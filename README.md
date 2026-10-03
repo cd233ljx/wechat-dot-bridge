@@ -162,6 +162,8 @@ python3 scripts/check_runtime.py \
 
 验收只发一条有唯一标记的文字。确认现有 dot 收到事件、读取同一消息 ID、提交回复，并由你在同一个微信对话看见一次回复。记录状态和时间即可，不要共享消息原文、callback URL、token 或密钥。
 
+可用 [真人验收记录模板](docs/REAL_VALIDATION.md)逐项记录部署结果；该模板初始全部待验证。
+
 `accepted` 仅代表微信 API 接受请求，**不等于已经投递或已读**。POST 后失联会保留 `uncertain`，系统不盲目重发。同一消息重复提交相同回复幂等；提交不同回复被拒绝。详细失败与恢复边界见 [安全说明](docs/SECURITY.md) 和 [dot 设置说明](docs/DOT_SETUP.md)。
 
 ## 停止与回滚

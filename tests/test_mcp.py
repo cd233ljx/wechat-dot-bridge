@@ -42,9 +42,9 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(result["resultType"], "complete")
         self.assertEqual(result["supportedVersions"], [PROTOCOL])
         self.assertEqual(set(result["capabilities"]), {"tools", "events"})
-        result = self.request("initialize", {"protocolVersion": "2025-03-26"})
+        result = self.request("initialize", {"protocolVersion": "2023-01-01"})
         self.assertEqual(result["error"]["data"]["reason"], "unsupported_protocol")
-        for version in [PROTOCOL, "2025-11-25", "2025-06-18", "2024-11-05"]:
+        for version in [PROTOCOL, "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]:
             self.assertEqual(self.request("initialize", {"protocolVersion": version})["result"]["protocolVersion"], version)
 
     def test_exact_five_tools_and_unbound_status_only(self):

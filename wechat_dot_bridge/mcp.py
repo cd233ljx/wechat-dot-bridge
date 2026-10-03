@@ -6,7 +6,7 @@ import re
 from .errors import BridgeError
 
 PROTOCOL = "2026-07-28"
-COMPATIBLE_VERSIONS = {PROTOCOL, "2025-11-25", "2025-06-18", "2024-11-05"}
+COMPATIBLE_VERSIONS = {PROTOCOL, "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"}
 SERVER_INFO = {"name": "wechat-dot-bridge", "version": "0.1.0"}
 MESSAGE_ID_SCHEMA = {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[A-Za-z0-9_-]+$"}
 
