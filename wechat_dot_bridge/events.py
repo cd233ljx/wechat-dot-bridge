@@ -30,6 +30,9 @@ MAX_ATTEMPTS = 5
 ROTATION_SECONDS = 300
 VERIFICATION_SECONDS = 300
 DEFAULT_TTL_SECONDS = 3600
+# Zero is an internal no-expiration sentinel compatible with existing NOT NULL rows.
+# Only explicit ttlMs:null grants this; omitted/finite requests remain finite.
+NO_EXPIRATION = 0
 MAX_TTL_SECONDS = 86400
 NETWORK_TIMEOUT = 10
 DNS_TIMEOUT = 10
@@ -364,7 +367,7 @@ class Events:
         self.store.db.execute("COMMIT")
 
     def _expire(self, now):
-        self.store.db.execute("UPDATE subscriptions SET status='expired' WHERE status='active' AND expires_at<=?", (now,))
+        self.store.db.execute("UPDATE subscriptions SET status='expired' WHERE status='active' AND expires_at!=0 AND expires_at<=?", (now,))
         self.store.db.execute("""UPDATE deliveries SET status='cancelled',error='subscription_inactive'
             WHERE status IN ('pending','retry','sending') AND subscription_id IN
             (SELECT id FROM subscriptions WHERE status!='active')""")
@@ -416,7 +419,7 @@ class Events:
         requested = params.get("ttlMs", DEFAULT_TTL_SECONDS * 1000)
         if requested is not None and (type(requested) is not int or requested <= 0):
             raise BridgeError("invalid_params")
-        ttl = DEFAULT_TTL_SECONDS if requested is None else min(MAX_TTL_SECONDS, max(60, requested / 1000))
+        ttl = None if requested is None else min(MAX_TTL_SECONDS, max(60, requested / 1000))
         with self._network_lock:
             now = self.clock()
             with self.store.lock:
@@ -449,7 +452,7 @@ class Events:
                     with self.store.lock:
                         self._metadata("last_error", "challenge_failed")
                     raise BridgeError("challenge_failed")
-            expires = self.clock() + ttl
+            expires = NO_EXPIRATION if ttl is None else self.clock() + ttl
             with self.store.lock:
                 self._begin()
                 try:
@@ -478,7 +481,7 @@ class Events:
                 except Exception:
                     self.store.db.execute("ROLLBACK")
                     raise
-        return {"id": subscription_id, "refreshBefore": _iso(expires), "cursor": None, "truncated": False}
+        return {"id": subscription_id, "refreshBefore": None if expires == NO_EXPIRATION else _iso(expires), "cursor": None, "truncated": False}
 
     def unsubscribe(self, params):
         subscription_id, _, _, _ = self._identity(params, False)
@@ -578,7 +581,7 @@ class Events:
             counts = dict(self.store.db.execute("SELECT status,COUNT(*) FROM deliveries GROUP BY status").fetchall())
             metadata = dict(self.store.db.execute("SELECT key,value FROM event_metadata").fetchall())
         return {"active_subscriptions": sum(row[1] == "active" for row in subscriptions),
-                "subscriptions": [{"id": row[0], "status": row[1], "refreshBefore": _iso(row[2])} for row in subscriptions],
+                "subscriptions": [{"id": row[0], "status": row[1], "refreshBefore": None if row[2] == NO_EXPIRATION else _iso(row[2])} for row in subscriptions],
                 "deliveries": counts, "last_error": metadata.get("last_error") or None,
                 "observed_callback_host": metadata.get("observed_host"),
                 "callback_hosts_configured": bool(self.allowed_hosts), "replay_supported": False,

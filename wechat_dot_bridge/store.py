@@ -493,7 +493,7 @@ class Store:
                 expiration = "expires" if "expires" in columns else "expires_at" if "expires_at" in columns else None
                 if expiration:
                     active_filter = " AND status='active'" if "status" in columns else ""
-                    active = self.db.execute("SELECT count(*) FROM subscriptions WHERE " + expiration + ">?" + active_filter, (self.clock(),)).fetchone()[0]
+                    active = self.db.execute("SELECT count(*) FROM subscriptions WHERE (" + expiration + "=0 OR " + expiration + ">?)" + active_filter, (self.clock(),)).fetchone()[0]
             result = {"bound": bool(binding), "enabled": bool(binding and binding["enabled"]),
                       "account_status": binding["status"] if binding else "not_bound",
                       "pending": pending, "reply_status": counts, "active_subscriptions": active}

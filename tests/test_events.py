@@ -170,6 +170,40 @@ class EventTests(unittest.TestCase):
         self.assertTrue(self.events.deliver_once())
         self.assertEqual(json.loads(self.callback.calls[-1][1])["data"]["message_id"], second)
 
+    def test_nonexpiring_refresh_survives_restart_and_can_be_cancelled(self):
+        original = self.events.subscribe(self.params)
+        self.params["ttlMs"] = None
+        forever = self.events.subscribe(self.params)
+        self.assertEqual(forever["id"], original["id"])
+        self.assertIsNone(forever["refreshBefore"])
+        self.store.close()
+        self.clock.now += 10 * 365 * 86400
+        self.store = Store(self.directory.name, clock=self.clock)
+        self.events = Events(self.store, ["callback.example.com"], self.callback, self.clock)
+        self.assertEqual(self.store.get_status()["active_subscriptions"], 1)
+        self.assertIsNone(self.events.status()["subscriptions"][0]["refreshBefore"])
+        self.ingest()
+        self.assertTrue(self.events.deliver_once())
+        self.unsubscribe()
+        self.assertEqual(self.store.get_status()["active_subscriptions"], 0)
+        self.assertFalse(self.events.deliver_once())
+
+    def test_finite_refresh_replaces_nonexpiring_subscription(self):
+        self.params["ttlMs"] = None
+        self.events.subscribe(self.params)
+        self.params["ttlMs"] = 60000
+        result = self.events.subscribe(self.params)
+        self.assertIsNotNone(result["refreshBefore"])
+        self.clock.now += 61
+        self.assertEqual(self.store.get_status()["active_subscriptions"], 0)
+        self.assertEqual(self.events.status()["subscriptions"][0]["status"], "expired")
+
+    def test_omitted_ttl_keeps_finite_default(self):
+        result = self.events.subscribe(self.params)
+        self.assertIsNotNone(result["refreshBefore"])
+        self.clock.now += 3601
+        self.assertEqual(self.events.status()["active_subscriptions"], 0)
+
     def test_new_callback_does_not_emit_preexisting_inbox(self):
         self.ingest()
         self.events.subscribe(self.params)

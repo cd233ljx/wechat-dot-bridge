@@ -43,6 +43,8 @@ MCP Events 目前支持 dot，以及符合条件的 Work / Cloud 聊天；它要
 
 > 使用我添加的私人 WeChat Dot Bridge 插件，订阅 `weixin.message`。每次收到事件，先用 `read_weixin_message` 读取该 `message_id`，理解我的文字，再用 `reply_weixin_message` 向同一条来信提交一次文字回复。随后用 `get_weixin_send_status` 查询结果。只有 `accepted` 才表示 API 接受；`uncertain` 时停止重发并告诉我需要核对。不要新建助手，不发送没有原来信的主动消息，不处理群聊或媒体。
 
+如需不过期，在原 dot 中要求刷新同一个订阅，明确传 `ttlMs: null`，并确认返回 `refreshBefore: null`。省略 `ttlMs` 仍使用一小时默认期限；明确请求有限期限时仍尊重该请求（最长一天、最短一分钟）。不过期订阅可取消，回调返回 410 也会停止投递。更新服务器代码不会自动修改已授予的有限订阅，必须由原 dot 刷新，让平台得到新的到期信息。
+
 订阅由 ChatGPT 提供 callback URL 和签名 secret。不要让用户手写 secret，亦不要把订阅完整请求抄入聊天、工单或日志。
 
 工具处理顺序是：

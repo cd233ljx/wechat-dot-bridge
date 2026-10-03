@@ -51,7 +51,7 @@ MCP Events 使用 `2026-07-28` discovery。若产品侧使用旧版 `initialize`
 - [ ] 停服务、更新配置并重启后，在原 dot 重新订阅。
 - [ ] 签名 challenge 验证实际通过。
 - [ ] 状态显示一个有效订阅；没有第二个聊天 / callback 占用该绑定。
-- [ ] 订阅返回有限 `refreshBefore`、`cursor: null` 与 `truncated: false`。
+- [ ] 有限订阅返回到期时间；明确 `ttlMs: null` 的不过期订阅返回 `refreshBefore: null`；均为 `cursor: null` 与 `truncated: false`。
 
 challenge 使用 `{type: verification, challenge: ...}`；响应必须成功回显 challenge。应用事件使用 `eventId/name/timestamp/data/cursor`；`data` 只有消息 ID。验收记录不得包含 challenge、完整 body 或签名 header 值。
 
