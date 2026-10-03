@@ -205,6 +205,13 @@ class MediaTests(unittest.TestCase):
                 upload_item(client, self.binding, attachment)
             self.assertEqual(upload.call_count, 1)
 
+    def test_voice_transcript_keeps_original_audio_for_reply(self):
+        mid = self.inbound(kind=3, extra={"text": "fixture voice transcript"})
+        message = self.store.read_message(mid)
+        self.assertEqual(message["text"], "fixture voice transcript")
+        self.assertEqual(len(message["attachments"]), 1)
+        self.assertEqual(message["attachments"][0]["kind"], "voice")
+
 
 if __name__ == "__main__":
     unittest.main()

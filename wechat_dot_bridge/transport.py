@@ -369,7 +369,9 @@ def _normalize_message(message: dict, binding: dict, now: float) -> dict | None:
         elif item["type"] in KINDS:
             if item["type"] == 3 and isinstance(item.get("voice_item"), dict) and isinstance(item["voice_item"].get("text"), str) and item["voice_item"]["text"].strip():
                 parts.append(item["voice_item"]["text"])
-            else:
+                if not isinstance(item["voice_item"].get("media"), dict):
+                    continue
+            if item["type"] in KINDS:
                 try:
                     attachments.append(descriptor(item))
                 except BridgeError as error:
