@@ -57,7 +57,7 @@ class FakeStore:
         reply, self.reply = self.reply, None
         return reply
 
-    def finish_send(self, message_id, status, error=None):
+    def finish_send(self, message_id, status, error=None, reply_id=None):
         self.finished.append((message_id, status, error))
 
 

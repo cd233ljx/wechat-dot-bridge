@@ -163,7 +163,7 @@ class PipelineTests(unittest.TestCase):
         self.assertNotIn("闭环验收原文", json.dumps(self.callback.events, ensure_ascii=False))
         read = self.call("read_weixin_message", {"message_id": identifier})
         self.assertEqual(read["text"], "闭环验收原文\n第二行")
-        reply = {"message_id": identifier, "text": "验收回复：已收到。"}
+        reply = {"message_id": identifier, "text": "验收回复：已收到。", "reply_key": "answer"}
         queued = self.call("reply_weixin_message", reply)
         self.assertEqual(queued["status"], "queued")
         self.assertIsNone(queued["delivered"])
@@ -179,7 +179,7 @@ class PipelineTests(unittest.TestCase):
         self.assertFalse(self.worker.send_once())
         self.assertEqual(self.call("reply_weixin_message", reply)["status"], "accepted")
         conflicting = self.request("tools/call", {"name": "reply_weixin_message",
-                                                 "arguments": {"message_id": identifier, "text": "改成另一个答案"}})
+                                                 "arguments": {"message_id": identifier, "text": "改成另一个答案", "reply_key": "answer"}})
         self.assertTrue(conflicting["result"]["isError"])
         self.assertEqual(len(self.client.posts), 1)
         self.assertEqual(self.call("get_weixin_status")["active_subscriptions"], 1)

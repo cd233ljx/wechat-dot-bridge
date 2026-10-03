@@ -59,7 +59,7 @@ class MCPTests(unittest.TestCase):
         data = self.call("read_weixin_message", {"message_id": message_id})["result"]["structuredContent"]
         self.assertEqual(data["text"], "User fixture")
         self.assertNotIn("fixture-context", json.dumps(data))
-        params = {"message_id": message_id, "text": "Reply fixture"}
+        params = {"message_id": message_id, "text": "Reply fixture", "reply_key": "answer"}
         first = self.call("reply_weixin_message", params)["result"]
         self.assertFalse(first["isError"])
         self.assertEqual(first["structuredContent"], self.call("reply_weixin_message", params)["result"]["structuredContent"])

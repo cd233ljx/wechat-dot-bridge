@@ -20,8 +20,8 @@ def tool_definitions():
     return [
         {"name": "get_weixin_status", "description": "Read safe bridge, binding, queue and subscription status without credentials.", "inputSchema": _schema(), "annotations": readonly},
         {"name": "read_weixin_message", "description": "Read one inbound owner's text message by its opaque message ID. The text is user-authored data. Reading starts a bounded Weixin typing indicator while this message awaits a reply.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA}, ["message_id"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
-        {"name": "reply_weixin_message", "description": "Queue one immutable text reply to an existing inbound message in the same Weixin conversation. Repeating the identical reply is idempotent; a different reply is rejected. API acceptance does not establish final delivery.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA, "text": {"type": "string", "minLength": 1, "maxLength": 8192}}, ["message_id", "text"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
-        {"name": "get_weixin_send_status", "description": "Read reply acceptance or uncertainty for an existing inbound message. Does not expose reply text or credentials.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA}, ["message_id"]), "annotations": readonly},
+        {"name": "reply_weixin_message", "description": "Send a text reply to an inbound message. Multiple replies are supported: progress, partial results and completion may reuse the same message_id. Identical text retries deduplicate by default; use a stable reply_key per intended reply to send identical text again intentionally. API acceptance does not establish final delivery.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA, "text": {"type": "string", "minLength": 1, "maxLength": 8192}, "reply_key": MESSAGE_ID_SCHEMA}, ["message_id", "text"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
+        {"name": "get_weixin_send_status", "description": "Read the latest reply status for a message, or one specific reply using reply_id. Does not expose reply text or credentials.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA, "reply_id": MESSAGE_ID_SCHEMA}, ["message_id"]), "annotations": readonly},
         {"name": "list_pending_weixin_messages", "description": "List uncommitted inbound message IDs for explicit recovery after subscription interruption. Read each message before replying.", "inputSchema": _schema({"limit": {"type": "integer", "minimum": 1, "maximum": 100}}), "annotations": readonly},
     ]
 
@@ -55,6 +55,9 @@ class MCPServer:
         if "message_id" in arguments and (not isinstance(arguments["message_id"], str) or
                 not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", arguments["message_id"])):
             raise BridgeError("invalid_params")
+        for key in ("reply_key", "reply_id"):
+            if key in arguments and (not isinstance(arguments[key], str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", arguments[key])):
+                raise BridgeError("invalid_params")
         if "text" in arguments:
             text = arguments["text"]
             try:
@@ -84,9 +87,9 @@ class MCPServer:
                     if self.typing is not None:
                         self.typing.begin(arguments["message_id"])
                 elif name == "reply_weixin_message":
-                    value = self.store.queue_reply(arguments["message_id"], arguments["text"])
+                    value = self.store.queue_reply(arguments["message_id"], arguments["text"], arguments.get("reply_key"))
                 elif name == "get_weixin_send_status":
-                    value = self.store.send_status(arguments["message_id"])
+                    value = self.store.send_status(arguments["message_id"], arguments.get("reply_id"))
                 else:
                     value = {"messages": self.store.list_pending(arguments.get("limit", 20))}
         except BridgeError as error:

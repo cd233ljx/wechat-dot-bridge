@@ -10,6 +10,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 import sqlite3
 import stat
@@ -174,6 +175,7 @@ class Store:
                 CREATE INDEX IF NOT EXISTS reply_dispatch
                     ON replies(status,created_at);
             """)
+            self._migrate_reply_identity()
             if self.db.execute("SELECT count(*) FROM binding").fetchone()[0] > 1:
                 raise BridgeError("invalid_binding_state")
         except (sqlite3.Error, BridgeError) as error:
@@ -182,6 +184,28 @@ class Store:
             if isinstance(error, BridgeError):
                 raise
             raise BridgeError("database_unavailable") from None
+
+    def _migrate_reply_identity(self):
+        columns = {r["name"]: r for r in self.db.execute("PRAGMA table_info(replies)")}
+        if not columns["message_id"]["pk"]:
+            return
+        # Preserve every existing client id and send outcome. A reply, not an
+        # inbound message, is now the unit of idempotency and uncertainty.
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            self.db.execute("""CREATE TABLE replies_v2 (
+                message_id TEXT NOT NULL REFERENCES messages(id), text TEXT NOT NULL,
+                client_id TEXT PRIMARY KEY, status TEXT NOT NULL, error TEXT,
+                created_at REAL NOT NULL, context_id TEXT, attempts INTEGER NOT NULL DEFAULT 0)""")
+            self.db.execute("INSERT INTO replies_v2 SELECT message_id,text,client_id,status,error,created_at,context_id,attempts FROM replies")
+            self.db.execute("DROP TABLE replies")
+            self.db.execute("ALTER TABLE replies_v2 RENAME TO replies")
+            self.db.execute("CREATE INDEX reply_dispatch ON replies(status,created_at)")
+            self.db.execute("CREATE INDEX reply_message ON replies(message_id)")
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
 
     @contextmanager
     def _transaction(self):
@@ -392,17 +416,25 @@ class Store:
                 "ORDER BY created_at,rowid LIMIT ?", (binding["id"], binding["owner"], limit)).fetchall()
             return [{"message_id": row["id"], "created_at": row["created_at"]} for row in rows]
 
-    def queue_reply(self, message_id, text):
+    def queue_reply(self, message_id, text, reply_key=None):
         size = _text_bytes(text)
         if size is None or not text.strip() or not 0 < size <= MAX_REPLY_BYTES:
             raise BridgeError("invalid_reply_text")
         with self._transaction():
             binding = self._binding()
             self._message(message_id, binding)
-            existing = self.db.execute("SELECT text FROM replies WHERE message_id=?", (message_id,)).fetchone()
+            if reply_key is not None and (not isinstance(reply_key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", reply_key)):
+                raise BridgeError("invalid_reply_key")
+            identity = json.dumps([message_id, reply_key if reply_key is not None else text, reply_key is not None], ensure_ascii=False)
+            client_id = "dot_reply_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
+            if reply_key is None:
+                existing = self.db.execute("SELECT text,client_id FROM replies WHERE message_id=? AND text=? ORDER BY rowid LIMIT 1", (message_id, text)).fetchone()
+            else:
+                existing = self.db.execute("SELECT text,client_id FROM replies WHERE message_id=? AND client_id=?", (message_id, client_id)).fetchone()
             if existing:
                 if existing["text"] != text:
-                    raise BridgeError("reply_already_committed")
+                    raise BridgeError("reply_key_conflict")
+                client_id = existing["client_id"]
             else:
                 if not binding["enabled"] or binding["status"] != "ready":
                     raise BridgeError("account_disabled")
@@ -412,18 +444,24 @@ class Store:
                     "AND m.account=? AND m.peer=?", (binding["id"], binding["owner"])).fetchone()[0]
                 if queued >= MAX_QUEUED_REPLIES:
                     raise BridgeError("send_queue_full")
-                client_id = "dot_reply_" + hashlib.sha256(message_id.encode("utf-8")).hexdigest()
                 self.db.execute(
                     "INSERT INTO replies(message_id,text,client_id,status,created_at) VALUES(?,?,?,'queued',?)",
                     (message_id, text, client_id, self.clock()))
                 self.db.execute("UPDATE messages SET state='reply_committed' WHERE id=?", (message_id,))
-        return self.send_status(message_id)
+        return self.send_status(message_id, client_id)
 
-    def send_status(self, message_id):
+    def send_status(self, message_id, reply_id=None):
         with self.lock:
             self._message(message_id, self._binding())
-            reply = self.db.execute("SELECT status,error FROM replies WHERE message_id=?", (message_id,)).fetchone()
+            if reply_id is None:
+                reply = self.db.execute("SELECT client_id,status,error FROM replies WHERE message_id=? ORDER BY rowid DESC LIMIT 1", (message_id,)).fetchone()
+            else:
+                reply = self.db.execute("SELECT client_id,status,error FROM replies WHERE message_id=? AND client_id=?", (message_id, reply_id)).fetchone()
+                if reply is None:
+                    raise BridgeError("unknown_reply")
             result = {"message_id": message_id, "status": reply["status"] if reply else "no_reply", "delivered": None}
+            if reply:
+                result["reply_id"] = reply["client_id"]
             if reply and reply["error"]:
                 result["error"] = _safe_error(reply["error"])
             return result
@@ -440,29 +478,32 @@ class Store:
             if row is None:
                 return None
             if row["attempts"] >= 3:
-                self.db.execute("UPDATE replies SET status='failed',error='retry_limit' WHERE message_id=?", (row["message_id"],))
+                self.db.execute("UPDATE replies SET status='failed',error='retry_limit' WHERE client_id=?", (row["client_id"],))
                 return None
             context = self._latest_context(binding)
             if context is None:
                 self.db.execute(
-                    "UPDATE replies SET status='context_required',error='fresh_context_required' WHERE message_id=?",
-                    (row["message_id"],))
+                    "UPDATE replies SET status='context_required',error='fresh_context_required' WHERE client_id=?",
+                    (row["client_id"],))
                 return None
             self.db.execute(
-                "UPDATE replies SET status='sending',error=NULL,context_id=?,attempts=attempts+1 WHERE message_id=?",
-                (context["id"], row["message_id"]))
-            return {"message_id": row["message_id"], "text": row["text"],
+                "UPDATE replies SET status='sending',error=NULL,context_id=?,attempts=attempts+1 WHERE client_id=?",
+                (context["id"], row["client_id"]))
+            return {"message_id": row["message_id"], "reply_id": row["client_id"], "text": row["text"],
                     "client_id": row["client_id"], "peer": row["peer"],
                     "context_token": context["context_token"]}
 
-    def finish_send(self, message_id, status, error=None):
+    def finish_send(self, message_id, status, error=None, reply_id=None):
         if not isinstance(status, str) or status not in SEND_OUTCOMES:
             raise BridgeError("invalid_send_outcome")
         diagnostic = None if error is None else _safe_error(error)
         with self._transaction():
             binding = self._binding()
             self._message(message_id, binding)
-            reply = self.db.execute("SELECT status,error,context_id,attempts FROM replies WHERE message_id=?", (message_id,)).fetchone()
+            if reply_id is None:
+                reply = self.db.execute("SELECT client_id,status,error,context_id,attempts FROM replies WHERE message_id=? ORDER BY (status='sending') DESC,rowid DESC LIMIT 1", (message_id,)).fetchone()
+            else:
+                reply = self.db.execute("SELECT client_id,status,error,context_id,attempts FROM replies WHERE message_id=? AND client_id=?", (message_id, reply_id)).fetchone()
             if reply is None:
                 raise BridgeError("reply_not_committed")
             if reply["status"] != "sending":
@@ -477,7 +518,7 @@ class Store:
                     status, diagnostic = "failed", "retry_limit"
                 elif context and context["id"] != reply["context_id"]:
                     status, diagnostic = "queued", None
-            self.db.execute("UPDATE replies SET status=?,error=? WHERE message_id=?", (status, diagnostic, message_id))
+            self.db.execute("UPDATE replies SET status=?,error=? WHERE client_id=?", (status, diagnostic, reply["client_id"]))
             if status == "accepted":
                 self.db.execute("UPDATE messages SET state='replied' WHERE id=?", (message_id,))
             if status == "auth_required":

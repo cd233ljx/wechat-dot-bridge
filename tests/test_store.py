@@ -130,10 +130,10 @@ class StoreTests(unittest.TestCase):
 
     def test_reply_is_immutable_idempotent_and_client_id_is_stable(self):
         identifier = self.add()
-        first = self.store.queue_reply(identifier, "准确回复")
+        first = self.store.queue_reply(identifier, "准确回复", "answer")
         self.assertEqual(first["status"], "queued")
-        self.assertEqual(first, self.store.queue_reply(identifier, "准确回复"))
-        self.expect_error("reply_already_committed", self.store.queue_reply, identifier, "另一个答案")
+        self.assertEqual(first, self.store.queue_reply(identifier, "准确回复", "answer"))
+        self.expect_error("reply_key_conflict", self.store.queue_reply, identifier, "另一个答案", "answer")
         self.assertEqual(self.store.list_pending(), [])
         self.reopen()
         outgoing = self.store.claim_send()
@@ -146,6 +146,55 @@ class StoreTests(unittest.TestCase):
         second = self.store.claim_send()
         self.assertEqual(second["client_id"], outgoing["client_id"])
         self.assertEqual(second["context_token"], "new-context")
+
+    def test_progress_and_completion_are_independent_replies_across_restart(self):
+        identifier = self.add()
+        progress = self.store.queue_reply(identifier, "正在处理")
+        outgoing = self.store.claim_send()
+        self.store.finish_send(identifier, "accepted", reply_id=outgoing["reply_id"])
+        self.reopen()
+        completion = self.store.queue_reply(identifier, "处理完成")
+        self.assertNotEqual(progress["reply_id"], completion["reply_id"])
+        final = self.store.claim_send()
+        self.store.finish_send(identifier, "accepted", reply_id=final["reply_id"])
+        self.assertEqual(self.store.queue_reply(identifier, "正在处理")["status"], "accepted")
+        self.assertEqual(self.store.queue_reply(identifier, "处理完成")["status"], "accepted")
+        self.assertIsNone(self.store.claim_send())
+        self.assertEqual(self.store.get_status()["reply_status"], {"accepted": 2})
+
+    def test_uncertain_progress_does_not_block_completion_or_change_its_status(self):
+        identifier = self.add()
+        first = self.store.queue_reply(identifier, "进度", "progress")
+        self.store.claim_send()
+        self.store.finish_send(identifier, "uncertain", "network_timeout", reply_id=first["reply_id"])
+        second = self.store.queue_reply(identifier, "完成", "done")
+        self.store.claim_send()
+        self.store.finish_send(identifier, "accepted", reply_id=second["reply_id"])
+        self.assertEqual(self.store.send_status(identifier, first["reply_id"])["status"], "uncertain")
+        self.assertEqual(self.store.send_status(identifier, second["reply_id"])["status"], "accepted")
+        self.assertEqual(self.store.queue_reply(identifier, "进度", "progress")["status"], "uncertain")
+        self.assertIsNone(self.store.claim_send())
+
+    def test_explicit_keys_allow_intentional_identical_replies(self):
+        identifier = self.add()
+        first = self.store.queue_reply(identifier, "已完成", "part1")
+        second = self.store.queue_reply(identifier, "已完成", "part2")
+        self.assertNotEqual(first["reply_id"], second["reply_id"])
+        self.assertEqual(self.store.queue_reply(identifier, "已完成", "part1"), first)
+
+    def test_migration_preserves_legacy_accepted_reply_and_allows_append(self):
+        identifier = self.add()
+        self.store.db.execute("DROP TABLE replies")
+        self.store.db.execute("""CREATE TABLE replies(message_id TEXT PRIMARY KEY REFERENCES messages(id),
+            text TEXT NOT NULL,client_id TEXT UNIQUE NOT NULL,status TEXT NOT NULL,error TEXT,
+            created_at REAL NOT NULL,context_id TEXT,attempts INTEGER NOT NULL DEFAULT 0)""")
+        self.store.db.execute("INSERT INTO replies(message_id,text,client_id,status,created_at) VALUES(?,?,?,'accepted',?)",
+                              (identifier, "已发送的旧回复", "legacy-id", 100))
+        self.reopen()
+        self.assertEqual(self.store.queue_reply(identifier, "已发送的旧回复")["reply_id"], "legacy-id")
+        self.store.queue_reply(identifier, "追加完成消息")
+        self.assertEqual(self.store.claim_send()["text"], "追加完成消息")
+        self.assertEqual(self.store.send_status(identifier, "legacy-id")["status"], "accepted")
 
     def test_latest_owner_context_used_and_older_messages_cannot_replace_it(self):
         identifier = self.add(message("first", created_at=100, context_token="first-context"))

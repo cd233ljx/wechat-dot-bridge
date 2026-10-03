@@ -431,18 +431,18 @@ class WeixinWorker:
             if error:
                 status = error if error in ("auth_required", "context_required") else (
                     "uncertain" if error == "response_invalid" else "failed")
-                self.store.finish_send(message_id, status, error)
+                self.store.finish_send(message_id, status, error, reply_id=reply.get("reply_id"))
                 self._record_error(error)
             else:
-                self.store.finish_send(message_id, "accepted")
+                self.store.finish_send(message_id, "accepted", reply_id=reply.get("reply_id"))
                 self.store.record_error(None)
         except BridgeError as error:
             status = error.code if error.code in ("auth_required", "context_required") else (
                 "failed" if error.code in ("endpoint_rejected", "dns_rejected", "binding_invalid", "invalid_reply") else "uncertain")
-            self.store.finish_send(message_id, status, error.code)
+            self.store.finish_send(message_id, status, error.code, reply_id=reply.get("reply_id"))
             self._record_error(error.code)
         except (UnicodeError, ValueError, TypeError, OverflowError):
-            self.store.finish_send(message_id, "uncertain", "response_invalid")
+            self.store.finish_send(message_id, "uncertain", "response_invalid", reply_id=reply.get("reply_id"))
             self._record_error("response_invalid")
         return True
 

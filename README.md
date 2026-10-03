@@ -20,7 +20,7 @@ flowchart LR
 
 ## 范围和依赖
 
-- 本人单账号、私聊、完整文字消息，一条来信对应一条不可变文字回复。
+- 本人单账号、私聊、完整文字消息，同一来信可提交多条进度、分段及完成回复。
 - 微信协议与绑定格式依据 [Tencent/openclaw-weixin](https://github.com/Tencent/openclaw-weixin)；无需安装或运行 OpenClaw。
 - 私有连接使用官方 [openai/tunnel-client](https://github.com/openai/tunnel-client/releases/latest)，不开放本机公网 MCP 端口。
 - 事件依据 [OpenAI MCP Events](https://developers.openai.com/plugins/build/mcp-events)，支持 `2026-07-28` discovery、验证、订阅刷新和取消。
@@ -170,7 +170,7 @@ python3 scripts/check_runtime.py \
 | --- | --- |
 | `get_weixin_status` | 查看安全状态、队列和订阅错误 |
 | `read_weixin_message` | 按消息 ID 读取本人文字 |
-| `reply_weixin_message` | 为已有来信提交一次不可变回复 |
+| `reply_weixin_message` | 为已有来信提交回复，支持多次追加 |
 | `get_weixin_send_status` | 查询 API 接受、失败或不确定状态 |
 | `list_pending_weixin_messages` | 显式恢复尚未提交回复的来信 |
 
