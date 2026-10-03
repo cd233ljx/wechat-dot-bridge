@@ -1,0 +1,466 @@
+"""Owner-scoped MCP Events with durable, bounded webhook delivery.
+
+Protocol reference: https://developers.openai.com/plugins/build/mcp-events
+No user text or Weixin routing credential is placed in event payloads.
+"""
+
+import base64
+import hashlib
+import hmac
+import http.client
+import ipaddress
+import json
+import queue
+import re
+import secrets
+import socket
+import ssl
+import threading
+import time
+from datetime import datetime, timezone
+from urllib.parse import urlsplit
+
+from .errors import BridgeError
+
+EVENT_NAME = "weixin.message"
+MAX_BODY = 262144
+MAX_RESPONSE = 65536
+MAX_ATTEMPTS = 5
+ROTATION_SECONDS = 300
+VERIFICATION_SECONDS = 300
+DEFAULT_TTL_SECONDS = 3600
+MAX_TTL_SECONDS = 86400
+NETWORK_TIMEOUT = 10
+DNS_TIMEOUT = 10
+_DNS_SLOTS = threading.BoundedSemaphore(4)
+
+
+def _json_bytes(value):
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+
+
+def _iso(timestamp):
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def _signing_key(secret):
+    if not isinstance(secret, str) or not secret.startswith("whsec_") or len(secret) > 100:
+        raise BridgeError("invalid_signing_secret")
+    try:
+        decoded = base64.b64decode(secret[6:], validate=True)
+    except (ValueError, TypeError):
+        raise BridgeError("invalid_signing_secret") from None
+    if not 24 <= len(decoded) <= 64:
+        raise BridgeError("invalid_signing_secret")
+    return decoded
+
+
+def signed_headers(event_id, body, secret, signed_at, subscription_id, old_secret=None):
+    """Standard Webhooks signs the exact bytes, with dual signatures on rotation."""
+    timestamp = str(int(signed_at))
+    signed = event_id.encode("ascii") + b"." + timestamp.encode("ascii") + b"." + body
+    signatures = []
+    for key in (secret, old_secret):
+        if key:
+            signature = hmac.new(_signing_key(key), signed, hashlib.sha256).digest()
+            signatures.append("v1," + base64.b64encode(signature).decode("ascii"))
+    return {"Content-Type": "application/json", "webhook-id": event_id,
+            "webhook-timestamp": timestamp, "webhook-signature": " ".join(signatures),
+            "X-MCP-Subscription-Id": subscription_id}
+
+
+def _callback_parts(url, allowed_hosts):
+    if not isinstance(url, str) or len(url) > 2048 or any(ord(c) <= 32 for c in url) or "\\" in url:
+        raise BridgeError("callback_invalid")
+    try:
+        parts = urlsplit(url)
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except (ValueError, TypeError):
+        raise BridgeError("callback_invalid") from None
+    if (parts.scheme != "https" or not host or parts.username is not None or
+            parts.password is not None or parts.fragment or port not in (None, 443) or
+            not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?", host) or
+            ".." in host or host.endswith(".") or "%" in parts.netloc):
+        raise BridgeError("callback_invalid")
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise BridgeError("callback_invalid")
+    if host not in allowed_hosts:
+        raise BridgeError("callback_not_allowed")
+    return parts, host
+
+
+def _public_addresses(host):
+    # libc resolution has no Python timeout. A small bounded pool of daemon
+    # resolvers keeps the delivery worker responsive even if the resolver hangs.
+    if not _DNS_SLOTS.acquire(blocking=False):
+        raise BridgeError("callback_dns_failed")
+    resolved = queue.Queue(maxsize=1)
+
+    def resolve():
+        try:
+            resolved.put((True, socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)))
+        except Exception:
+            resolved.put((False, None))
+        finally:
+            _DNS_SLOTS.release()
+
+    threading.Thread(target=resolve, name="callback-dns", daemon=True).start()
+    try:
+        ok, entries = resolved.get(timeout=DNS_TIMEOUT)
+    except queue.Empty:
+        raise BridgeError("callback_timeout") from None
+    if not ok:
+        raise BridgeError("callback_dns_failed") from None
+    addresses = []
+    for family, socktype, protocol, _, address in entries:
+        try:
+            ip = ipaddress.ip_address(address[0])
+        except ValueError:
+            raise BridgeError("callback_dns_blocked") from None
+        embedded = isinstance(ip, ipaddress.IPv6Address) and (ip.ipv4_mapped or ip.sixtofour or ip.teredo)
+        if not ip.is_global or ip.is_multicast or ip.is_unspecified or ip.is_reserved or embedded:
+            raise BridgeError("callback_dns_blocked")
+        entry = (family, socktype, protocol, address)
+        if entry not in addresses:
+            addresses.append(entry)
+    if not addresses or len(addresses) > 16:
+        raise BridgeError("callback_dns_failed")
+    return addresses
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """Connect to a previously checked IP while verifying TLS against the hostname."""
+
+    def __init__(self, host, addresses):
+        super().__init__(host, 443, timeout=NETWORK_TIMEOUT, context=ssl.create_default_context())
+        self.addresses = addresses
+
+    def connect(self):
+        deadline = time.monotonic() + NETWORK_TIMEOUT
+        for family, socktype, protocol, address in self.addresses:
+            raw = socket.socket(family, socktype, protocol)
+            try:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError()
+                raw.settimeout(remaining)
+                raw.connect(address)
+                self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+                return
+            except ssl.SSLError:
+                raw.close()
+                raise
+            except OSError:
+                raw.close()
+        raise OSError("callback connection failed")
+
+
+def secure_post(url, body, headers, allowed_hosts):
+    """No proxies, redirects, DNS re-resolution by the socket, or raw error output."""
+    parts, host = _callback_parts(url, allowed_hosts)
+    if len(body) > MAX_BODY:
+        raise BridgeError("event_too_large")
+    connection = _PinnedHTTPSConnection(host, _public_addresses(host))
+    target = parts.path or "/"
+    if parts.query:
+        target += "?" + parts.query
+    # A socket read timeout alone permits a peer to trickle bytes forever.
+    # Shutdown establishes an overall HTTPS exchange deadline as well.
+    timed_out = threading.Event()
+
+    def abort():
+        timed_out.set()
+        sock = connection.sock
+        if sock is not None:
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            sock.close()
+
+    deadline = threading.Timer(NETWORK_TIMEOUT, abort)
+    deadline.daemon = True
+    deadline.start()
+    try:
+        connection.request("POST", target, body=body, headers=headers)
+        response = connection.getresponse()
+        data = response.read(MAX_RESPONSE + 1)
+        if timed_out.is_set():
+            raise BridgeError("callback_timeout")
+        if len(data) > MAX_RESPONSE:
+            raise BridgeError("callback_response_too_large")
+        if 300 <= response.status < 400:
+            raise BridgeError("callback_redirect")
+        return response.status, data
+    except (TimeoutError, socket.timeout):
+        raise BridgeError("callback_timeout") from None
+    except ssl.SSLError:
+        raise BridgeError("callback_tls_failed") from None
+    except (OSError, ValueError, http.client.HTTPException):
+        if timed_out.is_set():
+            raise BridgeError("callback_timeout") from None
+        raise BridgeError("callback_network_failed") from None
+    finally:
+        deadline.cancel()
+        connection.close()
+
+
+class Events:
+    def __init__(self, store, allowed_hosts=(), post=None, clock=time.time):
+        self.store, self.clock = store, clock
+        self.allowed_hosts = frozenset(str(host).lower() for host in allowed_hosts)
+        if any(not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", host) or ".." in host or host.endswith(".")
+               for host in self.allowed_hosts):
+            raise BridgeError("invalid_callback_hosts")
+        self.post = post or (lambda url, body, headers: secure_post(url, body, headers, self.allowed_hosts))
+        # Serializes verification, delivery, refresh and cancellation within one owner process.
+        self._network_lock = threading.RLock()
+        with self.store.lock:
+            self.store.db.executescript("""
+                CREATE TABLE IF NOT EXISTS subscriptions (
+                    id TEXT PRIMARY KEY, principal TEXT NOT NULL, name TEXT NOT NULL,
+                    arguments TEXT NOT NULL, url TEXT NOT NULL, secret TEXT NOT NULL,
+                    old_secret TEXT, rotate_until REAL, expires_at REAL NOT NULL,
+                    verified_until REAL NOT NULL, status TEXT NOT NULL, start_rowid INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS deliveries (
+                    event_id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL,
+                    message_id TEXT NOT NULL, body BLOB NOT NULL, status TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL,
+                    error TEXT, UNIQUE(subscription_id,message_id)
+                );
+                CREATE TABLE IF NOT EXISTS event_metadata (key TEXT PRIMARY KEY,value TEXT);
+            """)
+            self.store.db.execute("UPDATE deliveries SET status='retry' WHERE status='sending'")
+
+    def _begin(self):
+        self.store.db.execute("BEGIN IMMEDIATE")
+
+    def _end(self):
+        self.store.db.execute("COMMIT")
+
+    def _expire(self, now):
+        self.store.db.execute("UPDATE subscriptions SET status='expired' WHERE status='active' AND expires_at<=?", (now,))
+        self.store.db.execute("""UPDATE deliveries SET status='cancelled',error='subscription_inactive'
+            WHERE status IN ('pending','retry','sending') AND subscription_id IN
+            (SELECT id FROM subscriptions WHERE status!='active')""")
+        self.store.db.execute("UPDATE subscriptions SET old_secret=NULL,rotate_until=NULL WHERE rotate_until<=?", (now,))
+
+    def _metadata(self, key, value):
+        self.store.db.execute("INSERT INTO event_metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+    def event_definition(self):
+        return {"name": EVENT_NAME, "description": "A new text message from the bound owner in the original Weixin conversation. Read the message by its ID.",
+                "delivery": ["webhook"], "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
+                "payloadSchema": {"type": "object", "properties": {"message_id": {"type": "string"}},
+                                  "required": ["message_id"], "additionalProperties": False}}
+
+    def _identity(self, params, with_secret):
+        if not isinstance(params, dict) or set(params) - {"name", "arguments", "delivery", "cursor", "ttlMs", "_meta"}:
+            raise BridgeError("invalid_params")
+        if params.get("name") != EVENT_NAME or params.get("arguments", {}) != {}:
+            raise BridgeError("invalid_params")
+        if params.get("cursor") is not None:
+            raise BridgeError("replay_not_supported")
+        delivery = params.get("delivery")
+        allowed = {"mode", "url", "secret"} if with_secret else {"mode", "url"}
+        if not isinstance(delivery, dict) or set(delivery) - allowed or delivery.get("mode") != "webhook":
+            raise BridgeError("invalid_params")
+        url = delivery.get("url")
+        try:
+            _callback_parts(url, self.allowed_hosts)
+        except BridgeError as error:
+            # Record only a syntactically safe host; never persist rejected callback paths or secrets.
+            if error.code == "callback_not_allowed":
+                host = (urlsplit(url).hostname or "").lower()
+                with self.store.lock:
+                    self._metadata("observed_host", host)
+                    self._metadata("last_error", error.code)
+            raise
+        binding = self.store.get_binding()
+        if not binding:
+            raise BridgeError("binding_required")
+        principal = _json_bytes([binding["id"], binding["owner"]]).decode("utf-8")
+        identity = {"principal": principal, "url": url, "name": EVENT_NAME, "arguments": {}}
+        subscription_id = "sub_" + hashlib.sha256(_json_bytes(identity)).hexdigest()
+        if with_secret:
+            _signing_key(delivery.get("secret"))
+        return subscription_id, principal, url, delivery.get("secret")
+
+    def subscribe(self, params):
+        subscription_id, principal, url, secret = self._identity(params, True)
+        requested = params.get("ttlMs", DEFAULT_TTL_SECONDS * 1000)
+        if requested is not None and (type(requested) is not int or requested <= 0):
+            raise BridgeError("invalid_params")
+        ttl = DEFAULT_TTL_SECONDS if requested is None else min(MAX_TTL_SECONDS, max(60, requested / 1000))
+        with self._network_lock:
+            now = self.clock()
+            with self.store.lock:
+                self._expire(now)
+                existing = self.store.db.execute("SELECT secret,old_secret,rotate_until,verified_until,status,start_rowid FROM subscriptions WHERE id=?", (subscription_id,)).fetchone()
+                active = self.store.db.execute("SELECT id FROM subscriptions WHERE status='active'").fetchone()
+                if active and active[0] != subscription_id:
+                    raise BridgeError("subscription_conflict")
+                cached = bool(existing and existing[0] == secret and existing[3] > now and existing[4] == "active")
+            if not cached:
+                challenge = secrets.token_urlsafe(32)
+                body = _json_bytes({"type": "verification", "challenge": challenge})
+                verification_id = "verify_" + secrets.token_hex(16)
+                headers = signed_headers(verification_id, body, secret, now, subscription_id)
+                try:
+                    status, response = self.post(url, body, headers)
+                    value = json.loads(response)
+                except BridgeError as error:
+                    with self.store.lock:
+                        self._metadata("last_error", error.code if error.code.startswith("callback_") else "challenge_failed")
+                    raise
+                except (ValueError, TypeError, OSError):
+                    with self.store.lock:
+                        self._metadata("last_error", "challenge_failed")
+                    raise BridgeError("challenge_failed") from None
+                if (not 200 <= status < 300 or not isinstance(value, dict) or
+                        not isinstance(value.get("challenge"), str) or
+                        self.clock() > now + 30 or
+                        not hmac.compare_digest(value["challenge"].encode("utf-8"), challenge.encode("utf-8"))):
+                    with self.store.lock:
+                        self._metadata("last_error", "challenge_failed")
+                    raise BridgeError("challenge_failed")
+            expires = self.clock() + ttl
+            with self.store.lock:
+                self._begin()
+                try:
+                    current = self.store.db.execute("SELECT secret,old_secret,rotate_until,status,start_rowid FROM subscriptions WHERE id=?", (subscription_id,)).fetchone()
+                    continuous = bool(current and current[3] == "active")
+                    # An explicit refresh resumes the same application's outstanding
+                    # inbox. This is not a protocol replay cursor and never resumes
+                    # a message that has an immutable reply committed to it.
+                    boundary = current[4] if current else self.store.db.execute("SELECT COALESCE(MAX(rowid),0) FROM messages").fetchone()[0]
+                    old_secret = current[0] if continuous and current[0] != secret else (current[1] if continuous else None)
+                    rotation = self.clock() + ROTATION_SECONDS if continuous and current[0] != secret else (current[2] if continuous else None)
+                    if current:
+                        self.store.db.execute("""UPDATE deliveries SET status='pending',attempts=0,next_attempt=?,error=NULL
+                            WHERE subscription_id=? AND (status IN ('failed','cancelled','retry') OR
+                            (status='acknowledged' AND ?)) AND message_id IN
+                            (SELECT m.id FROM messages m WHERE m.state='pending' AND NOT EXISTS
+                            (SELECT 1 FROM replies r WHERE r.message_id=m.id))""", (self.clock(), subscription_id, int(not continuous)))
+                    self.store.db.execute("""INSERT INTO subscriptions VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                        ON CONFLICT(id) DO UPDATE SET secret=excluded.secret,old_secret=excluded.old_secret,
+                        rotate_until=excluded.rotate_until,expires_at=excluded.expires_at,verified_until=excluded.verified_until,
+                        status='active',start_rowid=excluded.start_rowid""",
+                        (subscription_id, principal, EVENT_NAME, "{}", url, secret, old_secret, rotation,
+                         expires, self.clock() + VERIFICATION_SECONDS, "active", boundary))
+                    self._metadata("last_error", "")
+                    self._end()
+                except Exception:
+                    self.store.db.execute("ROLLBACK")
+                    raise
+        return {"id": subscription_id, "refreshBefore": _iso(expires), "cursor": None, "truncated": False}
+
+    def unsubscribe(self, params):
+        subscription_id, _, _, _ = self._identity(params, False)
+        with self._network_lock, self.store.lock:
+            self._begin()
+            try:
+                self.store.db.execute("UPDATE subscriptions SET status='cancelled',secret='',old_secret=NULL,rotate_until=NULL WHERE id=?", (subscription_id,))
+                self.store.db.execute("UPDATE deliveries SET status='cancelled',error='subscription_inactive' WHERE subscription_id=? AND status IN ('pending','retry','sending')", (subscription_id,))
+                self._end()
+            except Exception:
+                self.store.db.execute("ROLLBACK")
+                raise
+        return {}
+
+    def deliver_once(self):
+        binding = self.store.get_binding()
+        if not binding or not binding["enabled"]:
+            return False
+        with self._network_lock:
+            now = self.clock()
+            with self.store.lock:
+                self._begin()
+                try:
+                    self._expire(now)
+                    subscription = self.store.db.execute("SELECT id,url,secret,old_secret,rotate_until,start_rowid,principal FROM subscriptions WHERE status='active'").fetchone()
+                    principal = _json_bytes([binding["id"], binding["owner"]]).decode("utf-8")
+                    if not subscription or subscription[6] != principal:
+                        self._end()
+                        return False
+                    self.store.db.execute("""UPDATE deliveries SET status='cancelled',error='reply_committed'
+                        WHERE status IN ('pending','retry') AND message_id IN (SELECT message_id FROM replies)""")
+                    rows = self.store.db.execute("""SELECT id,created_at FROM messages m WHERE rowid>? AND account=? AND peer=?
+                        AND state='pending' AND NOT EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id)
+                        AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.subscription_id=? AND d.message_id=m.id)
+                        ORDER BY rowid LIMIT 100""", (subscription[5], binding["id"], binding["owner"], subscription[0])).fetchall()
+                    for message_id, created_at in rows:
+                        event_id = "evt_" + hashlib.sha256((subscription[0] + ":" + message_id).encode()).hexdigest()
+                        body = _json_bytes({"eventId": event_id, "name": EVENT_NAME, "timestamp": _iso(created_at),
+                                            "data": {"message_id": message_id}, "cursor": None})
+                        self.store.db.execute("INSERT OR IGNORE INTO deliveries(event_id,subscription_id,message_id,body,status,next_attempt) VALUES(?,?,?,?,'pending',?)", (event_id, subscription[0], message_id, body, now))
+                    delivery = self.store.db.execute("""SELECT event_id,body,attempts FROM deliveries
+                        WHERE subscription_id=? AND status IN ('pending','retry') AND next_attempt<=?
+                        ORDER BY next_attempt,event_id LIMIT 1""", (subscription[0], now)).fetchone()
+                    if not delivery:
+                        self._end()
+                        return False
+                    if delivery[2] >= MAX_ATTEMPTS:
+                        self.store.db.execute("UPDATE deliveries SET status='failed',error='retry_exhausted' WHERE event_id=?", (delivery[0],))
+                        self._metadata("last_error", "retry_exhausted")
+                        self._end()
+                        return True
+                    attempts = delivery[2] + 1
+                    self.store.db.execute("UPDATE deliveries SET status='sending',attempts=? WHERE event_id=?", (attempts, delivery[0]))
+                    self._end()
+                except Exception:
+                    self.store.db.execute("ROLLBACK")
+                    raise
+            old = subscription[3] if subscription[4] and subscription[4] > now else None
+            headers = signed_headers(delivery[0], delivery[1], subscription[2], self.clock(), subscription[0], old)
+            try:
+                status, _ = self.post(subscription[1], delivery[1], headers)
+                if 200 <= status < 300:
+                    state, error = "acknowledged", None
+                elif status == 410:
+                    state, error = "failed", "callback_gone"
+                elif status == 413:
+                    state, error = "failed", "event_too_large"
+                elif status in (408, 429) or 500 <= status < 600:
+                    state, error = "retry", "callback_transient"
+                else:
+                    state, error = "failed", "callback_rejected"
+            except BridgeError as failure:
+                error = failure.code if failure.code in {"callback_timeout", "callback_dns_failed", "callback_network_failed", "callback_dns_blocked", "callback_tls_failed", "callback_redirect", "callback_response_too_large", "callback_not_allowed", "callback_invalid"} else "callback_failed"
+                state = "retry" if error in {"callback_timeout", "callback_dns_failed", "callback_network_failed"} else "failed"
+            except Exception:
+                state, error = "failed", "callback_failed"
+            if state == "retry" and attempts >= MAX_ATTEMPTS:
+                state, error = "failed", "retry_exhausted"
+            with self.store.lock:
+                self._begin()
+                try:
+                    self.store.db.execute("UPDATE deliveries SET status=?,error=?,next_attempt=? WHERE event_id=?", (state, error, self.clock() + min(300, 2 ** attempts), delivery[0]))
+                    self._metadata("last_error", error or "")
+                    if error == "callback_gone":
+                        self.store.db.execute("UPDATE subscriptions SET status='cancelled',secret='',old_secret=NULL WHERE id=?", (subscription[0],))
+                        self._expire(self.clock())
+                    self._end()
+                except Exception:
+                    self.store.db.execute("ROLLBACK")
+                    raise
+            return True
+
+    def status(self):
+        with self.store.lock:
+            self._expire(self.clock())
+            subscriptions = self.store.db.execute("SELECT id,status,expires_at FROM subscriptions ORDER BY id").fetchall()
+            counts = dict(self.store.db.execute("SELECT status,COUNT(*) FROM deliveries GROUP BY status").fetchall())
+            metadata = dict(self.store.db.execute("SELECT key,value FROM event_metadata").fetchall())
+        return {"active_subscriptions": sum(row[1] == "active" for row in subscriptions),
+                "subscriptions": [{"id": row[0], "status": row[1], "refreshBefore": _iso(row[2])} for row in subscriptions],
+                "deliveries": counts, "last_error": metadata.get("last_error") or None,
+                "observed_callback_host": metadata.get("observed_host"),
+                "callback_hosts_configured": bool(self.allowed_hosts), "replay_supported": False,
+                "recovery_tool": "list_pending_weixin_messages"}

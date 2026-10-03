@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wechat-dot-bridge"
+version = "0.1.0"
+description = "Private text-only WeChat MCP Events bridge for an existing dot"
+requires-python = ">=3.11"
+license = "MIT"
+dependencies = []
+
+[project.optional-dependencies]
+setup = ["qrcode==8.2"]
+
+[project.scripts]
+wechat-dot-bridge = "wechat_dot_bridge.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["wechat_dot_bridge*"]
