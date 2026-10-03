@@ -18,8 +18,9 @@ from .transport import WeixinWorker, load_existing_binding
 from .events import Events
 from .mcp import MCPServer
 from .typing import TypingIndicator
+from .media import MediaWorker
 
-MAX_RPC_BYTES = 131072
+MAX_RPC_BYTES = 2 * 1024 * 1024
 
 
 def canonical(value):
@@ -110,6 +111,7 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
         typing = TypingIndicator(store)
         server = MCPServer(store, events, typing=typing)
         weixin = WeixinWorker(store)
+        media = MediaWorker(store)
 
         def run_worker(name, function):
             while not stop.wait(0.5):
@@ -123,7 +125,7 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
                     except Exception:
                         pass
 
-        for name, function in (("poll", weixin.poll_once), ("send", weixin.send_once), ("event", events.deliver_once)):
+        for name, function in (("poll", weixin.poll_once), ("send", weixin.send_once), ("event", events.deliver_once), ("media", media.tick)):
             thread = threading.Thread(target=run_worker, args=(name, function), daemon=True, name=name)
             thread.start()
             threads.append(thread)

@@ -47,9 +47,9 @@ class MCPTests(unittest.TestCase):
         for version in [PROTOCOL, "2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"]:
             self.assertEqual(self.request("initialize", {"protocolVersion": version})["result"]["protocolVersion"], version)
 
-    def test_exact_five_tools_and_unbound_status_only(self):
+    def test_exact_tools_and_unbound_status_only(self):
         tools = self.request("tools/list")["result"]["tools"]
-        self.assertEqual({tool["name"] for tool in tools}, {"get_weixin_status", "read_weixin_message", "reply_weixin_message", "get_weixin_send_status", "list_pending_weixin_messages"})
+        self.assertEqual({tool["name"] for tool in tools}, {"get_weixin_status", "read_weixin_message", "reply_weixin_message", "get_weixin_send_status", "list_pending_weixin_messages", "read_weixin_attachment", "stage_weixin_attachment", "reply_weixin_attachment"})
         self.assertTrue(all(tool["inputSchema"]["additionalProperties"] is False for tool in tools))
         self.assertFalse(self.call("get_weixin_status")["result"]["isError"])
         self.assertTrue(self.call("list_pending_weixin_messages")["result"]["isError"])
@@ -75,7 +75,7 @@ class MCPTests(unittest.TestCase):
         self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM replies").fetchone()[0], 0)
 
     def test_schema_errors_and_secret_safe_internal_failures(self):
-        for name, args in [("get_weixin_status", {"extra": "secret"}), ("read_weixin_message", {}), ("list_pending_weixin_messages", {"limit": True}), ("list_pending_weixin_messages", {"limit": 101}), ("reply_weixin_message", {"message_id": "m", "text": "字" * 3000}), ("send_weixin_message", {})]:
+        for name, args in [("get_weixin_status", {"extra": "secret"}), ("read_weixin_message", {}), ("list_pending_weixin_messages", {"limit": True}), ("list_pending_weixin_messages", {"limit": 101}), ("reply_weixin_message", {"message_id": "m", "text": "字" * 90000}), ("send_weixin_message", {})]:
             response = self.call(name, args)
             self.assertEqual(response["error"]["code"], -32602)
             self.assertNotIn("secret", json.dumps(response))

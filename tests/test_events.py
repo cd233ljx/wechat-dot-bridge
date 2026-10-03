@@ -66,6 +66,16 @@ class EventTests(unittest.TestCase):
         params["delivery"].pop("secret")
         return self.events.unsubscribe(params)
 
+    def test_media_event_waits_for_download_but_failed_media_is_not_lost(self):
+        self.events.subscribe(self.params)
+        self.store.ingest("fixture-account", [{"source_id": "media-fixture", "peer": "fixture-owner", "text": "[微信附件]", "created_at": self.clock(), "context_token": "fixture-context", "attachments": [{"kind": "file", "name": "fixture.txt", "url": "fixture"}]}], "media-cursor")
+        self.assertFalse(self.events.deliver_once())
+        mid = self.store.list_pending()[0]["message_id"]
+        aid = self.store.read_message(mid)["attachments"][0]["attachment_id"]
+        self.store.fail_attachment(aid, "media_decryption_failed")
+        self.assertTrue(self.events.deliver_once())
+        self.assertEqual(json.loads(self.callback.calls[-1][1])["data"]["message_id"], mid)
+
     def test_verification_signed_and_stable_refresh(self):
         first = self.events.subscribe(self.params)
         self.assertEqual(first["id"], self.events.subscribe(self.params)["id"])

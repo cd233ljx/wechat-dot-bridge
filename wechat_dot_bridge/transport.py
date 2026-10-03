@@ -262,7 +262,14 @@ class IlinkClient:
         checked = _binding(binding)
         if not isinstance(reply, dict) or reply.get("peer") != checked["owner"]:
             raise BridgeError("invalid_reply")
-        text = _checked_string(reply.get("text"), MAX_TEXT_BYTES, "invalid_reply")
+        text = reply.get("text", "")
+        attachment = reply.get("attachment")
+        if text or attachment is None:
+            text = _checked_string(text, MAX_TEXT_BYTES, "invalid_reply")
+        items = [{"type": 1, "text_item": {"text": text}}] if text else []
+        if attachment is not None:
+            from .media import upload_item
+            items.append(upload_item(self, checked, attachment))
         context = _checked_string(reply.get("context_token"), MAX_CONTEXT_BYTES, "context_required")
         client_id = _checked_string(reply.get("client_id"), 256, "invalid_reply")
         return self._post(checked, "/ilink/bot/sendmessage", {
@@ -270,7 +277,7 @@ class IlinkClient:
                 "from_user_id": "", "to_user_id": checked["owner"],
                 "client_id": client_id, "message_type": 2, "message_state": 2,
                 "context_token": context,
-                "item_list": [{"type": 1, "text_item": {"text": text}}],
+                "item_list": items,
             }, "base_info": self._base_info(),
         }, 15.0)
 
@@ -278,7 +285,7 @@ class IlinkClient:
 def _application_error(response: dict) -> str | None:
     if not isinstance(response, dict):
         return "response_invalid"
-    known_fields = {"typing_ticket", "ret", "errcode", "errmsg", "message_id", "msgs", "get_updates_buf", "longpolling_timeout_ms"}
+    known_fields = {"upload_full_url", "upload_param", "typing_ticket", "ret", "errcode", "errmsg", "message_id", "msgs", "get_updates_buf", "longpolling_timeout_ms"}
     if response and not known_fields.intersection(response):
         return "response_invalid"
     codes = []
@@ -293,6 +300,8 @@ def _application_error(response: dict) -> str | None:
         codes.append(value)
     if -14 in codes:
         return "auth_required"
+    if -2 in codes and "prepare failed" in str(response.get("errmsg", "")).lower():
+        return "rate_limited"
     if any(code != 0 for code in codes):
         # No inferred undocumented error-code mapping. A named context-token
         # rejection can be classified without retaining the remote error text.
@@ -334,15 +343,44 @@ def _normalize_message(message: dict, binding: dict, now: float) -> dict | None:
     items = message.get("item_list")
     if not isinstance(items, list) or not items or len(items) > 32:
         return None
-    parts = []
+    parts, attachments, quotes = [], [], []
+    from .media import descriptor, KINDS
     for item in items:
-        if not isinstance(item, dict) or type(item.get("type")) is not int or item["type"] != 1 or item.get("ref_msg"):
+        if not isinstance(item, dict) or type(item.get("type")) is not int:
             return None
-        text_item = item.get("text_item")
-        if not isinstance(text_item, dict) or not isinstance(text_item.get("text"), str):
+        if item.get("ref_msg"):
+            from .message_format import quote_content
+            ref = item["ref_msg"]
+            quoted, quoted_media = quote_content(ref)
+            if isinstance(ref, dict) and ref.get("svr_id") and not ref.get("message_item"):
+                quotes.append({"source_id": str(ref["svr_id"]), "partial": ref.get("partial_text")})
+            if quoted:
+                parts.append("[引用]\n" + quoted + "\n[/引用]")
+            if quoted_media:
+                try:
+                    attachments.append(descriptor(quoted_media))
+                except BridgeError as error:
+                    attachments.append({"kind": KINDS[quoted_media["type"]], "name": "quoted", "error": error.code})
+        if item["type"] == 1:
+            text_item = item.get("text_item")
+            if not isinstance(text_item, dict) or not isinstance(text_item.get("text"), str):
+                return None
+            parts.append(text_item["text"])
+        elif item["type"] in KINDS:
+            if item["type"] == 3 and isinstance(item.get("voice_item"), dict) and isinstance(item["voice_item"].get("text"), str) and item["voice_item"]["text"].strip():
+                parts.append(item["voice_item"]["text"])
+            else:
+                try:
+                    attachments.append(descriptor(item))
+                except BridgeError as error:
+                    attachments.append({"kind": KINDS[item["type"]], "name": KINDS[item["type"]], "error": error.code})
+        else:
             return None
-        parts.append(text_item["text"])
+    if len(attachments) > 8:
+        attachments = [{"kind": "file", "name": "attachments", "error": "media_too_large"}]
     text = "\n".join(parts)
+    if not text.strip() and attachments:
+        text = "[微信附件]"
     try:
         if not text.strip() or len(text.encode("utf-8")) > MAX_TEXT_BYTES:
             return None
@@ -375,7 +413,7 @@ def _normalize_message(message: dict, binding: dict, now: float) -> dict | None:
     except UnicodeError:
         return None
     return {"source_id": source_id, "peer": binding["owner"], "text": text,
-            "created_at": created_at, "context_token": context or None}
+            "created_at": created_at, "context_token": context or None, "attachments": attachments, "quotes": quotes}
 
 
 class WeixinWorker:
@@ -435,10 +473,15 @@ class WeixinWorker:
                 self._record_error(error)
             else:
                 self.store.finish_send(message_id, "accepted", reply_id=reply.get("reply_id"))
+                if response.get("message_id") and hasattr(self.store, "remember_sent_quote"):
+                    try:
+                        self.store.remember_sent_quote(str(response["message_id"]), reply)
+                    except BridgeError:
+                        pass  # Quote cache cannot change an accepted send result.
                 self.store.record_error(None)
         except BridgeError as error:
             status = error.code if error.code in ("auth_required", "context_required") else (
-                "failed" if error.code in ("endpoint_rejected", "dns_rejected", "binding_invalid", "invalid_reply") else "uncertain")
+                "failed" if error.code in ("endpoint_rejected", "dns_rejected", "binding_invalid", "invalid_reply") or error.code.startswith("media_") else "uncertain")
             self.store.finish_send(message_id, status, error.code, reply_id=reply.get("reply_id"))
             self._record_error(error.code)
         except (UnicodeError, ValueError, TypeError, OverflowError):

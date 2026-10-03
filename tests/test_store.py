@@ -317,7 +317,7 @@ class StoreTests(unittest.TestCase):
         self.expect_error("send_queue_full", self.store.queue_reply, identifiers[-1], "回答")
         # Retrying an already committed message is valid even at capacity.
         self.assertEqual(self.store.queue_reply(identifiers[0], "回答")["status"], "queued")
-        for text in ("", " ", "\ud800", "中" * 2731):
+        for text in ("", " ", "\ud800", "中" * 90000):
             self.expect_error("invalid_reply_text", self.store.queue_reply, identifiers[-1], text)
 
     def test_maximum_utf8_reply_is_preserved_without_chunking(self):

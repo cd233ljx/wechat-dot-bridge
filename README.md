@@ -1,14 +1,14 @@
 # WeChat Dot Bridge
 
-把微信插件的本人私聊文字接到**已有的 OpenAI dot**：微信来信保存到本机队列，通过 MCP Events 通知 dot；dot 读取来信、调用回复工具，桥接把文字发回该消息所属的微信对话。
+把微信插件的本人私聊消息接到**已有的 OpenAI dot**：微信来信保存到本机队列，通过 MCP Events 通知 dot；dot 读取来信、调用回复工具，桥接把回复发回该消息所属的微信对话。
 
-桥接使用 Python 3.11+ 标准库和 SQLite。它不运行模型、不调用模型 API、不启动 Codex CLI，也不创建替代 dot 的助手。dot / Work 和相关 OpenAI 产品仍受各自用量与费用规则约束。
+桥接使用 Python 3.11+、SQLite、cryptography 和 Pillow。它不运行模型、不调用模型 API、不启动 Codex CLI，也不创建替代 dot 的助手。dot / Work 和相关 OpenAI 产品仍受各自用量与费用规则约束。
 
-**当前状态：本地实现与 fixture 测试已完成，真实微信 → 现有 dot → 同一微信对话的真人闭环尚未验收。** 接入能力、账号权限和微信实际行为需要在你自己的环境验证。
+**当前状态：文字闭环和微信输入提示已通过本人真人验收；媒体及扩展能力已通过本地测试，真实微信端媒体验收待完成。** 接入能力、账号权限和微信实际行为需要在你自己的环境验证。
 
 ```mermaid
 flowchart LR
-    WX[本人微信私聊] --> I[腾讯 iLink 文字协议]
+    WX[本人微信私聊] --> I[腾讯 iLink 收发协议]
     I --> Q[本机 SQLite 收件箱]
     Q --> E[MCP Events: 消息 ID]
     E --> D[已有 dot]
@@ -25,12 +25,14 @@ flowchart LR
 - 私有连接使用官方 [openai/tunnel-client](https://github.com/openai/tunnel-client/releases/latest)，不开放本机公网 MCP 端口。
 - 事件依据 [OpenAI MCP Events](https://developers.openai.com/plugins/build/mcp-events)，支持 `2026-07-28` discovery、验证、订阅刷新和取消。
 - `cc-connect` 和 `dots-wechat-bridge` 只作为可行性调查参考，不是运行依赖；本目录没有复制它们的实现。
-- 不支持群聊、多用户、图片、文件、语音、无来信主动发送或跨账号迁移。
+- 支持图片、文件、视频、语音转写及 AMR/SILK 回传、引用内容、长文分段、分块上传；详细边界见 [能力对照](docs/CAPABILITIES.md)。
+- 不支持群聊、多用户、无来信无限制主动发送或跨账号历史迁移。
 
-本地安装脚本面向 Linux 和 systemd 用户服务。先确认 Python 版本；按下方源码运行方式安装不需要 pip 下载依赖。
+本地安装脚本面向 Linux 和 systemd 用户服务。先确认 Python 版本；在启动包装器使用的 Python 环境中安装依赖，或先创建专用 venv，再使用该环境执行安装脚本。
 
 ```bash
 python3 --version
+python3 -m pip install -e .
 python3 -m unittest discover -s tests -v
 ```
 
@@ -169,7 +171,10 @@ python3 scripts/check_runtime.py \
 | 工具 | 用途 |
 | --- | --- |
 | `get_weixin_status` | 查看安全状态、队列和订阅错误 |
-| `read_weixin_message` | 按消息 ID 读取本人文字 |
+| `read_weixin_message` | 读取本人来信、引用和附件；就绪图片直接返回可视预览 |
+| `read_weixin_attachment` | 读取图片预览、文件分块与文本文件内容 |
+| `stage_weixin_attachment` | 私有暂存新附件，支持分块上传 |
+| `reply_weixin_attachment` | 将收到或暂存的附件回传同一对话 |
 | `reply_weixin_message` | 为已有来信提交回复，支持多次追加 |
 | `get_weixin_send_status` | 查询 API 接受、失败或不确定状态 |
 | `list_pending_weixin_messages` | 显式恢复尚未提交回复的来信 |
@@ -178,7 +183,7 @@ python3 scripts/check_runtime.py \
 
 可用 [真人验收记录模板](docs/REAL_VALIDATION.md)逐项记录部署结果；该模板初始全部待验证。
 
-`accepted` 仅代表微信 API 接受请求，**不等于已经投递或已读**。POST 后失联会保留 `uncertain`，系统不盲目重发。同一消息重复提交相同回复幂等；提交不同回复被拒绝。详细失败与恢复边界见 [安全说明](docs/SECURITY.md) 和 [dot 设置说明](docs/DOT_SETUP.md)。
+`accepted` 仅代表微信 API 接受请求，**不等于已经投递或已读**。POST 后失联会保留 `uncertain`，系统不盲目重发。同一来信可以追加多条不同回复；相同正文默认幂等，独立 `reply_key` 可区分有意重复的回复。长文分段状态会持久保存，可查询 `parts_total` 和 `parts_accepted`。详细失败与恢复边界见 [安全说明](docs/SECURITY.md) 和 [dot 设置说明](docs/DOT_SETUP.md)。
 
 ## 停止与回滚
 

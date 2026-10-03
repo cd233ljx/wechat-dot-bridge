@@ -215,9 +215,7 @@ class MessageAndWorkerTests(unittest.TestCase):
                  message(room_id="fixture-room"), message(delete_time_ms=1700000000123),
                  message(to_user_id="other@im.bot"), message(to_user_id=None),
                  message(message_type=2), message(message_type=True), message(message_state=1),
-                 message(item_list=[{"type": 3, "voice_item": {"text": "transcription"}}]),
-                 message(item_list=[{"type": 1, "text_item": {"text": "text"}}, {"type": 2, "image_item": {}}]),
-                 message(item_list=[{"type": 1, "text_item": {"text": "quoted"}, "ref_msg": {"title": "quote"}}]),
+                 message(item_list=[{"type": 99}]),
                  message(item_list=[{"type": 1, "text_item": {"text": " "}}])]
         for case in cases:
             with self.subTest(case=case):
@@ -235,7 +233,7 @@ class MessageAndWorkerTests(unittest.TestCase):
         self.assertEqual(account, FIXTURE["id"])
         self.assertEqual(len(messages), 1)
         self.assertEqual(cursor, "next-fixture-cursor")
-        self.assertEqual(set(messages[0]), {"source_id", "peer", "text", "created_at", "context_token"})
+        self.assertEqual(set(messages[0]), {"source_id", "peer", "text", "created_at", "context_token", "attachments", "quotes"})
         self.assertEqual(store.errors[-1], None)
 
     def test_bad_poll_never_advances_cursor_and_stale_auth_disables(self):

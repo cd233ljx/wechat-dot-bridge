@@ -193,7 +193,7 @@ class PipelineTests(unittest.TestCase):
                     self.wire_message(5, group_id="fixture-group"),
                     self.wire_message(6, delete_time_ms=int(self.clock() * 1000)),
                     self.wire_message(7, message_state=1), self.wire_message(8, message_type=2),
-                    self.wire_message(9, item_list=[{"type": 2, "image_item": {}}])]
+                    self.wire_message(9, item_list=[{"type": 99}])]
         self.receive(rejected)
         self.assertEqual(self.call("list_pending_weixin_messages")["messages"], [])
         self.assertFalse(self.events.deliver_once())

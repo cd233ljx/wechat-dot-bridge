@@ -6,5 +6,10 @@ cc-connect and dots-wechat-bridge were examined during feasibility research;
 neither is a runtime dependency and neither project's source is vendored here.
 OpenAI tunnel-client is installed separately from its official release archive;
 the installed archive retains its own licenses and companion files.
-Python's standard library and SQLite are the only bridge runtime dependencies.
+Media protocol and partial-quote handling are adapted from the Tencent reference
+above; the original MIT copyright notice is retained in licenses/.
+Runtime dependencies also include cryptography (Apache-2.0 OR BSD-3-Clause)
+and Pillow (MIT-CMU), installed separately with their distribution notices.
+https://github.com/pyca/cryptography
+https://github.com/python-pillow/Pillow
 This project is independent and is not endorsed by OpenAI or Tencent.

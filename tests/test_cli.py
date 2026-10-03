@@ -56,7 +56,7 @@ class StdioTests(unittest.TestCase):
         process.stdin.write(b"invalid-json\n")
         process.stdin.flush()
         self.assertEqual(json.loads(process.stdout.readline())["error"]["code"], -32700)
-        process.stdin.write(b"x" * 140000 + b"\n")
+        process.stdin.write(b"x" * (2 * 1024 * 1024 + 1) + b"\n")
         process.stdin.flush()
         self.assertEqual(json.loads(process.stdout.readline())["error"]["code"], -32600)
         response = self.request(process, {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "get_weixin_status"}})

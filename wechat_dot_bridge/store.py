@@ -24,7 +24,7 @@ from .errors import BridgeError
 MAX_PENDING = 128
 MAX_QUEUED_REPLIES = 32
 MAX_INBOUND_BYTES = 65536
-MAX_REPLY_BYTES = 8192
+MAX_REPLY_BYTES = 262144
 SEND_OUTCOMES = frozenset(
     {"accepted", "uncertain", "failed", "context_required", "auth_required"}
 )
@@ -123,7 +123,11 @@ def _private_database_file(directory):
     return path
 
 
-class Store:
+from .attachment_store import AttachmentStore, MEDIA_ERRORS
+SAFE_ERRORS = SAFE_ERRORS | MEDIA_ERRORS
+
+
+class Store(AttachmentStore):
     def __init__(self, state_dir, clock=time.time):
         self.directory = _private_directory(state_dir)
         self.state_dir = self.directory
@@ -176,6 +180,12 @@ class Store:
                     ON replies(status,created_at);
             """)
             self._migrate_reply_identity()
+            self._init_media()
+            self.db.execute("""CREATE TABLE IF NOT EXISTS sent_quotes (
+                source_id TEXT PRIMARY KEY, text TEXT NOT NULL, attachment_id TEXT)""")
+            self.db.execute("""CREATE TABLE IF NOT EXISTS reply_parts (
+                reply_id TEXT NOT NULL, part INTEGER NOT NULL, text TEXT NOT NULL,
+                accepted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(reply_id,part))""")
             if self.db.execute("SELECT count(*) FROM binding").fetchone()[0] > 1:
                 raise BridgeError("invalid_binding_state")
         except (sqlite3.Error, BridgeError) as error:
@@ -346,7 +356,13 @@ class Store:
                     or (context is not None and (not isinstance(context, str)
                         or not 0 < len(context) <= 16384))):
                 raise BridgeError("invalid_inbound_message")
-            normalized.append((source, peer, text, float(created_at), context))
+            refs = message.get("attachments", [])
+            if not isinstance(refs, list) or len(refs) > 8 or any(not isinstance(r, dict) or r.get("kind") not in ("image", "file", "voice", "video") for r in refs):
+                raise BridgeError("invalid_inbound_message")
+            quotes = message.get("quotes", [])
+            if not isinstance(quotes, list) or len(quotes) > 32 or any(not isinstance(q, dict) for q in quotes):
+                raise BridgeError("invalid_inbound_message")
+            normalized.append((source, peer, text, float(created_at), context, refs, quotes))
         with self._transaction():
             binding = self._binding()
             if account_id != binding["id"]:
@@ -358,7 +374,7 @@ class Store:
                 "SELECT count(*) FROM messages WHERE account=? AND peer=? AND state='pending'",
                 (binding["id"], binding["owner"])).fetchone()[0]
             added = 0
-            for source, peer, text, created_at, context in normalized:
+            for source, peer, text, created_at, context, refs, quotes in normalized:
                 if peer != binding["owner"]:
                     raise BridgeError("owner_identity_mismatch")
                 identifier = _opaque_id(binding["id"], peer, source)
@@ -366,10 +382,37 @@ class Store:
                     continue
                 if count + added >= MAX_PENDING:
                     raise BridgeError("inbox_full")
+                from .message_format import partial_quote
+                cached_aids = []
+                for quote in quotes:
+                    sid = quote.get("source_id")
+                    if not isinstance(sid, str) or not sid.isdigit() or len(sid) > 20:
+                        continue
+                    cached = self.db.execute("SELECT id,text FROM messages WHERE account=? AND peer=? AND source_id=?", (binding["id"], peer, "message:" + str(int(sid)))).fetchone()
+                    if cached:
+                        quote_text = cached["text"]
+                        cached_aids.extend(r[0] for r in self.db.execute("SELECT id FROM attachments WHERE message_id=?", (cached["id"],)))
+                    else:
+                        sent = self.db.execute("SELECT text,attachment_id FROM sent_quotes WHERE source_id=?", (sid,)).fetchone()
+                        if not sent:
+                            continue
+                        quote_text = sent["text"]
+                        if sent["attachment_id"]:
+                            cached_aids.append(sent["attachment_id"])
+                    quoted = partial_quote(quote_text, quote.get("partial"))
+                    budget = max(0, MAX_INBOUND_BYTES - len(text.encode()) - 64)
+                    quoted = quoted.encode()[:budget].decode("utf-8", errors="ignore")
+                    if quoted:
+                        text = "[引用缓存]\n" + quoted + "\n[/引用缓存]\n" + text
                 self.db.execute(
                     "INSERT INTO messages(id,account,peer,source_id,text,created_at,context_token) "
                     "VALUES(?,?,?,?,?,?,?)",
                     (identifier, binding["id"], peer, source, text, created_at, context))
+                self._ingest_attachments(binding, identifier, refs)
+                for index, aid in enumerate(cached_aids):
+                    target = "att_" + hashlib.sha256((identifier + ":quote:" + str(index)).encode()).hexdigest()
+                    self.db.execute("""INSERT OR IGNORE INTO attachments(id,account,peer,message_id,kind,name,descriptor,data,status,error,attempts,next_attempt)
+                        SELECT ?,account,peer,?,kind,name,descriptor,data,CASE WHEN status='downloading' THEN 'pending' ELSE status END,error,attempts,next_attempt FROM attachments WHERE id=?""", (target, identifier, aid))
                 added += 1
             latest_context = self._latest_context(binding)
             if latest_context and (previous_context is None or latest_context["id"] != previous_context["id"]):
@@ -381,10 +424,18 @@ class Store:
             self.db.execute("UPDATE binding SET cursor=?,last_error=NULL WHERE id=?", (cursor, binding["id"]))
         return added
 
+    def remember_sent_quote(self, source_id, reply):
+        if not source_id.isdigit() or len(source_id) > 20:
+            return
+        with self._transaction():
+            attachment = reply.get("attachment")
+            self.db.execute("INSERT OR REPLACE INTO sent_quotes VALUES(?,?,?)", (source_id, reply["text"], attachment["id"] if attachment else None))
+
     def read_message(self, message_id):
         with self.lock:
             message = self._message(message_id, self._binding())
-            return {"message_id": message["id"], "text": message["text"], "created_at": message["created_at"]}
+            return {"message_id": message["id"], "text": message["text"], "created_at": message["created_at"],
+                    "attachments": self.attachment_metadata(message_id)}
 
     def typing_target(self, message_ids):
         """Internal route only for pending owner messages dot has actually read."""
@@ -416,23 +467,25 @@ class Store:
                 "ORDER BY created_at,rowid LIMIT ?", (binding["id"], binding["owner"], limit)).fetchall()
             return [{"message_id": row["id"], "created_at": row["created_at"]} for row in rows]
 
-    def queue_reply(self, message_id, text, reply_key=None):
+    def queue_reply(self, message_id, text, reply_key=None, attachment_id=None):
         size = _text_bytes(text)
-        if size is None or not text.strip() or not 0 < size <= MAX_REPLY_BYTES:
+        if size is None or size > MAX_REPLY_BYTES or (not text.strip() and attachment_id is None):
             raise BridgeError("invalid_reply_text")
         with self._transaction():
             binding = self._binding()
             self._message(message_id, binding)
             if reply_key is not None and (not isinstance(reply_key, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", reply_key)):
                 raise BridgeError("invalid_reply_key")
-            identity = json.dumps([message_id, reply_key if reply_key is not None else text, reply_key is not None], ensure_ascii=False)
+            if attachment_id is not None:
+                self.read_attachment(attachment_id)
+            identity = json.dumps([message_id, reply_key if reply_key is not None else text, reply_key is not None] + ([attachment_id] if attachment_id and reply_key is None else []), ensure_ascii=False)
             client_id = "dot_reply_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
             if reply_key is None:
-                existing = self.db.execute("SELECT text,client_id FROM replies WHERE message_id=? AND text=? ORDER BY rowid LIMIT 1", (message_id, text)).fetchone()
+                existing = self.db.execute("SELECT text,client_id,attachment_id FROM replies WHERE message_id=? AND text=? AND attachment_id IS ? ORDER BY rowid LIMIT 1", (message_id, text, attachment_id)).fetchone()
             else:
-                existing = self.db.execute("SELECT text,client_id FROM replies WHERE message_id=? AND client_id=?", (message_id, client_id)).fetchone()
+                existing = self.db.execute("SELECT text,client_id,attachment_id FROM replies WHERE message_id=? AND client_id=?", (message_id, client_id)).fetchone()
             if existing:
-                if existing["text"] != text:
+                if existing["text"] != text or existing["attachment_id"] != attachment_id:
                     raise BridgeError("reply_key_conflict")
                 client_id = existing["client_id"]
             else:
@@ -445,8 +498,11 @@ class Store:
                 if queued >= MAX_QUEUED_REPLIES:
                     raise BridgeError("send_queue_full")
                 self.db.execute(
-                    "INSERT INTO replies(message_id,text,client_id,status,created_at) VALUES(?,?,?,'queued',?)",
-                    (message_id, text, client_id, self.clock()))
+                    "INSERT INTO replies(message_id,text,client_id,status,created_at,attachment_id) VALUES(?,?,?,'queued',?,?)",
+                    (message_id, text, client_id, self.clock(), attachment_id))
+                from .message_format import split_text
+                for part, chunk in enumerate(split_text(text)):
+                    self.db.execute("INSERT INTO reply_parts(reply_id,part,text) VALUES(?,?,?)", (client_id, part, chunk))
                 self.db.execute("UPDATE messages SET state='reply_committed' WHERE id=?", (message_id,))
         return self.send_status(message_id, client_id)
 
@@ -462,6 +518,10 @@ class Store:
             result = {"message_id": message_id, "status": reply["status"] if reply else "no_reply", "delivered": None}
             if reply:
                 result["reply_id"] = reply["client_id"]
+            if reply:
+                parts = self.db.execute("SELECT count(*),COALESCE(SUM(accepted),0) FROM reply_parts WHERE reply_id=?", (reply["client_id"],)).fetchone()
+                if parts[0] > 1:
+                    result.update(parts_total=parts[0], parts_accepted=parts[1])
             if reply and reply["error"]:
                 result["error"] = _safe_error(reply["error"])
             return result
@@ -489,9 +549,12 @@ class Store:
             self.db.execute(
                 "UPDATE replies SET status='sending',error=NULL,context_id=?,attempts=attempts+1 WHERE client_id=?",
                 (context["id"], row["client_id"]))
-            return {"message_id": row["message_id"], "reply_id": row["client_id"], "text": row["text"],
-                    "client_id": row["client_id"], "peer": row["peer"],
-                    "context_token": context["context_token"]}
+            part = self.db.execute("SELECT part,text FROM reply_parts WHERE reply_id=? AND accepted=0 ORDER BY part LIMIT 1", (row["client_id"],)).fetchone()
+            remaining = self.db.execute("SELECT count(*) FROM reply_parts WHERE reply_id=? AND accepted=0", (row["client_id"],)).fetchone()[0]
+            return {"message_id": row["message_id"], "reply_id": row["client_id"], "text": part["text"] if part else row["text"],
+                    "client_id": row["client_id"] + ("_part_" + str(part["part"]) if part and part["part"] else ""), "peer": row["peer"],
+                    "context_token": context["context_token"],
+                    **({"attachment": self.read_attachment(row["attachment_id"])} if row["attachment_id"] and remaining <= 1 else {})}
 
     def finish_send(self, message_id, status, error=None, reply_id=None):
         if not isinstance(status, str) or status not in SEND_OUTCOMES:
@@ -518,6 +581,13 @@ class Store:
                     status, diagnostic = "failed", "retry_limit"
                 elif context and context["id"] != reply["context_id"]:
                     status, diagnostic = "queued", None
+            if status == "accepted":
+                part = self.db.execute("SELECT part FROM reply_parts WHERE reply_id=? AND accepted=0 ORDER BY part LIMIT 1", (reply["client_id"],)).fetchone()
+                if part:
+                    self.db.execute("UPDATE reply_parts SET accepted=1 WHERE reply_id=? AND part=?", (reply["client_id"], part["part"]))
+                    if self.db.execute("SELECT 1 FROM reply_parts WHERE reply_id=? AND accepted=0", (reply["client_id"],)).fetchone():
+                        status = "queued"
+                        self.db.execute("UPDATE replies SET attempts=0 WHERE client_id=?", (reply["client_id"],))
             self.db.execute("UPDATE replies SET status=?,error=? WHERE client_id=?", (status, diagnostic, reply["client_id"]))
             if status == "accepted":
                 self.db.execute("UPDATE messages SET state='replied' WHERE id=?", (message_id,))
@@ -557,6 +627,7 @@ class Store:
             result = {"bound": bool(binding), "enabled": bool(binding and binding["enabled"]),
                       "account_status": binding["status"] if binding else "not_bound",
                       "pending": pending, "reply_status": counts, "active_subscriptions": active}
+            result["attachments"] = {row[0]: row[1] for row in self.db.execute("SELECT status,count(*) FROM attachments GROUP BY status")}
             if binding and binding["last_error"]:
                 result["last_error"] = _safe_error(binding["last_error"])
             return result

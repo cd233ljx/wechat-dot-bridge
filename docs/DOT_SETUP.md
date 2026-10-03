@@ -12,7 +12,7 @@ MCP Events 目前支持 dot，以及符合条件的 Work / Cloud 聊天；它要
 2. 运行 README 中配置的官方 `tunnel-client` 用户服务。桥接通过 stdio 接收 MCP，不需要公网入站端口。
 3. 打开 [ChatGPT Plugins](https://chatgpt.com/plugins)，创建开发者插件，在 Connection 中选 **Tunnel**，选择已有 Tunnel 或填入控制台给出的有效 identity。本方案为单人私有 stdio 服务，认证方式选择 **No authentication / 无认证**，依赖仅本人可用的 Tunnel 访问控制；不要选需要独立 OAuth 服务的 OAuth 模式。
 4. 保持插件仅自己可用，不分享给工作区、组织或其他账号。不要发布到公共目录。私人 Tunnel 与公共插件发布是不同部署模式。
-5. 扫描 / 刷新插件工具和事件，确认五个工具以及 `weixin.message` 出现，然后把插件添加到你原有 dot。
+5. 扫描 / 刷新插件工具和事件，确认八个工具以及 `weixin.message` 出现，然后把插件添加到你原有 dot。
 
 这些连接方式与访问要求依据 [官方 Secure MCP Tunnel 指南](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。**不要自行构造 `server_url`、伪造 Tunnel URL 或把本机 stdio 当公共服务地址。** 未出现在插件页面时先核验关联和权限；不要因此开放公网 MCP 端口。
 
@@ -41,7 +41,7 @@ MCP Events 目前支持 dot，以及符合条件的 Work / Cloud 聊天；它要
 
 可在原 dot 中发送以下指令；这是操作者对 dot 的工作要求，不会嵌入事件消息：
 
-> 使用我添加的私人 WeChat Dot Bridge 插件，订阅 `weixin.message`。每次收到事件，先用 `read_weixin_message` 读取该 `message_id`，理解我的文字，再用 `reply_weixin_message` 向同一条来信回复；可以先发进度，随后按需追加分段内容或完成消息。随后用 `get_weixin_send_status` 查询结果。只有 `accepted` 才表示 API 接受；`uncertain` 时不要重试该条回复，但可以提交其他进度或完成回复。不要新建助手，不发送没有原来信的主动消息，不处理群聊或媒体。
+> 使用我添加的私人 WeChat Dot Bridge 插件，订阅 `weixin.message`。每次收到事件，先用 `read_weixin_message` 读取该 `message_id`，理解我的文字，再用 `reply_weixin_message` 向同一条来信回复；可以先发进度，随后按需追加分段内容或完成消息。随后用 `get_weixin_send_status` 查询结果。只有 `accepted` 才表示 API 接受；`uncertain` 时不要重试该条回复，但可以提交其他进度或完成回复。不要新建助手，不发送没有原来信的主动消息，不处理群聊。遇到附件，读取 `attachments`；图片预览可直接理解，其他附件用 `read_weixin_attachment` 读取。需要回传原附件时直接用原 `attachment_id` 调用 `reply_weixin_attachment`，不要把文件重新编码。新附件用 `stage_weixin_attachment` 暂存；超过单次 1 MiB 时使用同一个 `upload_id`、字节 `offset` 分块，最后一块 `final:true`。不要对尚未读取成功的附件声称已经理解。
 
 如需不过期，在原 dot 中要求刷新同一个订阅，明确传 `ttlMs: null`，并确认返回 `refreshBefore: null`。省略 `ttlMs` 仍使用一小时默认期限；明确请求有限期限时仍尊重该请求（最长一天、最短一分钟）。不过期订阅可取消，回调返回 410 也会停止投递。更新服务器代码不会自动修改已授予的有限订阅，必须由原 dot 刷新，让平台得到新的到期信息。
 
@@ -97,3 +97,15 @@ API 接受与实际可见回复是两个验收点。不能仅凭 fixture 测试�
 在原 dot 明确取消对 `weixin.message` 的订阅，调用状态确认不再有有效订阅。取消仅停止 dot 通知；若需要停止微信收发，还必须停止本机用户服务并执行 `pause`，具体命令见 README。
 
 dot / Work 的使用仍消耗其正常用量。桥接不新增模型 API 调用，不能承诺整个流程免费。
+
+## 扩展能力验收
+
+刷新现有插件工具定义至八个，无需新建插件、订阅或重新扫码。原 dot 应继续复用唯一订阅。
+
+1. 图片：发送普通图片，请 dot 描述内容后回传原图；确认图可见且原图回到同一对话。
+2. 文件 / 视频：分别发送一个小文本文件和短视频，请 dot 回传；文件名、大小、内容应保持一致。视频接收回传不等于 dot 已理解画面。
+3. 语音：发送语音并让 dot 复述微信提供的转写；若没有转写，工具保留原始音频，不虚构识别结果。AMR/SILK 可原生回传，其他编码作为文件。
+4. 引用：引用一条文字及图片分别追问；检查 dot 获得引用内容。只有引用 ID 时，依赖本地收到或发送过的缓存；未缓存的旧历史无法恢复。
+5. 多次回复：同一消息先发进度，再发完成结果；长文本自动分段，查询同一 reply_id 的 parts_total / parts_accepted。
+
+`text_format:"markdown"` 可去掉常见 Markdown 标记并保留代码内容、链接地址；默认 `plain` 原样保留。工具不拦截 /new、/model 或 Shell 风格文字，也不会执行它们。
