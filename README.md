@@ -73,9 +73,23 @@ python3 scripts/install_local.py \
   --key-file "$WDB_KEY_FILE"
 ```
 
-默认包装器安装到 `~/.local/bin/wechat-dot-bridge`，用户服务到 `~/.config/systemd/user/wechat-dot-bridge.service`。可用 `--bin-dir`、`--unit-dir` 指定其他专用位置。脚本不覆盖现有目标，**不会 enable 或 start 服务**。选项 `--proxy http://127.0.0.1:PORT` 仅用于已存在的本机 Tunnel 控制面代理；微信与 Events 回调直接使用经过目标校验的 HTTPS。
+默认包装器安装到 `~/.local/bin/wechat-dot-bridge`，用户服务到 `~/.config/systemd/user/wechat-dot-bridge.service`。可用 `--bin-dir`、`--unit-dir` 指定其他专用位置。脚本不覆盖现有目标，**不会 enable 或 start 服务**。选项 `--proxy http://127.0.0.1:PORT` 仅用于已存在的本机 Tunnel 控制面代理；Events 回调的代理通过下面的独立配置设置，微信收发仍直连经过目标校验的腾讯 HTTPS。
 
 `bridge.json` 中的 `callback_hosts` 初始为空，因此不会向未经批准的回调发送数据。回调的精确域名配置见 [dot 接入说明](docs/DOT_SETUP.md)。配置文件、Tunnel profile 和状态目录都不应加入版本库。
+
+Events 默认使用本机 DNS 和直接 HTTPS；需要经本人管理的本机代理出站，或本机 DNS 对回调主机返回异常地址时，在私人 `bridge.json` 中配置 `callback_proxy` 与 `callback_dns`。下面仅展示相关字段，`PORT` 应替换为现有代理的实际端口：
+
+```json
+{
+  "callback_hosts": ["connectors.api.openai.com"],
+  "callback_proxy": "http://127.0.0.1:PORT",
+  "callback_dns": "google"
+}
+```
+
+只配置已从本人 dot 核验的精确回调主机；官方 MCP Events 文档没有公布上述主机白名单。`callback_proxy` 仅接受 `http://127.0.0.1:端口`；`callback_dns` 支持 `system`（默认）和 `google`，后者固定连接 `8.8.8.8:443` 并以 `dns.google` 核验 TLS。桥接先检查回调 allowlist，再解析并校验公网 IP，代理 `CONNECT` 使用该 IP，回调 TLS 和 HTTP `Host` 保留原 hostname；不继承环境代理，不改变系统 DNS 或代理配置。
+
+Google DoH 仅收到回调主机 DNS 查询，回调路径、签名 secret 和消息不会交给 DNS 服务。本机代理转发 HTTPS 并可观察连接元数据。配置后重启服务，再由原 dot 重新订阅并确认 challenge 验证成功；网络验证失败时不会向回调投递事件。详见 [安全说明](docs/SECURITY.md)。
 
 ## 保留或新建微信绑定
 

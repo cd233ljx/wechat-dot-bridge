@@ -10,7 +10,7 @@ MCP 经官方 Secure MCP Tunnel 访问，本项目不运行公开 HTTP MCP 监�
 
 ## 数据和凭据
 
-消息去向只有腾讯 iLink、当前用户的私人 SQLite、允许的 OpenAI Events 回调，以及经私人 Tunnel 访问的 dot。事件载荷只有 opaque `message_id`，没有消息正文、微信 owner、route、context token 或登录 token。正文经 `read_weixin_message` 提供给有权调用该插件的 dot。
+消息正文的业务去向是腾讯 iLink、当前用户的私人 SQLite，以及经私人 Tunnel 访问的 dot。Events 回调载荷只有 opaque `message_id`，没有消息正文、微信 owner、route、context token 或登录 token。正文经 `read_weixin_message` 提供给有权调用该插件的 dot。
 
 | 数据 | 保存位置 / 对外行为 |
 | --- | --- |
@@ -21,6 +21,8 @@ MCP 经官方 Secure MCP Tunnel 访问，本项目不运行公开 HTTP MCP 监�
 | 待确认二维码 | 私人登录状态文件；确认或过期后清除状态文件中的二维码内容；可选本地 PNG 仍需操作者保管 |
 | 手机验证码 | 隐藏交互输入，不持久保存 |
 
+启用 `callback_proxy` 后，本机 HTTP 代理转发 Events 的端到端 HTTPS 连接，可以观察目标公网 IP、TLS 主机名等连接元数据，桥接不会向它发送明文 callback 路径、签名 secret 或事件 body。启用 `callback_dns: "google"` 后，Google Public DNS 仅收到回调 hostname 的 DNS 查询，不收到 callback URL / path、secret、消息 ID 或消息正文。微信绑定凭据不会进入 Events 请求；微信收发的网络路径不受这两个配置项影响。
+
 专用状态目录使用 `0700`，数据库、运行密钥和私人配置使用 `0600`。禁止用认证缓存作为配置输入，不扫描任何 agent 的认证目录。不要将运行目录、配置文件、数据库、二维码、密钥或 callback URL 放入 Git、聊天、工单附件或公开日志。SQLite 不是加密数据库；有本机同用户或管理员访问权的人可以读取它，备份必须继承相同保密边界。
 
 运行密钥通过 `scripts/save_runtime_key.py` 在交互终端隐藏输入；脚本拒绝管道和覆盖。已有密钥文件应继续引用原文件。Bridge 不调用模型 API，但密钥仍可能属于具有其他权限的 OpenAI 账号，不能声称它没有权限风险或没有用量成本。
@@ -29,15 +31,19 @@ MCP 经官方 Secure MCP Tunnel 访问，本项目不运行公开 HTTP MCP 监�
 
 ## 出站请求校验
 
-微信请求限定在源码认可的腾讯 HTTPS origins；不接受调用者任意指定目标。Events callback 采用配置中的**精确 hostname**：
+微信请求限定在源码认可的腾讯 HTTPS origins；不接受调用者任意指定目标。Events callback 采用配置中的**精确 hostname**，先检查 allowlist，再执行 DNS 和连接：
 
 - 只允许 HTTPS 和 443；拒绝 userinfo、fragment、IP 字面量与通配符。
-- 每次请求重新解析 DNS；任何私有、本机、非公共或 IPv6 地址封装答案都拒绝，不能混合公共与私有答案。
-- 连接使用已校验的地址，不在 socket 连接时再次解析；TLS 仍核验原始 hostname。
-- 不跟随 HTTP redirect，不继承环境变量代理。
+- 每次请求重新解析 DNS；任何私有、本机、非公共或 IPv6 地址封装答案都拒绝，不能混合公共与私有答案。选择 Google DoH 也不跳过这些检查。
+- 直连 socket 或代理 `CONNECT` 都使用已经校验的公网 IP，不让代理再次解析回调 hostname；TLS 证书校验、SNI 和 HTTP `Host` 保留原 hostname。
+- 不跟随 HTTP redirect，不继承环境变量代理。不修改系统 DNS、环境代理或其他服务的网络配置。
 - DNS 与 HTTPS 请求有限时，请求 / 响应大小有限制。
 
-`callback_hosts` 默认空数组。首次订阅会被拒绝，状态只保留观察到的 hostname。操作者应通过 OpenAI 的可信界面或官方来源独立确认后，配置准确主机名；**不要把任意被请求的 hostname 都批准，也不要开放 `*.openai.com` 或全域名通配**。
+`callback_proxy` 未配置时 Events 直连；配置时只接受 `http://127.0.0.1:端口`，不接受远程代理、认证信息、路径、query 或其他 scheme。该代理必须由本人管理，桥接不会新建或修改代理服务。它与官方 Tunnel client 的控制面代理是两个独立配置。
+
+`callback_dns` 可选 `system`（默认）或 `google`。`system` 使用本机解析器；`google` 使用固定 `8.8.8.8:443`，TLS 核验 `dns.google`，通过 HTTPS 请求 Google Public DNS，避免先用本机 DNS 解析 DoH 服务。当启用 `callback_proxy` 时，DoH 也经该显式代理 `CONNECT 8.8.8.8:443`。解析或 TLS 失败时拒绝请求，不回退到未经校验的地址。
+
+`callback_hosts` 默认空数组。首次订阅会被拒绝，状态只保留观察到的 hostname。操作者应通过 OpenAI 的可信界面或官方来源独立确认后，配置准确主机名；**不要把任意被请求的 hostname 都批准，也不要开放 `*.openai.com` 或全域名通配**。本次现有 dot 返回的主机是 `connectors.api.openai.com`；[官方 MCP Events 文档](https://developers.openai.com/plugins/build/mcp-events)没有列出这一精确主机白名单。其核验依据是本人 dot 提供的订阅目标、OpenAI 主域层级、独立 DNS 查询和覆盖该主机的有效 TLS 证书；不是文档背书，也不能据此自动批准其他主机。
 
 激活订阅前发送短期随机 challenge，要求对方成功响应并 constant-time 回显；请求按 [MCP Events 官方要求](https://developers.openai.com/plugins/build/mcp-events)用 Standard Webhooks HMAC 签名。签名覆盖事件 ID、发送时间和确切 body 字节。签名 key 更新持久保存，并在短轮换窗口使用新旧双签名。事件不携带任何要求 dot 执行的用户指令；来信文本是用户数据。
 

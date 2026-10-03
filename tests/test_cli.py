@@ -8,6 +8,10 @@ import sys
 import tempfile
 import time
 import unittest
+from argparse import Namespace
+
+from wechat_dot_bridge.cli import load_config
+from wechat_dot_bridge.errors import BridgeError
 
 ROOT = Path(__file__).absolute().parent.parent
 
@@ -88,6 +92,26 @@ class StdioTests(unittest.TestCase):
 
 
 class SetupTests(unittest.TestCase):
+    def test_callback_network_options_are_operator_only_and_loopback_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "config.json"
+            config = {"state_dir": str(Path(directory) / "state"), "callback_hosts": ["callback.example.com"],
+                      "callback_proxy": "http://127.0.0.1:7890", "callback_dns": "google"}
+            path.write_text(json.dumps(config))
+            options = load_config(Namespace(config=str(path), state_dir=None))
+            self.assertEqual(options[-2:], ("http://127.0.0.1:7890", "google"))
+            for proxy in ("http://192.168.1.1:7890", "http://localhost:7890", "https://127.0.0.1:7890",
+                          "http://user:secret@127.0.0.1:7890", "http://127.0.0.1:0", "http://127.0.0.1:7890/", "http://127.0.0.1:65536"):
+                config["callback_proxy"] = proxy
+                path.write_text(json.dumps(config))
+                with self.assertRaisesRegex(BridgeError, "config_invalid"):
+                    load_config(Namespace(config=str(path), state_dir=None))
+            config["callback_proxy"] = "http://127.0.0.1:7890"
+            config["callback_dns"] = "untrusted.example.com"
+            path.write_text(json.dumps(config))
+            with self.assertRaisesRegex(BridgeError, "config_invalid"):
+                load_config(Namespace(config=str(path), state_dir=None))
+
     def test_hidden_key_save_private_and_no_overwrite_or_symlink(self):
         helper = script_module("save_runtime_key.py")
         with tempfile.TemporaryDirectory() as directory:

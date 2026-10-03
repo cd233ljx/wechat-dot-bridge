@@ -66,7 +66,7 @@ def load_config(args):
             config = json.loads(path.read_text())
         except (OSError, ValueError):
             raise BridgeError("config_invalid") from None
-        if not isinstance(config, dict) or set(config) - {"state_dir", "callback_hosts", "lock_dir"}:
+        if not isinstance(config, dict) or set(config) - {"state_dir", "callback_hosts", "lock_dir", "callback_proxy", "callback_dns"}:
             raise BridgeError("config_invalid")
     state = args.state_dir or config.get("state_dir") or str(Path.home() / ".local/share/wechat-dot-bridge")
     hosts = config.get("callback_hosts", [])
@@ -78,14 +78,22 @@ def load_config(args):
     locks = config.get("lock_dir") or str(Path.home() / ".local/state/wechat-dot-bridge/locks")
     if not isinstance(state, str) or not isinstance(locks, str):
         raise BridgeError("config_invalid")
-    return Path(state).absolute(), hosts, Path(locks).absolute()
+    proxy = config.get("callback_proxy")
+    if proxy is not None:
+        match = re.fullmatch(r"http://127\.0\.0\.1:([0-9]{1,5})", proxy) if isinstance(proxy, str) else None
+        if not match or not 1 <= int(match[1]) <= 65535:
+            raise BridgeError("config_invalid")
+    dns = config.get("callback_dns", "system")
+    if dns not in ("system", "google"):
+        raise BridgeError("config_invalid")
+    return Path(state).absolute(), hosts, Path(locks).absolute(), proxy, dns
 
 
 def rpc_error(code, message):
     return {"jsonrpc": "2.0", "id": None, "error": {"code": code, "message": message}}
 
 
-def serve(store, hosts, lock_dir, state_dir):
+def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="system"):
     locks = []
     stop = threading.Event()
     threads = []
@@ -97,7 +105,7 @@ def serve(store, hosts, lock_dir, state_dir):
             identity = hashlib.sha256(binding["id"].encode()).hexdigest()
             locks.append(acquire_lock(lock_dir / ("account-" + identity + ".lock")))
         store.recover_inflight()
-        events = Events(store, allowed_hosts=hosts)
+        events = Events(store, allowed_hosts=hosts, proxy=callback_proxy, dns=callback_dns)
         server = MCPServer(store, events)
         weixin = WeixinWorker(store)
 
@@ -182,7 +190,7 @@ def main(argv=None):
     args = parser().parse_args(argv)
     store = None
     try:
-        state, hosts, lock_dir = load_config(args)
+        state, hosts, lock_dir, proxy, dns = load_config(args)
         state = private_directory(state)
         if args.command in ("login-start", "login-poll"):
             from .login import start_login, poll_login
@@ -215,7 +223,7 @@ def main(argv=None):
             if args.command == "serve":
                 runtime_store = store
                 store = None
-                serve(runtime_store, hosts, lock_dir, state)
+                serve(runtime_store, hosts, lock_dir, state, proxy, dns)
             else:
                 print(canonical(store.get_status()))
         return 0

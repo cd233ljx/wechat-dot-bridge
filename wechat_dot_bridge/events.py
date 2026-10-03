@@ -18,13 +18,14 @@ import ssl
 import threading
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 from .errors import BridgeError
 
 EVENT_NAME = "weixin.message"
 MAX_BODY = 262144
 MAX_RESPONSE = 65536
+MAX_DNS_RESPONSE = 32768
 MAX_ATTEMPTS = 5
 ROTATION_SECONDS = 300
 VERIFICATION_SECONDS = 300
@@ -33,6 +34,29 @@ MAX_TTL_SECONDS = 86400
 NETWORK_TIMEOUT = 10
 DNS_TIMEOUT = 10
 _DNS_SLOTS = threading.BoundedSemaphore(4)
+
+
+def _proxy_port(proxy):
+    """Only an explicitly configured, literal IPv4 loopback HTTP proxy is valid."""
+    if proxy is None:
+        return None
+    if not isinstance(proxy, str):
+        raise BridgeError("invalid_callback_proxy")
+    matched = re.fullmatch(r"http://127\.0\.0\.1:([0-9]{1,5})", proxy)
+    if not matched or not 1 <= int(matched[1]) <= 65535:
+        raise BridgeError("invalid_callback_proxy")
+    return int(matched[1])
+
+
+def _public_ip(value):
+    try:
+        ip = ipaddress.ip_address(value)
+    except (ValueError, TypeError):
+        raise BridgeError("callback_dns_blocked") from None
+    embedded = isinstance(ip, ipaddress.IPv6Address) and (ip.ipv4_mapped or ip.sixtofour or ip.teredo)
+    if not ip.is_global or ip.is_multicast or ip.is_unspecified or ip.is_reserved or embedded:
+        raise BridgeError("callback_dns_blocked")
+    return ip
 
 
 def _json_bytes(value):
@@ -118,13 +142,7 @@ def _public_addresses(host):
         raise BridgeError("callback_dns_failed") from None
     addresses = []
     for family, socktype, protocol, _, address in entries:
-        try:
-            ip = ipaddress.ip_address(address[0])
-        except ValueError:
-            raise BridgeError("callback_dns_blocked") from None
-        embedded = isinstance(ip, ipaddress.IPv6Address) and (ip.ipv4_mapped or ip.sixtofour or ip.teredo)
-        if not ip.is_global or ip.is_multicast or ip.is_unspecified or ip.is_reserved or embedded:
-            raise BridgeError("callback_dns_blocked")
+        _public_ip(address[0])
         entry = (family, socktype, protocol, address)
         if entry not in addresses:
             addresses.append(entry)
@@ -136,42 +154,77 @@ def _public_addresses(host):
 class _PinnedHTTPSConnection(http.client.HTTPSConnection):
     """Connect to a previously checked IP while verifying TLS against the hostname."""
 
-    def __init__(self, host, addresses):
+    def __init__(self, host, addresses, proxy=None):
         super().__init__(host, 443, timeout=NETWORK_TIMEOUT, context=ssl.create_default_context())
         self.addresses = addresses
+        self.proxy_port = _proxy_port(proxy)
+        self._request_expired = None
 
     def connect(self):
         deadline = time.monotonic() + NETWORK_TIMEOUT
         for family, socktype, protocol, address in self.addresses:
-            raw = socket.socket(family, socktype, protocol)
+            ip = _public_ip(address[0])
+            raw = socket.socket(socket.AF_INET if self.proxy_port else family, socktype, protocol)
             try:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     raise TimeoutError()
                 raw.settimeout(remaining)
-                raw.connect(address)
-                self.sock = self._context.wrap_socket(raw, server_hostname=self.host)
+                if self.proxy_port is None:
+                    raw.connect(address)
+                else:
+                    # The proxy receives a numeric CONNECT target and therefore
+                    # cannot re-resolve the approved callback host. TLS remains
+                    # end-to-end and is verified against the original hostname.
+                    numeric = str(ip)
+                    target = "[" + numeric + "]" if ip.version == 6 else numeric
+                    self.set_tunnel(target, 443, headers={"Host": target + ":443"})
+                    raw.connect(("127.0.0.1", self.proxy_port))
+                    self.sock = raw
+                    try:
+                        self._tunnel()
+                    finally:
+                        # http.client otherwise emits the numeric tunnel target
+                        # as HTTP Host on the subsequent application request.
+                        self._tunnel_host = None
+                        self._tunnel_port = None
+                        self._tunnel_headers = {}
+                # Publish the TLS socket before the blocking handshake: wrapping
+                # detaches raw's descriptor, which would hide it from the timer.
+                self.sock = self._context.wrap_socket(raw, server_hostname=self.host,
+                                                     do_handshake_on_connect=False)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or (self._request_expired is not None and self._request_expired.is_set()):
+                    raise TimeoutError()
+                self.sock.settimeout(remaining)
+                self.sock.do_handshake()
+                if (time.monotonic() >= deadline or
+                        (self._request_expired is not None and self._request_expired.is_set())):
+                    raise TimeoutError()
                 return
             except ssl.SSLError:
+                self.close()
+                raw.close()
+                raise
+            except TimeoutError:
+                self.close()
                 raw.close()
                 raise
             except OSError:
+                self.close()
                 raw.close()
         raise OSError("callback connection failed")
 
 
-def secure_post(url, body, headers, allowed_hosts):
-    """No proxies, redirects, DNS re-resolution by the socket, or raw error output."""
-    parts, host = _callback_parts(url, allowed_hosts)
-    if len(body) > MAX_BODY:
-        raise BridgeError("event_too_large")
-    connection = _PinnedHTTPSConnection(host, _public_addresses(host))
-    target = parts.path or "/"
-    if parts.query:
-        target += "?" + parts.query
+def _https_request(host, addresses, method, target, body, headers, proxy=None, max_response=MAX_RESPONSE):
+    """One bounded TLS exchange, without redirects or ambient proxy variables."""
+    connection = _PinnedHTTPSConnection(host, addresses, proxy=proxy)
+    request_headers = dict(headers)
+    request_headers["Host"] = host
     # A socket read timeout alone permits a peer to trickle bytes forever.
     # Shutdown establishes an overall HTTPS exchange deadline as well.
     timed_out = threading.Event()
+    connection._request_expired = timed_out
 
     def abort():
         timed_out.set()
@@ -187,12 +240,15 @@ def secure_post(url, body, headers, allowed_hosts):
     deadline.daemon = True
     deadline.start()
     try:
-        connection.request("POST", target, body=body, headers=headers)
-        response = connection.getresponse()
-        data = response.read(MAX_RESPONSE + 1)
+        connection.connect()
         if timed_out.is_set():
             raise BridgeError("callback_timeout")
-        if len(data) > MAX_RESPONSE:
+        connection.request(method, target, body=body, headers=request_headers)
+        response = connection.getresponse()
+        data = response.read(max_response + 1)
+        if timed_out.is_set():
+            raise BridgeError("callback_timeout")
+        if len(data) > max_response:
             raise BridgeError("callback_response_too_large")
         if 300 <= response.status < 400:
             raise BridgeError("callback_redirect")
@@ -200,6 +256,8 @@ def secure_post(url, body, headers, allowed_hosts):
     except (TimeoutError, socket.timeout):
         raise BridgeError("callback_timeout") from None
     except ssl.SSLError:
+        if timed_out.is_set():
+            raise BridgeError("callback_timeout") from None
         raise BridgeError("callback_tls_failed") from None
     except (OSError, ValueError, http.client.HTTPException):
         if timed_out.is_set():
@@ -210,14 +268,75 @@ def secure_post(url, body, headers, allowed_hosts):
         connection.close()
 
 
+def _google_addresses(host, proxy=None):
+    """Explicit Google DoH: fixed public IP, provider TLS, only the approved name."""
+    _proxy_port(proxy)
+    google_ip = "8.8.8.8"
+    _public_ip(google_ip)
+    addresses = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, (google_ip, 443))]
+    target = "/resolve?" + urlencode({"name": host, "type": "A"})
+    status, body = _https_request("dns.google", addresses, "GET", target, None,
+                                  {"Accept": "application/dns-json"}, proxy, MAX_DNS_RESPONSE)
+    if status != 200:
+        raise BridgeError("callback_dns_failed")
+    try:
+        value = json.loads(body)
+    except (ValueError, TypeError, UnicodeError):
+        raise BridgeError("callback_dns_failed") from None
+    if (not isinstance(value, dict) or type(value.get("Status")) is not int or value["Status"] != 0 or
+            value.get("TC") is True or not isinstance(value.get("Answer"), list) or
+            not 1 <= len(value["Answer"]) <= 16):
+        raise BridgeError("callback_dns_failed")
+    result = []
+    for record in value["Answer"]:
+        if (not isinstance(record, dict) or type(record.get("type")) is not int or
+                record["type"] not in (1, 5) or not isinstance(record.get("data"), str)):
+            raise BridgeError("callback_dns_failed")
+        if record["type"] == 5:
+            # DNS aliases may accompany the final A records. Never connect to
+            # or separately resolve the alias; TLS still verifies the approved host.
+            if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}\.?", record["data"]) or ".." in record["data"]:
+                raise BridgeError("callback_dns_failed")
+            continue
+        ip = _public_ip(record["data"])
+        if ip.version != 4:
+            raise BridgeError("callback_dns_failed")
+        entry = (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, (str(ip), 443))
+        if entry not in result:
+            result.append(entry)
+    if not result:
+        raise BridgeError("callback_dns_failed")
+    return result
+
+
+def secure_post(url, body, headers, allowed_hosts, proxy=None, dns="system"):
+    """Pin an approved callback through direct TLS or an explicit loopback proxy."""
+    # Callback authorization precedes DNS or proxy I/O. No callback path, token,
+    # headers or request body is disclosed to the optional DNS provider.
+    parts, host = _callback_parts(url, allowed_hosts)
+    _proxy_port(proxy)
+    if not isinstance(dns, str) or dns not in {"system", "google"}:
+        raise BridgeError("invalid_callback_dns")
+    if len(body) > MAX_BODY:
+        raise BridgeError("event_too_large")
+    addresses = _public_addresses(host) if dns == "system" else _google_addresses(host, proxy)
+    target = parts.path or "/"
+    if parts.query:
+        target += "?" + parts.query
+    return _https_request(host, addresses, "POST", target, body, headers, proxy)
+
+
 class Events:
-    def __init__(self, store, allowed_hosts=(), post=None, clock=time.time):
+    def __init__(self, store, allowed_hosts=(), post=None, clock=time.time, proxy=None, dns="system"):
         self.store, self.clock = store, clock
         self.allowed_hosts = frozenset(str(host).lower() for host in allowed_hosts)
         if any(not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", host) or ".." in host or host.endswith(".")
                for host in self.allowed_hosts):
             raise BridgeError("invalid_callback_hosts")
-        self.post = post or (lambda url, body, headers: secure_post(url, body, headers, self.allowed_hosts))
+        _proxy_port(proxy)
+        if not isinstance(dns, str) or dns not in {"system", "google"}:
+            raise BridgeError("invalid_callback_dns")
+        self.post = post or (lambda url, body, headers: secure_post(url, body, headers, self.allowed_hosts, proxy, dns))
         # Serializes verification, delivery, refresh and cancellation within one owner process.
         self._network_lock = threading.RLock()
         with self.store.lock:

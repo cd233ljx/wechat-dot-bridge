@@ -10,7 +10,7 @@ MCP Events 目前支持 dot，以及符合条件的 Work / Cloud 聊天；它要
 
 1. 在 [Platform Tunnel 设置](https://platform.openai.com/settings/organization/tunnels)确认 Tunnel 属于自己的 Platform 组织，并关联要使用的个人 ChatGPT 上下文。核验 Read / Use 等权限和实际可访问者。
 2. 运行 README 中配置的官方 `tunnel-client` 用户服务。桥接通过 stdio 接收 MCP，不需要公网入站端口。
-3. 打开 [ChatGPT Plugins](https://chatgpt.com/plugins)，创建开发者插件，在 Connection 中选 **Tunnel**，选择已有 Tunnel 或填入控制台给出的有效 identity。
+3. 打开 [ChatGPT Plugins](https://chatgpt.com/plugins)，创建开发者插件，在 Connection 中选 **Tunnel**，选择已有 Tunnel 或填入控制台给出的有效 identity。本方案为单人私有 stdio 服务，认证方式选择 **No authentication / 无认证**，依赖仅本人可用的 Tunnel 访问控制；不要选需要独立 OAuth 服务的 OAuth 模式。
 4. 保持插件仅自己可用，不分享给工作区、组织或其他账号。不要发布到公共目录。私人 Tunnel 与公共插件发布是不同部署模式。
 5. 扫描 / 刷新插件工具和事件，确认五个工具以及 `weixin.message` 出现，然后把插件添加到你原有 dot。
 
@@ -34,6 +34,8 @@ MCP Events 目前支持 dot，以及符合条件的 Work / Cloud 聊天；它要
 上面是不可直接运行的结构示例。用已经确认的小写主机名替换占位符，保留安装器生成的 `state_dir`。不能填写 URL、路径、端口、IP、通配符，也不能批准来自聊天文本或第三方页面的任意主机。
 
 重启用户服务，并在**同一个原 dot**中重新订阅。激活前服务器会完成签名 challenge 验证。调用状态工具确认 `active_subscriptions` 为 `1`，而不是只看 Tunnel 已启动。
+
+如果系统 DNS 返回的地址导致回调 TLS 主机名验证失败，保留所有验证，按 [网络边界](SECURITY.md)配置可选的本机回调代理及固定 Google DNS-over-HTTPS。`callback_proxy` 只能是 `http://127.0.0.1:PORT`；`callback_dns` 只允许 `system`（默认）或 `google`。DoH 仅发送已经批准的主机名，不发送完整回调 URL、微信消息或签名密钥。不要关闭 TLS、公网地址验证或扩大主机白名单。
 
 ## 给原 dot 的订阅指令
 
