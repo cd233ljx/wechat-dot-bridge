@@ -31,7 +31,7 @@ ROTATION_SECONDS = 300
 VERIFICATION_SECONDS = 300
 DEFAULT_TTL_SECONDS = 3600
 # Zero is an internal no-expiration sentinel compatible with existing NOT NULL rows.
-# Only explicit ttlMs:null grants this; omitted/finite requests remain finite.
+# Explicit ttlMs:null or a local owner policy grants this; finite requests stay finite.
 NO_EXPIRATION = 0
 MAX_TTL_SECONDS = 86400
 NETWORK_TIMEOUT = 10
@@ -414,9 +414,41 @@ class Events:
             _signing_key(delivery.get("secret"))
         return subscription_id, principal, url, delivery.get("secret")
 
+    def set_current_subscription_nonexpiring(self):
+        """Local owner command, under the CLI worker lock; never an MCP tool.
+
+        Changes only the currently active owner's subscription. Cancellation
+        clears this policy; a different callback cannot inherit it.
+        """
+        binding = self.store.get_binding()
+        if not binding:
+            raise BridgeError("binding_required")
+        principal = _json_bytes([binding["id"], binding["owner"]]).decode("utf-8")
+        with self._network_lock, self.store.lock:
+            self._expire(self.clock())
+            rows = self.store.db.execute(
+                "SELECT id FROM subscriptions WHERE status='active' AND principal=?", (principal,)).fetchall()
+            if len(rows) != 1:
+                raise BridgeError("active_subscription_required")
+            subscription_id = rows[0][0]
+            self._begin()
+            try:
+                self.store.db.execute("UPDATE subscriptions SET expires_at=0 WHERE id=?", (subscription_id,))
+                self._metadata("nonexpiring_default:" + subscription_id, "1")
+                self._end()
+            except Exception:
+                self.store.db.execute("ROLLBACK")
+                raise
+        return {"active_subscriptions": 1, "refreshBefore": None,
+                "scope": "bridge_subscription", "platform_task_lifetime_verified": False}
+
     def subscribe(self, params):
         subscription_id, principal, url, secret = self._identity(params, True)
-        requested = params.get("ttlMs", DEFAULT_TTL_SECONDS * 1000)
+        with self.store.lock:
+            local_policy = self.store.db.execute(
+                "SELECT value FROM event_metadata WHERE key=?", ("nonexpiring_default:" + subscription_id,)).fetchone()
+        default_ttl = None if local_policy and local_policy[0] == "1" else DEFAULT_TTL_SECONDS * 1000
+        requested = params.get("ttlMs", default_ttl)
         if requested is not None and (type(requested) is not int or requested <= 0):
             raise BridgeError("invalid_params")
         ttl = None if requested is None else min(MAX_TTL_SECONDS, max(60, requested / 1000))
@@ -476,6 +508,8 @@ class Events:
                         status='active',start_rowid=excluded.start_rowid""",
                         (subscription_id, principal, EVENT_NAME, "{}", url, secret, old_secret, rotation,
                          expires, self.clock() + VERIFICATION_SECONDS, "active", boundary))
+                    if requested is not None:
+                        self.store.db.execute("DELETE FROM event_metadata WHERE key=?", ("nonexpiring_default:" + subscription_id,))
                     self._metadata("last_error", "")
                     self._end()
                 except Exception:
@@ -489,6 +523,7 @@ class Events:
             self._begin()
             try:
                 self.store.db.execute("UPDATE subscriptions SET status='cancelled',secret='',old_secret=NULL,rotate_until=NULL WHERE id=?", (subscription_id,))
+                self.store.db.execute("DELETE FROM event_metadata WHERE key=?", ("nonexpiring_default:" + subscription_id,))
                 self.store.db.execute("UPDATE deliveries SET status='cancelled',error='subscription_inactive' WHERE subscription_id=? AND status IN ('pending','retry','sending')", (subscription_id,))
                 self._end()
             except Exception:

@@ -45,6 +45,8 @@ MCP Events 目前支持 dot，以及符合条件的 Work / Cloud 聊天；它要
 
 如需不过期，在原 dot 中要求刷新同一个订阅，明确传 `ttlMs: null`，并确认返回 `refreshBefore: null`。省略 `ttlMs` 仍使用一小时默认期限；明确请求有限期限时仍尊重该请求（最长一天、最短一分钟）。不过期订阅可取消，回调返回 410 也会停止投递。更新服务器代码不会自动修改已授予的有限订阅，必须由原 dot 刷新，让平台得到新的到期信息。
 
+若 dot 的订阅入口没有暴露 `ttlMs`，本人可先停服务，再执行 `wechat-dot-bridge --config /path/to/bridge.json subscription-forever`，然后启动服务。此命令仅将当前本人有效订阅在桥接侧设为不过期；取消会清除策略，不同 callback 不继承。之后省略期限的刷新沿用该策略，明确请求有限期限则改回有限并清除策略。平台自己的任务期限没有因此得到确认；可在原 dot 调用状态查看 `refreshBefore: null`。
+
 订阅由 ChatGPT 提供 callback URL 和签名 secret。不要让用户手写 secret，亦不要把订阅完整请求抄入聊天、工单或日志。
 
 工具处理顺序是：

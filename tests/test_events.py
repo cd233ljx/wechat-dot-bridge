@@ -198,6 +198,33 @@ class EventTests(unittest.TestCase):
         self.assertEqual(self.store.get_status()["active_subscriptions"], 0)
         self.assertEqual(self.events.status()["subscriptions"][0]["status"], "expired")
 
+    def test_local_owner_policy_survives_refresh_and_cancellation_clears_it(self):
+        self.events.subscribe(self.params)
+        self.ingest()
+        self.events.deliver_once()
+        calls = len(self.callback.calls)
+        result = self.events.set_current_subscription_nonexpiring()
+        self.assertIsNone(result["refreshBefore"])
+        self.assertEqual(len(self.callback.calls), calls)
+        self.assertFalse(self.events.deliver_once())
+        self.store.close()
+        self.clock.now += 86400 * 30
+        self.store = Store(self.directory.name, clock=self.clock)
+        self.events = Events(self.store, ["callback.example.com"], self.callback, self.clock)
+        self.assertIsNone(self.events.subscribe(self.params)["refreshBefore"])
+        self.unsubscribe()
+        self.assertIsNotNone(self.events.subscribe(self.params)["refreshBefore"])
+
+    def test_local_owner_policy_respects_explicit_finite_refresh(self):
+        self.events.subscribe(self.params)
+        self.events.set_current_subscription_nonexpiring()
+        self.params["ttlMs"] = 60000
+        self.assertIsNotNone(self.events.subscribe(self.params)["refreshBefore"])
+        self.clock.now += 61
+        self.assertEqual(self.events.status()["active_subscriptions"], 0)
+        with self.assertRaisesRegex(BridgeError, "active_subscription_required"):
+            self.events.set_current_subscription_nonexpiring()
+
     def test_omitted_ttl_keeps_finite_default(self):
         result = self.events.subscribe(self.params)
         self.assertIsNotNone(result["refreshBefore"])

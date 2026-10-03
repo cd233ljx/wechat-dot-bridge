@@ -174,6 +174,7 @@ def parser():
     commands.add_parser("serve", help="Start the private stdio MCP server")
     commands.add_parser("status", help="Read redacted local status")
     commands.add_parser("pause", help="Disable WeChat polling and sending")
+    commands.add_parser("subscription-forever", help="Keep the current owner subscription until cancellation; stop the service first")
     enable = commands.add_parser("resume", help="Enable the imported single-owner binding")
     enable.add_argument("--confirm-single-consumer", action="store_true", required=True)
     importer = commands.add_parser("import-binding", help="Import an existing binding without changing its source")
@@ -207,13 +208,16 @@ def main(argv=None):
                             code = getpass.getpass("Weixin verification code (hidden): ")
                     result = poll_login(state, verify_code=code)
                 print(canonical(result))
-        elif args.command in ("import-binding", "resume", "pause"):
+        elif args.command in ("import-binding", "resume", "pause", "subscription-forever"):
             # Configuration changes must not race a running tunnel child.
             with acquire_lock(state / "worker.lock"):
                 store = Store(state)
                 if args.command == "import-binding":
                     binding = load_existing_binding(args.source, args.account_id)
                     result = store.import_binding(binding)
+                elif args.command == "subscription-forever":
+                    events = Events(store, allowed_hosts=hosts, proxy=proxy, dns=dns)
+                    result = events.set_current_subscription_nonexpiring()
                 else:
                     store.set_enabled(args.command == "resume")
                     result = store.get_status()
