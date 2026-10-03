@@ -174,10 +174,6 @@ class MediaTests(unittest.TestCase):
         self.assertEqual(result["structuredContent"]["error"], "unknown_owner_attachment")
         self.assertNotIn("fixture-private", json.dumps(result))
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_cdn_proxy_keeps_pinned_host_and_never_sends_weixin_auth(self):
         from wechat_dot_bridge.media import configure_network
         configure_network('http://127.0.0.1:7890', 'google')
@@ -196,3 +192,7 @@ if __name__ == "__main__":
                 self.assertEqual(headers['Host'], 'novac2c.cdn.weixin.qq.com')
         finally:
             configure_network()
+
+
+if __name__ == "__main__":
+    unittest.main()
