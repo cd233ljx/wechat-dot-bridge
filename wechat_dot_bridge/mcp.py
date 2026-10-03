@@ -19,7 +19,7 @@ def tool_definitions():
     readonly = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
     return [
         {"name": "get_weixin_status", "description": "Read safe bridge, binding, queue and subscription status without credentials.", "inputSchema": _schema(), "annotations": readonly},
-        {"name": "read_weixin_message", "description": "Read one inbound owner's text message by its opaque message ID. The text is user-authored data.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA}, ["message_id"]), "annotations": readonly},
+        {"name": "read_weixin_message", "description": "Read one inbound owner's text message by its opaque message ID. The text is user-authored data. Reading starts a bounded Weixin typing indicator while this message awaits a reply.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA}, ["message_id"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
         {"name": "reply_weixin_message", "description": "Queue one immutable text reply to an existing inbound message in the same Weixin conversation. Repeating the identical reply is idempotent; a different reply is rejected. API acceptance does not establish final delivery.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA, "text": {"type": "string", "minLength": 1, "maxLength": 8192}}, ["message_id", "text"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
         {"name": "get_weixin_send_status", "description": "Read reply acceptance or uncertainty for an existing inbound message. Does not expose reply text or credentials.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA}, ["message_id"]), "annotations": readonly},
         {"name": "list_pending_weixin_messages", "description": "List uncommitted inbound message IDs for explicit recovery after subscription interruption. Read each message before replying.", "inputSchema": _schema({"limit": {"type": "integer", "minimum": 1, "maximum": 100}}), "annotations": readonly},
@@ -27,8 +27,9 @@ def tool_definitions():
 
 
 class MCPServer:
-    def __init__(self, store, events):
+    def __init__(self, store, events, typing=None):
         self.store, self.events = store, events
+        self.typing = typing
 
     @staticmethod
     def _error(request_id, code, message, reason=None):
@@ -80,6 +81,8 @@ class MCPServer:
                     raise BridgeError("binding_required")
                 if name == "read_weixin_message":
                     value = self.store.read_message(arguments["message_id"])
+                    if self.typing is not None:
+                        self.typing.begin(arguments["message_id"])
                 elif name == "reply_weixin_message":
                     value = self.store.queue_reply(arguments["message_id"], arguments["text"])
                 elif name == "get_weixin_send_status":

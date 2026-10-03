@@ -362,6 +362,25 @@ class Store:
             message = self._message(message_id, self._binding())
             return {"message_id": message["id"], "text": message["text"], "created_at": message["created_at"]}
 
+    def typing_target(self, message_ids):
+        """Internal route only for pending owner messages dot has actually read."""
+        if not message_ids or len(message_ids) > 128:
+            return None
+        with self.lock:
+            binding = self.get_binding()
+            if not binding or not binding["enabled"] or binding["status"] != "ready":
+                return None
+            placeholders = ",".join("?" for _ in message_ids)
+            rows = self.db.execute(
+                "SELECT m.id FROM messages m WHERE m.id IN (" + placeholders + ") "
+                "AND m.account=? AND m.peer=? AND m.state='pending' "
+                "AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.message_id=m.id)",
+                (*message_ids, binding["id"], binding["owner"])).fetchall()
+            context = self._latest_context(binding)
+            if not rows or not context:
+                return None
+            return binding, context["context_token"], {row["id"] for row in rows}
+
     def list_pending(self, limit=20):
         if type(limit) is not int or not 1 <= limit <= 100:
             raise BridgeError("invalid_limit")

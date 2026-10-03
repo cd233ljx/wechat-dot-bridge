@@ -183,7 +183,7 @@ class IlinkClient:
     def __init__(self, clock=time.time):
         self.clock = clock
 
-    def _post(self, binding: dict, path: str, body: dict, timeout: float) -> dict:
+    def _post(self, binding: dict, path: str, body: dict, timeout: float, allow_empty=False) -> dict:
         binding = _binding(binding)
         host, _origin = _endpoint(binding["base_url"])
         address = _resolve_public(host)
@@ -210,7 +210,7 @@ class IlinkClient:
             raw = response.read(MAX_RESPONSE_BYTES + 1)
             if len(raw) > MAX_RESPONSE_BYTES:
                 raise BridgeError("response_too_large")
-            return _json_object(raw)
+            return {} if allow_empty and not raw.strip() else _json_object(raw)
         except BridgeError:
             raise
         except (TimeoutError, socket.timeout):
@@ -234,6 +234,30 @@ class IlinkClient:
             "get_updates_buf": checked["cursor"], "base_info": self._base_info(),
         }, 40.0)
 
+    def typing_ticket(self, binding, context_token):
+        checked = _binding(binding)
+        context = _checked_string(context_token, MAX_CONTEXT_BYTES, "context_required")
+        result = self._post(checked, "/ilink/bot/getconfig", {
+            "ilink_user_id": checked["owner"], "context_token": context,
+            "base_info": self._base_info()}, 5.0)
+        error = _application_error(result)
+        if error:
+            raise BridgeError(error)
+        ticket = result.get("typing_ticket")
+        return _checked_string(ticket, MAX_CONTEXT_BYTES, "typing_unavailable")
+
+    def send_typing(self, binding, ticket, status):
+        checked = _binding(binding)
+        if type(status) is not int or status not in (1, 2):
+            raise BridgeError("invalid_typing_status")
+        ticket = _checked_string(ticket, MAX_CONTEXT_BYTES, "typing_unavailable")
+        result = self._post(checked, "/ilink/bot/sendtyping", {
+            "ilink_user_id": checked["owner"], "typing_ticket": ticket,
+            "status": status, "base_info": self._base_info()}, 5.0, allow_empty=True)
+        error = _application_error(result)
+        if error:
+            raise BridgeError(error)
+
     def send(self, binding: dict, reply: dict) -> dict:
         checked = _binding(binding)
         if not isinstance(reply, dict) or reply.get("peer") != checked["owner"]:
@@ -254,7 +278,7 @@ class IlinkClient:
 def _application_error(response: dict) -> str | None:
     if not isinstance(response, dict):
         return "response_invalid"
-    known_fields = {"ret", "errcode", "errmsg", "message_id", "msgs", "get_updates_buf", "longpolling_timeout_ms"}
+    known_fields = {"typing_ticket", "ret", "errcode", "errmsg", "message_id", "msgs", "get_updates_buf", "longpolling_timeout_ms"}
     if response and not known_fields.intersection(response):
         return "response_invalid"
     codes = []

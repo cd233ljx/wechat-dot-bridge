@@ -17,6 +17,7 @@ from .store import Store
 from .transport import WeixinWorker, load_existing_binding
 from .events import Events
 from .mcp import MCPServer
+from .typing import TypingIndicator
 
 MAX_RPC_BYTES = 131072
 
@@ -106,7 +107,8 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
             locks.append(acquire_lock(lock_dir / ("account-" + identity + ".lock")))
         store.recover_inflight()
         events = Events(store, allowed_hosts=hosts, proxy=callback_proxy, dns=callback_dns)
-        server = MCPServer(store, events)
+        typing = TypingIndicator(store)
+        server = MCPServer(store, events, typing=typing)
         weixin = WeixinWorker(store)
 
         def run_worker(name, function):
@@ -125,6 +127,20 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
             thread = threading.Thread(target=run_worker, args=(name, function), daemon=True, name=name)
             thread.start()
             threads.append(thread)
+
+        def run_typing():
+            try:
+                while not stop.wait(0.5):
+                    try:
+                        typing.tick()
+                    except Exception:
+                        pass
+            finally:
+                typing.close()
+
+        thread = threading.Thread(target=run_typing, daemon=True, name="typing")
+        thread.start()
+        threads.append(thread)
 
         def terminate(signum, frame):
             stop.set()
