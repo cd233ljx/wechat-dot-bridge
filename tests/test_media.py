@@ -193,6 +193,18 @@ class MediaTests(unittest.TestCase):
         finally:
             configure_network()
 
+    def test_upload_retries_server_failures_but_not_client_rejection(self):
+        client = Mock()
+        client._post.return_value = {"upload_param": "fixture"}
+        attachment = {"data": self.data, "kind": "image", "name": "fixture.png"}
+        with patch("wechat_dot_bridge.media.cdn_request", side_effect=[BridgeError("media_http_error"), (b"", "fixture")]) as upload, patch("wechat_dot_bridge.media.time.sleep"):
+            self.assertEqual(upload_item(client, self.binding, attachment)["type"], 2)
+            self.assertEqual(upload.call_count, 2)
+        with patch("wechat_dot_bridge.media.cdn_request", side_effect=BridgeError("media_http_rejected")) as upload:
+            with self.assertRaisesRegex(BridgeError, "media_http_rejected"):
+                upload_item(client, self.binding, attachment)
+            self.assertEqual(upload.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

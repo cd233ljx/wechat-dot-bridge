@@ -10,6 +10,7 @@ import io
 import json
 import secrets
 import threading
+import time
 import warnings
 from urllib.parse import urlencode, urlsplit
 
@@ -126,7 +127,7 @@ def cdn_request(url, data=None):
                            body=data, headers={"Host": CDN_HOST, "Content-Type": "application/octet-stream"})
         response = connection.getresponse()
         if response.status != 200:
-            raise BridgeError("media_http_error")
+            raise BridgeError("media_http_rejected" if 400 <= response.status < 500 else "media_http_error")
         limit = MAX_MEDIA + 16 if data is None else 65536
         body = response.read(limit + 1)
         if len(body) > limit:
@@ -223,9 +224,16 @@ def upload_item(client, binding, attachment):
         if not isinstance(param, str) or not param:
             raise BridgeError("media_upload_failed")
         url = CDN_BASE + "/upload?" + urlencode({"encrypted_query_param": param, "filekey": filekey})
-    _, download = cdn_request(url, encrypted)
-    if not isinstance(download, str) or not 0 < len(download) <= 8192:
-        raise BridgeError("media_upload_failed")
+    for attempt in range(3):
+        try:
+            _, download = cdn_request(url, encrypted)
+            if not isinstance(download, str) or not 0 < len(download) <= 8192:
+                raise BridgeError("media_upload_failed")
+            break
+        except BridgeError as error:
+            if error.code not in {"media_http_error", "media_timeout", "media_network_failed", "media_upload_failed"} or attempt == 2:
+                raise
+            time.sleep(2 ** attempt)
     body = {"media": {"encrypt_query_param": download,
                       "aes_key": base64.b64encode(key.hex().encode()).decode(), "encrypt_type": 1}}
     if kind == "image":

@@ -9,7 +9,7 @@ from .errors import BridgeError
 from .media import MAX_CACHE, MAX_MEDIA, MAX_STAGE, image_preview, safe_name
 
 MEDIA_ERRORS = {"media_key_invalid", "media_invalid", "media_endpoint_rejected", "media_too_large",
-                "media_timeout", "media_http_error", "media_network_failed", "media_decryption_failed",
+                "media_timeout", "media_http_error", "media_http_rejected", "media_network_failed", "media_decryption_failed",
                 "media_image_invalid", "media_cache_full", "media_failed", "media_upload_failed"}
 
 
