@@ -177,3 +177,22 @@ class MediaTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_cdn_proxy_keeps_pinned_host_and_never_sends_weixin_auth(self):
+        from wechat_dot_bridge.media import configure_network
+        configure_network('http://127.0.0.1:7890', 'google')
+        connection = Mock()
+        response = connection.getresponse.return_value
+        response.status = 200
+        response.read.return_value = b'fixture'
+        response.getheader.return_value = None
+        try:
+            with patch('wechat_dot_bridge.events._google_addresses', return_value=['fixture-ip']) as resolve, patch('wechat_dot_bridge.events._PinnedHTTPSConnection', return_value=connection) as factory:
+                self.assertEqual(cdn_request(CDN_BASE + '/download?encrypted_query_param=fixture')[0], b'fixture')
+                resolve.assert_called_once_with('novac2c.cdn.weixin.qq.com', 'http://127.0.0.1:7890')
+                factory.assert_called_once_with('novac2c.cdn.weixin.qq.com', ['fixture-ip'], 'http://127.0.0.1:7890')
+                headers = connection.request.call_args.kwargs['headers']
+                self.assertNotIn('Authorization', headers)
+                self.assertEqual(headers['Host'], 'novac2c.cdn.weixin.qq.com')
+        finally:
+            configure_network()

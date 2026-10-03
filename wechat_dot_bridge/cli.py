@@ -68,7 +68,7 @@ def load_config(args):
             config = json.loads(path.read_text())
         except (OSError, ValueError):
             raise BridgeError("config_invalid") from None
-        if not isinstance(config, dict) or set(config) - {"state_dir", "callback_hosts", "lock_dir", "callback_proxy", "callback_dns"}:
+        if not isinstance(config, dict) or set(config) - {"state_dir", "callback_hosts", "lock_dir", "callback_proxy", "callback_dns", "media_proxy", "media_dns"}:
             raise BridgeError("config_invalid")
     state = args.state_dir or config.get("state_dir") or str(Path.home() / ".local/share/wechat-dot-bridge")
     hosts = config.get("callback_hosts", [])
@@ -88,14 +88,22 @@ def load_config(args):
     dns = config.get("callback_dns", "system")
     if dns not in ("system", "google"):
         raise BridgeError("config_invalid")
-    return Path(state).absolute(), hosts, Path(locks).absolute(), proxy, dns
+    media_proxy, media_dns = config.get("media_proxy"), config.get("media_dns", "system")
+    from .events import _proxy_port
+    try:
+        _proxy_port(media_proxy)
+    except BridgeError:
+        raise BridgeError("config_invalid") from None
+    if media_dns not in ("system", "google"):
+        raise BridgeError("config_invalid")
+    return Path(state).absolute(), hosts, Path(locks).absolute(), proxy, dns, media_proxy, media_dns
 
 
 def rpc_error(code, message):
     return {"jsonrpc": "2.0", "id": None, "error": {"code": code, "message": message}}
 
 
-def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="system"):
+def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="system", media_proxy=None, media_dns="system"):
     locks = []
     stop = threading.Event()
     threads = []
@@ -111,6 +119,8 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
         typing = TypingIndicator(store)
         server = MCPServer(store, events, typing=typing)
         weixin = WeixinWorker(store)
+        from .media import configure_network
+        configure_network(media_proxy, media_dns)
         media = MediaWorker(store)
 
         def run_worker(name, function):
@@ -209,7 +219,7 @@ def main(argv=None):
     args = parser().parse_args(argv)
     store = None
     try:
-        state, hosts, lock_dir, proxy, dns = load_config(args)
+        state, hosts, lock_dir, proxy, dns, media_proxy, media_dns = load_config(args)
         state = private_directory(state)
         if args.command in ("login-start", "login-poll"):
             from .login import start_login, poll_login
@@ -245,7 +255,7 @@ def main(argv=None):
             if args.command == "serve":
                 runtime_store = store
                 store = None
-                serve(runtime_store, hosts, lock_dir, state, proxy, dns)
+                serve(runtime_store, hosts, lock_dir, state, proxy, dns, media_proxy, media_dns)
             else:
                 print(canonical(store.get_status()))
         return 0

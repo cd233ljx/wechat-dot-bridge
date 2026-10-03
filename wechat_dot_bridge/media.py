@@ -24,6 +24,19 @@ CDN_BASE = "https://" + CDN_HOST + "/c2c"
 MAX_MEDIA = 20 * 1024 * 1024
 MAX_STAGE = 1024 * 1024
 MAX_CACHE = 256 * 1024 * 1024
+NETWORK_PROXY = None
+NETWORK_DNS = "system"
+
+
+def configure_network(proxy=None, dns="system"):
+    from .events import _proxy_port
+    _proxy_port(proxy)
+    if dns not in ("system", "google"):
+        raise BridgeError("media_network_invalid")
+    global NETWORK_PROXY, NETWORK_DNS
+    NETWORK_PROXY, NETWORK_DNS = proxy, dns
+
+
 KINDS = {2: "image", 3: "voice", 4: "file", 5: "video"}
 
 
@@ -83,7 +96,12 @@ def cdn_request(url, data=None):
     # Upload needs a header returned by the CDN. Keep the same validated-IP,
     # original TLS hostname and deadline policy as the callback transport.
     from .events import _PinnedHTTPSConnection
-    connection = _PinnedHTTPSConnection(CDN_HOST, _public_addresses(CDN_HOST))
+    from .events import _google_addresses
+    try:
+        addresses = _google_addresses(CDN_HOST, NETWORK_PROXY) if NETWORK_DNS == "google" else _public_addresses(CDN_HOST)
+        connection = _PinnedHTTPSConnection(CDN_HOST, addresses, NETWORK_PROXY)
+    except BridgeError:
+        raise BridgeError("media_network_failed") from None
     expired = threading.Event()
     connection._request_expired = expired
 

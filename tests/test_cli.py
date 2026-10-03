@@ -99,7 +99,7 @@ class SetupTests(unittest.TestCase):
                       "callback_proxy": "http://127.0.0.1:7890", "callback_dns": "google"}
             path.write_text(json.dumps(config))
             options = load_config(Namespace(config=str(path), state_dir=None))
-            self.assertEqual(options[-2:], ("http://127.0.0.1:7890", "google"))
+            self.assertEqual(options[3:5], ("http://127.0.0.1:7890", "google"))
             for proxy in ("http://192.168.1.1:7890", "http://localhost:7890", "https://127.0.0.1:7890",
                           "http://user:secret@127.0.0.1:7890", "http://127.0.0.1:0", "http://127.0.0.1:7890/", "http://127.0.0.1:65536"):
                 config["callback_proxy"] = proxy

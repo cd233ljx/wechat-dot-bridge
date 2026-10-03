@@ -199,3 +199,5 @@ systemctl --user stop wechat-dot-bridge.service
 ## 许可
 
 原创桥接实现使用 [MIT](LICENSE)。官方腾讯协议参考的版权许可保存在 [licenses](licenses/Tencent-openclaw-weixin-MIT.txt)，来源说明见 [NOTICE.txt](NOTICE.txt)。官方 Tunnel client 单独安装并保留自己的许可。本项目与 OpenAI、腾讯无隶属或背书关系。
+
+媒体 CDN 网络单独支持 `media_proxy`（仅本人本机 `http://127.0.0.1:端口`）及 `media_dns`（system / google），默认直连及系统 DNS。仅在本机 DNS 或直连不可用时配置；同样保留精确腾讯主机、公共 IP 固定连接、TLS 域名核验和无重定向。DoH 只接收 CDN 主机名，不接收媒体 URL 参数或 AES 密钥；本机代理转发端到端 HTTPS。它不修改全局代理、微信 API 或 Events 回调设置。
