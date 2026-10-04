@@ -142,3 +142,35 @@ class ChannelFeatures(unittest.TestCase):
         self.store.finish_send(self.mid,'uncertain',reply_id=second['reply_id'])
         with self.assertRaisesRegex(BridgeError,'delivery_uncertain_review_required'):
             self.store.retry_reply(receipt['reply_id'])
+
+    def test_nested_quote_id_and_item_alias_restore_image_reference(self):
+        self.store.ingest('bot',[dict(source_id='message:20',aliases=['20','image-item:fixture'],peer='owner',text='[图片]',created_at=2,context_token='fixture',attachments=[dict(kind='image',name='picture.jpg',url='fixture')])],'20')
+        aid=self.store.db.execute('SELECT id FROM attachments').fetchone()[0]
+        from test_media import picture
+        self.store.finish_attachment(aid,picture())
+        self.restart()
+        wire=dict(message_id=21,from_user_id='owner',message_type=1,message_state=2,item_list=[dict(type=1,text_item=dict(text='question'),ref_msg=dict(message_item=dict(type=2,msg_id=' image-item:fixture ')))])
+        msg=_normalize_message(wire,self.binding,3)
+        self.assertEqual(msg['quotes'][0]['source_id'],'image-item:fixture')
+        self.assertEqual(msg['attachments'],[])
+        self.store.ingest('bot',[msg],'21')
+        mid=self.store.db.execute("SELECT id FROM messages WHERE source_id='message:21'").fetchone()[0]
+        result=self.store.read_message(mid)
+        self.assertEqual(result['quotes'][0]['status'],'cached_inbound')
+        self.assertEqual(result['attachments'][0]['attachment_id'],aid)
+        self.assertNotIn('引用内容暂不可用',result['text'])
+
+    def test_quote_diagnostics_distinguish_missing_id_from_missing_cache(self):
+        for n,ref,status in [(30,dict(title=''),'reference_not_provided'),(31,dict(svr_id='unknown'),'not_cached')]:
+            ref['fixture_nonsecret_field']=True
+            wire=dict(message_id=n,from_user_id='owner',message_type=1,message_state=2,item_list=[dict(type=1,text_item=dict(text='question'),ref_msg=ref)])
+            self.store.ingest('bot',[_normalize_message(wire,self.binding,3)],str(n))
+            mid=self.store.db.execute('SELECT id FROM messages WHERE source_id=?',('message:'+str(n),)).fetchone()[0]
+            result=self.store.read_message(mid)
+            self.assertEqual(result['quotes'][0]['status'],status)
+            self.assertEqual(result['quotes'][0]['has_reference_id'],n==31)
+
+    def test_normalizer_retains_top_and_item_ids_for_later_quotes(self):
+        wire=dict(message_id=50,from_user_id='owner',message_type=1,message_state=2,item_list=[dict(type=1,msg_id='item-50',text_item=dict(text='fixture'))])
+        result=_normalize_message(wire,self.binding,3)
+        self.assertEqual(result['aliases'],['50','item-50'])

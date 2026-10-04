@@ -376,8 +376,20 @@ def _normalize_message(message: dict, binding: dict, now: float) -> dict | None:
             from .message_format import quote_content
             ref = item["ref_msg"]
             quoted, quoted_media = quote_content(ref)
-            if isinstance(ref, dict) and ref.get("svr_id") and not ref.get("message_item"):
-                quotes.append({"source_id": str(ref["svr_id"]), "partial": ref.get("partial_text")})
+            if quoted_media:
+                quoted_body=quoted_media.get(KINDS[quoted_media["type"]]+"_item")
+                if not isinstance(quoted_body,dict) or not isinstance(quoted_body.get("media"),dict):
+                    quoted_media=None
+            if isinstance(ref, dict):
+                from .message_format import reference_id
+                nested=ref.get("message_item")
+                rid=reference_id(ref.get("svr_id")) or reference_id(nested.get("msg_id") if isinstance(nested,dict) else None)
+                inline=bool(quoted_media or (quoted and quoted!="[引用内容暂不可用]"))
+                quotes.append({"source_id":rid,"partial":ref.get("partial_text"),"inline":inline,
+                    "shape":{"reference_fields":[k for k in ref if re.fullmatch(r"[a-zA-Z_]{1,64}",k)][:32],
+                             "item_fields":[k for k in nested if re.fullmatch(r"[a-zA-Z_]{1,64}",k)][:32] if isinstance(nested,dict) else []}})
+                if rid and quoted=="[引用内容暂不可用]":
+                    quoted=""
             if quoted:
                 parts.append("[引用]\n" + quoted + "\n[/引用]")
             if quoted_media:
@@ -448,7 +460,9 @@ def _normalize_message(message: dict, binding: dict, now: float) -> dict | None:
             return None
     except UnicodeError:
         return None
-    return {"source_id": source_id, "peer": binding["owner"], "text": text,
+    from .message_format import reference_id
+    aliases=list(dict.fromkeys(r for value in [message.get("message_id"), *(item.get("msg_id") for item in items)] if (r:=reference_id(value))))
+    return {"aliases":aliases,"source_id": source_id, "peer": binding["owner"], "text": text,
             "created_at": created_at, "context_token": context or None, "attachments": attachments, "quotes": quotes}
 
 

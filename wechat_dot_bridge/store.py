@@ -180,6 +180,11 @@ class Store(AttachmentStore):
                     ON replies(status,created_at);
             """)
             self._migrate_reply_identity()
+            self.db.execute("CREATE TABLE IF NOT EXISTS message_aliases (account TEXT NOT NULL,peer TEXT NOT NULL,reference_id TEXT NOT NULL,message_id TEXT NOT NULL REFERENCES messages(id),PRIMARY KEY(account,peer,reference_id))")
+            self.db.execute("CREATE TABLE IF NOT EXISTS message_quotes (message_id TEXT NOT NULL REFERENCES messages(id),position INTEGER NOT NULL,has_reference_id INTEGER NOT NULL,status TEXT NOT NULL,resolved_message_id TEXT,PRIMARY KEY(message_id,position))")
+            if "shape" not in {r["name"] for r in self.db.execute("PRAGMA table_info(message_quotes)")}:
+                self.db.execute("ALTER TABLE message_quotes ADD COLUMN shape TEXT NOT NULL DEFAULT '{}'")
+            self.db.execute("INSERT OR IGNORE INTO message_aliases SELECT account,peer,CASE WHEN source_id LIKE 'message:item:%' THEN substr(source_id,14) ELSE substr(source_id,9) END,id FROM messages WHERE source_id LIKE 'message:%'")
             self._init_media()
             if "is_notice" not in {r["name"] for r in self.db.execute("PRAGMA table_info(replies)")}:
                 self.db.execute("ALTER TABLE replies ADD COLUMN is_notice INTEGER NOT NULL DEFAULT 0")
@@ -393,7 +398,12 @@ class Store(AttachmentStore):
             quotes = message.get("quotes", [])
             if not isinstance(quotes, list) or len(quotes) > 32 or any(not isinstance(q, dict) for q in quotes):
                 raise BridgeError("invalid_inbound_message")
-            normalized.append((source, peer, text, float(created_at), context, refs, quotes))
+            aliases=message.get("aliases",[])
+            from .message_format import reference_id
+            if not isinstance(aliases,list) or len(aliases)>33:
+                raise BridgeError("invalid_inbound_message")
+            aliases=[rid for value in aliases if (rid:=reference_id(value))]
+            normalized.append((source, peer, text, float(created_at), context, refs, quotes, aliases))
         with self._transaction():
             binding = self._binding()
             if account_id != binding["id"]:
@@ -405,7 +415,7 @@ class Store(AttachmentStore):
                 "SELECT count(*) FROM messages WHERE account=? AND peer=? AND state='pending'",
                 (binding["id"], binding["owner"])).fetchone()[0]
             added = 0
-            for source, peer, text, created_at, context, refs, quotes in normalized:
+            for source, peer, text, created_at, context, refs, quotes, aliases in normalized:
                 if peer != binding["owner"]:
                     raise BridgeError("owner_identity_mismatch")
                 identifier = _opaque_id(binding["id"], peer, source)
@@ -414,31 +424,43 @@ class Store(AttachmentStore):
                 if count + added >= MAX_PENDING:
                     raise BridgeError("inbox_full")
                 from .message_format import partial_quote
-                cached_aids = []
-                for quote in quotes:
-                    sid = quote.get("source_id")
-                    if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid):
-                        continue
-                    cached = self.db.execute("SELECT id,text FROM messages WHERE account=? AND peer=? AND source_id IN (?,?)", (binding["id"], peer, "message:" + (str(int(sid)) if sid.isdigit() else sid), "message:item:" + sid)).fetchone()
+                cached_aids, quote_states = [], []
+                from .message_format import reference_id
+                for position,quote in enumerate(quotes):
+                    sid=reference_id(quote.get("source_id"))
+                    status="inline" if quote.get("inline") else "not_cached" if sid else "reference_not_provided"
+                    resolved=None
+                    cached=None
+                    if sid:
+                        cached=self.db.execute("SELECT m.id,m.text FROM messages m LEFT JOIN message_aliases a ON a.message_id=m.id WHERE m.account=? AND m.peer=? AND (a.reference_id=? OR m.source_id IN (?,?)) LIMIT 1", (binding["id"],peer,sid,"message:"+sid,"message:item:"+sid)).fetchone()
+                    quote_text=""
                     if cached:
-                        quote_text = cached["text"]
-                        cached_aids.extend(r[0] for r in self.db.execute("SELECT id FROM attachments WHERE message_id=? UNION SELECT attachment_id FROM attachment_links WHERE message_id=?", (cached["id"],cached["id"])))
-                    else:
-                        sent = self.db.execute("SELECT text,attachment_id FROM sent_quotes WHERE source_id=?", (sid,)).fetchone()
-                        if not sent:
-                            continue
-                        quote_text = sent["text"]
-                        if sent["attachment_id"]:
-                            cached_aids.append(sent["attachment_id"])
-                    quoted = partial_quote(quote_text, quote.get("partial"))
-                    budget = max(0, MAX_INBOUND_BYTES - len(text.encode()) - 64)
-                    quoted = quoted.encode()[:budget].decode("utf-8", errors="ignore")
+                        resolved=cached["id"];status="cached_inbound";quote_text=cached["text"]
+                        cached_aids.extend(r[0] for r in self.db.execute("SELECT id FROM attachments WHERE message_id=? UNION SELECT attachment_id FROM attachment_links WHERE message_id=?", (resolved,resolved)))
+                    elif sid:
+                        sent=self.db.execute("SELECT text,attachment_id FROM sent_quotes WHERE source_id=?", (sid,)).fetchone()
+                        if sent:
+                            status="cached_outbound";quote_text=sent["text"]
+                            if sent["attachment_id"]: cached_aids.append(sent["attachment_id"])
+                    shape=quote.get("shape",{})
+                    safe_shape={k:[f for f in v if isinstance(f,str) and re.fullmatch(r"[a-zA-Z_]{1,64}",f)][:32] for k,v in shape.items() if k in ("reference_fields","item_fields") and isinstance(v,list)} if isinstance(shape,dict) else {}
+                    quote_states.append((position,int(bool(sid)),status,resolved,json.dumps(safe_shape)))
+                    quoted=partial_quote(quote_text,quote.get("partial"))
+                    budget=max(0,MAX_INBOUND_BYTES-len(text.encode())-64)
+                    quoted=quoted.encode()[:budget].decode("utf-8",errors="ignore")
                     if quoted:
-                        text = "[引用缓存]\n" + quoted + "\n[/引用缓存]\n" + text
+                        text="[引用缓存]\n"+quoted+"\n[/引用缓存]\n"+text
                 self.db.execute(
                     "INSERT INTO messages(id,account,peer,source_id,text,created_at,context_token) "
                     "VALUES(?,?,?,?,?,?,?)",
                     (identifier, binding["id"], peer, source, text, created_at, context))
+                if source.startswith("message:"):
+                    original=source[len("message:item:"):] if source.startswith("message:item:") else source[len("message:"):]
+                    if reference_id(original): aliases.append(reference_id(original))
+                for alias in aliases:
+                    self.db.execute("INSERT OR IGNORE INTO message_aliases VALUES(?,?,?,?)", (binding["id"],peer,alias,identifier))
+                for position,has_id,status,resolved,shape in quote_states:
+                    self.db.execute("INSERT INTO message_quotes VALUES(?,?,?,?,?,?)", (identifier,position,has_id,status,resolved,shape))
                 self._ingest_attachments(binding, identifier, refs)
                 for aid in cached_aids:
                     self.db.execute("INSERT OR IGNORE INTO attachment_links VALUES(?,?)", (identifier,aid))
@@ -454,7 +476,9 @@ class Store(AttachmentStore):
         return added
 
     def remember_sent_quote(self, source_id, reply):
-        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", source_id):
+        from .message_format import reference_id
+        source_id=reference_id(source_id)
+        if not source_id:
             return
         with self._transaction():
             attachment = reply.get("attachment")
@@ -464,7 +488,8 @@ class Store(AttachmentStore):
         with self.lock:
             message = self._message(message_id, self._binding())
             return {"message_id": message["id"], "text": message["text"], "created_at": message["created_at"],
-                    "attachments": self.attachment_metadata(message_id)}
+                    "attachments": self.attachment_metadata(message_id),
+                    "quotes":[dict(has_reference_id=bool(r["has_reference_id"]),status=r["status"],resolved_message_id=r["resolved_message_id"],shape=json.loads(r["shape"])) for r in self.db.execute("SELECT has_reference_id,status,resolved_message_id,shape FROM message_quotes WHERE message_id=? ORDER BY position",(message_id,))]}
 
     def report_progress(self, message_id, active=True):
         with self._transaction():

@@ -93,3 +93,14 @@ def _plain_markdown(text):
                 continue
         output.append(line)
     return ''.join(output)
+
+
+def reference_id(value):
+    """Opaque Weixin reference ID, not a URL or credential."""
+    import re
+    if isinstance(value,int) and not isinstance(value,bool):
+        value=str(value)
+    if not isinstance(value,str): return None
+    value=value.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.:@-]{1,256}",value) or value=="0": return None
+    return str(int(value)) if value.isdigit() else value
