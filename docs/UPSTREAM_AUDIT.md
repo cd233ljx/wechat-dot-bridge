@@ -85,10 +85,12 @@ cc-connect 首次输入请求失败会结束该次输入提示；本桥接保留
 本轮通过远端 HEAD 核对，本地 cc-connect 快照与查询时的远端一致。
 对照范围包含微信 adapter 的收发 / 媒体 / typing / context / 限流、Engine 的
 会话锁 / 等待队列 / EventResult / EventError / 取消，以及相关测试。
-这是设计审查，不是“已按上游完成全部重构”的声明；以下问题尚未修复。
+以下保留修复前的设计审查和复现基线。五项问题已在后续实现中修复，
+当前代码、社区组件采用和新增验收见本文件末尾“本轮实施结果”；
+本文件不把本地测试等同于生产已部署或微信客户端已确认。
 复现只用临时数据库、合成字节和模拟 callback，没有读取生产正文或发送微信。
 
-### 已复现的问题
+### 修复前已复现的问题
 
 | 优先级 | 触发与当前结果 | 根因与修改方向 |
 | --- | --- | --- |
@@ -144,7 +146,7 @@ cc-connect 的 [SaveFilesToDisk](https://github.com/chenhg5/cc-connect/blob/dfad
 
 ### 技术栈判断与社区组件
 
-当前依赖入口是 `pyproject.toml` 和 `codecs/package.json`：主进程为 Python 3.11+，
+审查时依赖入口是 `pyproject.toml` 和 `codecs/package.json`：主进程为 Python 3.11+，
 存储使用标准库 SQLite；并发、MCP 分发、参数校验、HTTP/DNS 与 webhook 签名主要手写。
 第三方必需 Python 运行依赖仅 cryptography 和 Pillow。已有官方 Tunnel、systemd、
 silk-wasm、ffmpeg 和腾讯 Markdown 过滤器复用，并不是所有底层都自行实现。
@@ -181,4 +183,68 @@ silk-wasm、ffmpeg 和腾讯 Markdown 过滤器复用，并不是所有底层都
 4. 引入锁文件，逐步收敛网络和运行时；一次只迁移一个边界，不在同次升级叠加状态库、SDK、
    网络库全部替换。每步都有模拟重启 / 升级验收后再更新生产。
 
-本轮修改仅记录审查结果和社区优先原则，没有对生产做上述迁移，也没有关闭功能来冒充设计完善。
+以上是实施前的审查记录，以下记录当前代码实际完成的变更。生产升级与本人手机验收
+按独立的部署记录确认，不由这份设计文档推断。
+
+## 本轮实施结果（2026-10-04）
+
+参考仍固定为 cc-connect `dfad19415a38b00b2c5c288610784d1a7eef337f`，
+腾讯通道参考为 `24de5c9`。复用对象是微信 adapter、实际处理事件与会话成员的设计；
+本项目仍是已有 dot 的通道，没有引入它的 Agent Engine、模型执行器或第二个助手。
+
+### 原五项复现的修复结果
+
+| 修复前问题 | 当前行为与回归 |
+| --- | --- |
+| 进度回复进入 outbox 后任务从恢复列表消失 | `message_work` 持久保存处理轮次；`final:false` 不终结任务，已接受进度仍能由 `list_pending_weixin_messages` 找到。进程重启保留中断任务，发送状态独立 |
+| 重放旧进度开启 typing | reply 幂等同时校验正文、附件、`final` 和显式消息范围，去重分支不更新处理状态；typing 只同步持久轮次。普通迟到 heartbeat / stop 不改变完成终态；旧版本被拒绝 |
+| 同批事件按哈希排序 | 首次投递按持久入站 `messages.rowid`；未就绪媒体可被越过，就绪后进入当前首次投递序列。退避中的重试不阻塞后续消息，到期重试按期限有界优先，上限仍为五次 |
+| UTF-8 跨块损坏 | `attachment_content.py` 用 Python 标准增量 UTF-8 codec 重建边界；完整字符留在下一块文本。字节 offset / next_offset 和 blob 保持精确，文本范围独立标注；中文、表情、无效 UTF-8、乱序读取与重试均有回归 |
+| 限流后追加状态通知 | `rate_limited` 保留失败状态和本机诊断，不追加微信通知；同来信较早的其他失败不能绕过此保护。`uncertain` 仍不提醒、不重发 |
+
+本轮还补齐了审查指出的处理关联：读取返回轮次 ID 和 revision，后续进度与回复
+可携带版本；合并处理只覆盖显式指定、已读取的本人来信。缩小成员集合会分离轮次，
+之后默认完成仅影响当前成员，不会误收尾被排除的旧文件。分组恢复同步各成员的有限租期。
+回复与 `get_weixin_send_status` 返回当前 `work`，调用者可取得合组后的新版本。
+
+收信后异步预热 typing 票据，真正读取后才显示输入提示。成功读取活跃轮次的附件续期，
+诊断或旧附件读取不会自动认领任务。输入状态仍是 best effort；微信接口成功不能保证
+手机恒显示，也不能据此推断 dot 的模型内部事件。
+
+### 已采用的社区基础设施
+
+当前应用环境由 `uv.lock` 固定。以下版本来自本轮锁文件，不是对上游最新版本的声明：
+
+| 组件 | 锁定版本 / 职责 | 保留适配的具体原因 |
+| --- | --- | --- |
+| 官方 MCP Python SDK | 2.3.0；JSON-RPC 类型、解析、分发、stdio 与取消 | OpenAI 的三个 webhook `events/*` 方法和既有 Tunnel 请求形态需要薄适配；不能用 SDK 资源订阅冒充 webhook |
+| AnyIO | 4.15.1；协议与 worker 任务组、退出协调 | 同步 SQLite 和网络工作通过受控线程执行；业务事务、唯一进程锁与 uncertain 仍由桥接维护 |
+| jsonschema | 4.26.0；工具 Schema 校验 | 本人权限、处理成员、幂等与发送语义仍需业务层验证 |
+| HTTPCore | 1.0.9；统一 HTTP framing、CONNECT、响应解析 | 默认 backend 不提供本项目要求的公网 IP 固定、原 hostname TLS、总体期限和所有请求的取消；`net_transport.py` 提供受测的有限适配 |
+| Standard Webhooks | 1.1.0；精确原始 body 字节签名 | 桥接保留协议指定 header、UTC 时间与短期双签名轮换 |
+| uv | 开发、CI、源码生产部署统一 `uv sync --locked --all-extras` | 部署时拒绝过期锁文件，不现场重新解析另一套版本；升级依赖需显式更新锁并验证 |
+| SQLite / systemd / 媒体组件 | 保留标准库 SQLite、用户服务、cryptography、Pillow、silk-wasm、ffmpeg 与腾讯 Markdown 过滤器 | 当前单账号无需新增外部队列、数据库服务或 Web 框架；Node 使用原 package-lock，编解码器仍是可选本地依赖 |
+
+选择 HTTPCore 直接承担共同 HTTP 机制，而不是在每个通道继续复制 HTTP 客户端。
+微信 API、回调、登录、媒体 CDN、公开文件导入共用该边界；端点授权和固定错误类别
+仍由各业务入口控制。库设置 `retries=0`，原有媒体上传的有界重试不扩展为微信发送自动重试。
+写出请求后超时或退出取消继续保留 uncertain；跨进程重启不重发。
+
+MCP 薄适配有一个明确的维护例外：SDK 的公开自定义 reader 接口不能同时提供桥接的
+2 MiB 帧限制和子进程 stdin 隔离，因而复用锁定 2.3 系列中的
+`mcp.server.stdio._claim_fd` / `_open_stdin_diversion`。它使 handler 子进程得到 EOF，
+不会消费 MCP 帧，并在退出时恢复描述符。依赖范围固定为 `>=2.3.0,<2.4`，当前锁到
+2.3.0；更新时必须审查私有入口并重跑 stdio、帧限制、EOF、取消与错误脱敏合约。
+这是已验证的适配差异，不把 SDK 升级兼容性当作自动保证。
+
+### 验证与部署边界
+
+回归使用临时私有 SQLite、合成消息和 mock / 本地网络，不访问生产正文或真实 callback。
+新增覆盖进度后恢复、幂等重放、迟到版本、多消息合并 / 缩组、附件跨 UTF-8 字符、
+限流通知、取消窗口、已受理分段与 uncertain。官方 SDK 线协议覆盖 discovery、旧 initialize、
+工具清单 / 参数、webhook Events、帧上限、子进程 EOF、通知和取消，错误 / 日志保持脱敏。
+
+CI 从提交的锁文件安装依赖，在 Python 3.11 / 3.14 运行 Ruff 和共享发布检查；
+发布检查包括 required unittest、模拟升级、秘密扫描、源码包 / wheel 资源与许可、
+checkout 外安装 smoke，sdist 包含 uv.lock。生产沿用原绑定、原订阅和私有运行目录，
+先停唯一服务并备份，再同步锁定环境。部署成功和本人微信端实际显示效果分别验证。

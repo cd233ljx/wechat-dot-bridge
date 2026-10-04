@@ -2,7 +2,7 @@
 
 把微信插件的本人私聊消息接到**已有的 OpenAI dot**：微信来信保存到本机队列，通过 MCP Events 通知 dot；dot 读取来信、调用回复工具，桥接把回复发回该消息所属的微信对话。
 
-桥接使用 Python 3.11+、SQLite、cryptography 和 Pillow。它不运行模型、不调用模型 API、不启动 Codex CLI，也不创建替代 dot 的助手。dot / Work 和相关 OpenAI 产品仍受各自用量与费用规则约束。
+桥接使用 Python 3.11+、官方 MCP Python SDK 2.3、AnyIO、jsonschema、HTTPCore 1、Standard Webhooks、SQLite、cryptography 和 Pillow。应用依赖由 `uv.lock` 固定；协议与通用网络机制交给社区组件，本人消息处理和发送状态保存在 SQLite。它不运行模型、不调用模型 API、不启动 Codex CLI，也不创建替代 dot 的助手。dot / Work 和相关 OpenAI 产品仍受各自用量与费用规则约束。
 
 **当前版本：0.1.0，实验性 / Early Access，支持 Linux 和 systemd 用户服务、本人单账号私聊。** 文字、输入提示、图片描述与原图回传、文件回传、语音接收与转写、旧图引用回复、视频回传、进度加长文及生成 TXT 文件已由本人确认。接入能力、账号权限和微信实际行为需要在你自己的环境验证；历史结果不代表其他部署已通过。
 
@@ -13,6 +13,8 @@ flowchart LR
     Q --> E[MCP Events: 消息 ID]
     E --> D[已有 dot]
     D --> T[私有 Tunnel: 读取与回复工具]
+    T --> P[持久处理轮次: 进度与完成]
+    P --> Q
     T --> O[不可变回复队列]
     O --> I
     I --> WX
@@ -24,16 +26,16 @@ flowchart LR
 - 微信协议与绑定格式依据 [Tencent/openclaw-weixin](https://github.com/Tencent/openclaw-weixin)；无需安装或运行 OpenClaw。
 - 私有连接使用官方 [openai/tunnel-client](https://github.com/openai/tunnel-client/releases/latest)，不开放本机公网 MCP 端口。
 - 事件依据 [OpenAI MCP Events](https://developers.openai.com/plugins/build/mcp-events)，支持 `2026-07-28` discovery、验证、订阅刷新和取消。
-- `cc-connect` 和 `dots-wechat-bridge` 只作为可行性调查参考，不是运行依赖；本目录没有复制它们的实现。
+- 微信 adapter 与会话生命周期对照 `cc-connect` 固定版本 `dfad19415a38b00b2c5c288610784d1a7eef337f`；它的 Agent Engine 不是运行依赖。参考来源与桥接适配差异见 [上游审查](docs/UPSTREAM_AUDIT.md)。
 - 支持图片、文件、视频、语音转写及 AMR/SILK 回传、引用内容、长文分段、分块上传；详细边界见 [能力对照](docs/CAPABILITIES.md)。
 - 不支持群聊、多用户、无来信无限制主动发送或跨账号历史迁移。
 
-本地安装脚本面向 Linux 和 systemd 用户服务。先确认 Python 版本；在启动包装器使用的 Python 环境中安装依赖，或先创建专用 venv，再使用该环境执行安装脚本。
+本地安装脚本面向 Linux 和 systemd 用户服务。安装 uv 后，在仓库根目录同步已提交的锁文件；开发、CI 和源码生产部署使用同一套依赖。`--locked` 遇到过期锁文件会失败，不在部署时重新选择版本。
 
 ```bash
 python3 --version
-python3 -m pip install -e .
-python3 -m unittest discover -s tests -v
+uv sync --locked --all-extras
+uv run --locked --all-extras python3 -m unittest discover -s tests -v
 ```
 
 ## 准备私人访问条件
@@ -58,7 +60,7 @@ WDB_KEY_FILE="$WDB_CONFIG/tunnel-runtime-key"
 已有合适的私人 Tunnel 运行密钥文件时，直接把 `WDB_KEY_FILE` 指向该文件，保留原文件。没有文件时，在自己的交互式终端隐藏输入保存：
 
 ```bash
-python3 scripts/save_runtime_key.py --path "$WDB_KEY_FILE"
+uv run --locked --all-extras python scripts/save_runtime_key.py --path "$WDB_KEY_FILE"
 ```
 
 不要把密钥放入命令参数、管道、聊天、截图或 Git。保存脚本拒绝覆盖已有文件和非交互输入；专用目录为 `0700`、文件为 `0600`。
@@ -66,7 +68,7 @@ python3 scripts/save_runtime_key.py --path "$WDB_KEY_FILE"
 生成源码启动包装器、私人配置和 systemd 用户服务：
 
 ```bash
-python3 scripts/install_local.py \
+uv run --locked --all-extras python scripts/install_local.py \
   --source-dir "$WDB_SOURCE" \
   --config-dir "$WDB_CONFIG" \
   --state-dir "$WDB_STATE" \
@@ -114,13 +116,10 @@ Google DoH 仅收到回调主机 DNS 查询，回调路径、签名 secret 和�
 "$HOME/.local/bin/wechat-dot-bridge" --config "$WDB_CONFIG/bridge.json" login-start
 ```
 
-命令返回安全的状态与 `qr_state_file` 位置；二维码内容只保存在该专用目录内的私人登录状态文件。可选的 setup 工具在本地生成私人 PNG，不下载远程图片、不打印二维码链接。它使用独立 venv 中的 `qrcode==8.2`；此依赖不参与 bridge 的正常运行：
+命令返回安全的状态与 `qr_state_file` 位置；二维码内容只保存在该专用目录内的私人登录状态文件。可选的 setup 工具在本地生成私人 PNG，不下载远程图片、不打印二维码链接。`qrcode==8.2` 已由 `--all-extras` 安装并锁定；此依赖不参与 bridge 的正常收发：
 
 ```bash
-WDB_SETUP="$HOME/.local/share/wechat-dot-bridge-setup"
-python3 -m venv "$WDB_SETUP"
-"$WDB_SETUP/bin/python" -m pip install qrcode==8.2
-"$WDB_SETUP/bin/python" scripts/render_login_qr.py \
+uv run --locked --all-extras python scripts/render_login_qr.py \
   --state-dir "$WDB_STATE" \
   --output "$WDB_STATE/weixin-login-qr.png"
 ```
@@ -143,7 +142,7 @@ python3 -m venv "$WDB_SETUP"
 确认运行密钥文件可安全读取，且没有第二个接收者后，再开启绑定并启动 Tunnel 服务：
 
 ```bash
-python3 scripts/check_runtime.py \
+uv run --locked --all-extras python scripts/check_runtime.py \
   --key-file "$WDB_KEY_FILE" --state-dir "$WDB_STATE" \
   --config "$WDB_CONFIG/bridge.json" --key-only
 "$HOME/.local/bin/wechat-dot-bridge" --config "$WDB_CONFIG/bridge.json" \
@@ -155,7 +154,7 @@ systemctl --user start wechat-dot-bridge.service
 服务启动后查询本机健康和安全状态：
 
 ```bash
-python3 scripts/check_runtime.py \
+uv run --locked --all-extras python scripts/check_runtime.py \
   --key-file "$WDB_KEY_FILE" --state-dir "$WDB_STATE" \
   --config "$WDB_CONFIG/bridge.json"
 ```
@@ -177,16 +176,18 @@ python3 scripts/check_runtime.py \
 | `import_weixin_attachment` | 从明确提供的公开 HTTPS 地址导入附件 |
 | `reply_weixin_attachment` | 将收到或暂存的附件回传同一对话 |
 | `reply_weixin_message` | 为已有来信提交回复，支持多次追加 |
-| `report_weixin_progress` | 续期或结束处理进度与输入提示，不发送消息 |
+| `report_weixin_progress` | 续期、停止或显式完成处理轮次，可关联已读取的多条来信；不发送消息 |
 | `retry_weixin_operation` | 重试明确失败的发送或附件下载，保留已接受部分 |
 | `get_weixin_send_status` | 查询 API 接受、失败或不确定状态 |
-| `list_pending_weixin_messages` | 显式恢复尚未提交回复的来信 |
+| `list_pending_weixin_messages` | 显式恢复尚未完成处理的来信，包括已发进度的任务 |
 
 验收只发一条有唯一标记的文字。确认现有 dot 收到事件、读取同一消息 ID、提交回复，并由你在同一个微信对话看见一次回复。记录状态和时间即可，不要共享消息原文、callback URL、token 或密钥。
 
 当前应发现表中的 **11 个工具**及 `weixin.message` 事件。按 [当前部署验收清单](docs/ACCEPTANCE.md)逐项记录自己的结果；[历史真人验收记录](docs/REAL_VALIDATION.md)保留此前部署证据，其中旧版五 / 八工具是当时的数量。
 
 `accepted` 仅代表微信 API 接受请求，**不等于已经投递或已读**。POST 后失联会保留 `uncertain`，系统不盲目重发。同一来信可以追加多条不同回复；相同正文默认幂等，独立 `reply_key` 可区分有意重复的回复。长文分段状态会持久保存，可查询 `parts_total` 和 `parts_accepted`。详细失败与恢复边界见 [安全说明](docs/SECURITY.md) 和 [dot 设置说明](docs/DOT_SETUP.md)。
+
+处理轮次与发送队列独立：`final:false` 的进度回复不会清除待处理任务；`final:true` 表示本轮处理完成，发送是否成功仍查对应 `reply_id`。读取工具返回 `processing_id` 和 `revision`，后续进度与回复可携带它们拒绝迟到的旧轮次操作。一次回答覆盖多条来信时显式传 `message_ids`，其他成员必须先读取；不会用同会话另一条回复自动清空旧文件。附件分页的 `offset` / `next_offset` 始终是原始字节位置，文本范围另由 `text_offset` / `text_next_offset` 表示。
 
 ## 停止与回滚
 

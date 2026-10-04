@@ -10,22 +10,24 @@ jobs:
         python: ['3.11', '3.14']
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
       - uses: actions/setup-node@v4
         with:
           node-version: '24'
-      - run: python -m pip install '.[setup]' build imageio-ffmpeg==0.6.0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.12.1'
+          enable-cache: true
+      - name: Sync the committed application lock
+        run: uv sync --locked --all-extras --python '${{ matrix.python }}'
+      - name: Ruff correctness checks
+        run: uv run --locked --all-extras ruff check .
       - run: npm ci --ignore-scripts --prefix wechat_dot_bridge/codecs
-      - name: Test including real local codecs
+      - name: Required unittest, upgrade, privacy and release checks
         run: |
-          export WECHAT_BRIDGE_FFMPEG="$(python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')"
-          python -m unittest discover -s tests -v
-      - run: python -m build
-      - name: Inspect wheel resources and install outside checkout
-        run: |
-          python -m venv /tmp/bridge-wheel-test
-          /tmp/bridge-wheel-test/bin/pip install dist/*.whl
-          cd /tmp
-          /tmp/bridge-wheel-test/bin/python -c 'from importlib.resources import files; from wechat_dot_bridge.mcp import tool_definitions; assert len(tool_definitions()) == 11; assert files("wechat_dot_bridge").joinpath("codecs/markdown-filter.ts").is_file()'
+          export WECHAT_BRIDGE_FFMPEG="$(uv run --locked --all-extras python -c 'import imageio_ffmpeg; print(imageio_ffmpeg.get_ffmpeg_exe())')"
+          uv run --locked --all-extras python scripts/check_release.py

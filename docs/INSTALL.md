@@ -4,12 +4,11 @@
 
 ## 安装源码与可选音频
 
-在自己选择的新目录检出仓库，创建独立环境：
+在自己选择的新目录检出仓库，准备 Python 3.11+ 和 uv，再用已提交锁文件创建独立环境。开发、CI 和源码部署沿用相同命令：
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install '.[setup]'
-.venv/bin/python -m unittest discover -s tests -v
+uv sync --locked --all-extras
+uv run --locked --all-extras python3 -m unittest discover -s tests -v
 ```
 
 音频可选安装（要求现有 Node 24+、npm、uv）：
@@ -18,14 +17,16 @@ python3 -m venv .venv
 bash scripts/install-codecs.sh
 ```
 
-未安装音频转换依赖时仍可传文件和已有 AMR/SILK，不能宣称已验证通用音频转码。Node 缺失时 Markdown 使用简化降级。Python 依赖装在独立环境，SILK 依赖使用 package-lock.json；FFmpeg 使用独立的 imageio-ffmpeg 0.6.0 环境。
+未安装音频转换依赖时仍可传文件和已有 AMR/SILK，不能宣称已验证通用音频转码。Node 缺失时 Markdown 使用简化降级。应用 Python 依赖和开发工具使用 `uv.lock`，SILK 依赖使用 package-lock.json；可选转换脚本把 imageio-ffmpeg 0.6.0 装在独立编解码环境，不改变应用锁。
+
+`--locked` 拒绝过期锁文件；部署时不执行 `uv lock`，不使用 `pip install` 独立解析另一组运行版本。需要选择最低版本时可加 `--python 3.11`。明确升级依赖后提交 pyproject 与锁文件差异并通过回归，再更新生产专用 `.venv`。官方 MCP SDK 2.3、AnyIO、jsonschema、HTTPCore 1 和 Standard Webhooks 是应用依赖，不需要安装 cc-connect 的 Agent Engine。
 
 ## 准备服务，不自动启动
 
 从 OpenAI 官方发布下载匹配系统的 tunnel-client，核对发布校验和；自行创建仅本人使用的 Tunnel。运行 key 通过隐藏输入脚本保存到本人私有目录，禁止写入仓库或聊天。
 
 ```bash
-.venv/bin/python scripts/install_local.py \
+uv run --locked --all-extras python scripts/install_local.py \
   --config-dir /PRIVATE/bridge-config \
   --state-dir /PRIVATE/bridge-data \
   --tunnel-bin /ABSOLUTE/tunnel-client \
@@ -43,13 +44,14 @@ bash scripts/install-codecs.sh
 
 ## 发布验证
 
-发布验证在本地完成，不要求 CI。完整回归、源码包 / wheel 构建、安装产物检查以及 Git 历史扫描的步骤见 [贡献指南](../CONTRIBUTING.md)。真人微信验收单独按 [当前清单](ACCEPTANCE.md)进行，本地测试不能代替微信端确认。
+本地和 CI 共享完整回归、源码包 / wheel 构建、安装产物检查及 Git 历史扫描入口，步骤见 [贡献指南](../CONTRIBUTING.md)。真人微信验收单独按 [当前清单](ACCEPTANCE.md)进行，自动化测试不能代替微信端确认。
 
-本地打包要求当前 Python 环境已安装 `setuptools>=77`，使用项目配置的 PEP 517 backend，不需要 `build` 前端：
+本地打包使用锁定开发环境中的 setuptools PEP 517 backend，源码包携带 `uv.lock`：
 
 ```bash
-.venv/bin/python -m pip install 'setuptools>=77'
-.venv/bin/python scripts/check_release.py
+uv sync --locked --all-extras
+uv run --locked --all-extras ruff check .
+uv run --locked --all-extras python scripts/check_release.py
 ```
 
 依赖准备完成后，发布检查不联网。临时 wheel 安装 smoke 使用 `--no-index --no-deps`，复用已有运行依赖，仅验证产物在 checkout 外的导入、资源和新库初始化；不能把它当作新的干净环境依赖安装验证。首次部署仍需执行上面的干净环境安装步骤。
