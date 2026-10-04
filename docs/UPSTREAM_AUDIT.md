@@ -45,3 +45,21 @@ Markdown 转纯文本、错误退避、限流冷却、绑定失效冷却均已�
 - 旧图片引用、文件回传和语音转写已经本人确认，不重复列为未实现。
 
 回滚先停唯一服务，保留升级后原库，在新目录使用与旧版本兼容的升级前副本并核对新增来信 / 发送结果。旧代码未必识别新增引用、提示或分段语义；不要直接打开已升级的生产库，不用旧快照覆盖新消息。推荐前向修复，完整流程见 OPERATIONS.md。
+
+## 等待提醒复核（2026-10-04）
+
+针对连续文字和文件分别触发相同等待提示，复核 cc-connect
+[dfad194 的 core/engine.go](https://github.com/chenhg5/cc-connect/blob/dfad19415a38b00b2c5c288610784d1a7eef337f/core/engine.go)：
+
+- `SetEventIdleTimeout` / `processInteractiveEvents` 的事件循环在收到实际 Agent
+  事件时重置 idle timer；绝对 turn deadline 是独立机制。超时处理与所管理运行的终止相连。
+- `EventResult` 处理完成结果后推进 `pendingMessages`；`EventError` 和事件通道关闭
+  有明确失败处理。连续来信由会话执行状态管理，而非逐条按来信年龄推断执行失败。
+- `platform/weixin/weixin.go` 的 `StartTyping` 返回停止函数，进度展示与实际执行生命周期关联。
+
+本桥接只接收 dot 的工具调用，既没有完整 Agent 事件流，也不拥有其执行器，不能照搬
+cc-connect 的本地 Agent 会话或假装能终止超时任务。因此移除由 `message_unread` /
+`processing_stalled` 自动触发微信提示的路径，保留这两项诊断及待处理消息；
+只对明确的回复发送失败保留一次性提示，继续排除 uncertain。没有新增会话冷却阈值，
+没有把另一条消息的回复作为旧任务完成依据。这是借鉴上游生命周期边界后的桥接适配，
+不是声称已实现 cc-connect 的完整 Agent Engine。

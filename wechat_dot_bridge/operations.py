@@ -85,7 +85,9 @@ class HealthMonitor:
         issue=diagnostics(self.store)
         for item in issue['issues']:
             mid=item.get('message_id')
-            if not mid or item['code']=='reply_uncertain':
+            # Waiting age is an observation, not a dot execution failure.
+            # Unlike cc-connect, this bridge does not own the agent event loop.
+            if not mid or item['code'] not in {'reply_failed', 'reply_context_required', 'reply_auth_required'}:
                 continue
             with self.store.lock:
                 message=self.store.db.execute('SELECT created_at FROM messages WHERE id=?',(mid,)).fetchone()
@@ -94,11 +96,7 @@ class HealthMonitor:
                 # At most one notice per inbound message, persisted across restarts.
                 if self.store.db.execute('SELECT 1 FROM replies WHERE message_id=? AND is_notice=1',(mid,)).fetchone():
                     continue
-            text=('【桥接状态】这条来信等待超过五分钟，dot 尚未读取。消息已保留，当前没有微信回复发送记录。'
-                  if item['code']=='message_unread' else
-                  '【桥接状态】dot 已读取这条来信，但尚未提交微信回复。尚未进入微信回复发送阶段，消息仍在待处理列表。'
-                  if item['code']=='processing_stalled' else
-                  '【桥接状态】这条来信的回复发送遇到了问题，请让原 dot 查询对应 reply_id 的发送状态。消息记录已保留。')
+            text='【桥接状态】这条来信的回复发送遇到了问题，请让原 dot 查询对应 reply_id 的发送状态。消息记录已保留。'
             try:
                 self.store.queue_reply(mid,text,reply_key='bridge_status_notice',notice=True)
                 break

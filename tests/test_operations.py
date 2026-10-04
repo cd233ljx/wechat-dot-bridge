@@ -27,19 +27,45 @@ class OperationsTests(unittest.TestCase):
     def tearDown(self):
         self.store.close();self.tmp.cleanup()
 
-    def test_notice_does_not_consume_pending_or_claim_dot_replied(self):
+    def test_failure_notice_preserves_original_reply_status(self):
+        self.store.queue_reply(self.mid,'failed response')
+        failed=self.store.claim_send()
+        self.store.finish_send(self.mid,'failed',reply_id=failed['reply_id'])
         self.now+=301
         monitor=HealthMonitor(self.store);monitor.tick()
         reply=self.store.claim_send()
         self.assertTrue(reply['text'].startswith('【桥接状态】'))
         self.store.finish_send(self.mid,'accepted',reply_id=reply['reply_id'])
-        self.assertEqual(len(self.store.list_pending()),1)
-        self.assertEqual(self.store.send_status(self.mid)['status'],'no_reply')
+        self.assertEqual(self.store.db.execute('SELECT state FROM messages WHERE id=?',(self.mid,)).fetchone()[0],'reply_committed')
+        self.assertEqual(self.store.send_status(self.mid)['status'],'failed')
         self.now+=301;HealthMonitor(self.store).tick()
-        self.assertEqual(self.store.db.execute('SELECT count(*) FROM replies').fetchone()[0],1)
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM replies WHERE is_notice=1').fetchone()[0],1)
         self.store.queue_reply(self.mid,'actual response')
         reply=self.store.claim_send();self.store.finish_send(self.mid,'accepted',reply_id=reply['reply_id'])
         self.assertEqual(self.store.list_pending(),[])
+
+    def test_waiting_messages_remain_diagnostic_without_automatic_notices(self):
+        self.store.ingest('bot',[dict(source_id='2',peer='owner',text='file task',created_at=self.now,context_token='PRIVATE_CONTEXT')],'2')
+        second=self.store.list_pending()[-1]['message_id']
+        self.store.record_tool_call('read_weixin_message',second,'ok')
+        self.store.report_progress(second)
+        self.now+=601
+        for _ in range(3):
+            HealthMonitor(self.store).tick()
+            self.now+=301
+        self.assertIsNone(self.store.claim_send())
+        self.assertEqual(len(self.store.list_pending()),2)
+        self.assertEqual({r['code'] for r in diagnostics(self.store)['issues']},
+                         {'message_unread','processing_stalled','subscription_inactive'})
+
+    def test_uncertain_send_never_triggers_notice_or_resend(self):
+        self.store.queue_reply(self.mid,'response')
+        reply=self.store.claim_send()
+        self.store.finish_send(self.mid,'uncertain',reply_id=reply['reply_id'])
+        self.now+=601
+        HealthMonitor(self.store).tick()
+        self.assertIsNone(self.store.claim_send())
+        self.assertEqual(self.store.send_status(self.mid)['status'],'uncertain')
 
     def test_active_progress_suppresses_stall_notice(self):
         self.now+=301;self.store.report_progress(self.mid)
