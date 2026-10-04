@@ -181,6 +181,8 @@ class Store(AttachmentStore):
             """)
             self._migrate_reply_identity()
             self._init_media()
+            if "is_notice" not in {r["name"] for r in self.db.execute("PRAGMA table_info(replies)")}:
+                self.db.execute("ALTER TABLE replies ADD COLUMN is_notice INTEGER NOT NULL DEFAULT 0")
             self.db.execute("""CREATE TABLE IF NOT EXISTS sent_quotes (
                 source_id TEXT PRIMARY KEY, text TEXT NOT NULL, attachment_id TEXT)""")
             self.db.execute("""CREATE TABLE IF NOT EXISTS reply_parts (
@@ -485,7 +487,7 @@ class Store(AttachmentStore):
             rows = self.db.execute(
                 "SELECT m.id FROM messages m WHERE m.id IN (" + placeholders + ") "
                 "AND m.account=? AND m.peer=? AND ((m.state='pending' "
-                "AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.message_id=m.id)) OR EXISTS(SELECT 1 FROM processing p WHERE p.message_id=m.id AND p.expires>?))",
+                "AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.is_notice=0)) OR EXISTS(SELECT 1 FROM processing p WHERE p.message_id=m.id AND p.expires>?))",
                 (*message_ids, binding["id"], binding["owner"],self.clock())).fetchall()
             context = self._latest_context(binding)
             if not rows or not context:
@@ -499,11 +501,11 @@ class Store(AttachmentStore):
             binding = self._binding()
             rows = self.db.execute(
                 "SELECT id,created_at FROM messages m WHERE account=? AND peer=? AND state='pending' "
-                "AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.message_id=m.id) "
+                "AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.is_notice=0) "
                 "ORDER BY created_at,rowid LIMIT ?", (binding["id"], binding["owner"], limit)).fetchall()
             return [{"message_id": row["id"], "created_at": row["created_at"]} for row in rows]
 
-    def queue_reply(self, message_id, text, reply_key=None, attachment_id=None, final=True):
+    def queue_reply(self, message_id, text, reply_key=None, attachment_id=None, final=True, notice=False):
         size = _text_bytes(text)
         if size is None or size > MAX_REPLY_BYTES or (not text.strip() and attachment_id is None):
             raise BridgeError("invalid_reply_text")
@@ -534,22 +536,24 @@ class Store(AttachmentStore):
                 if queued >= MAX_QUEUED_REPLIES:
                     raise BridgeError("send_queue_full")
                 self.db.execute(
-                    "INSERT INTO replies(message_id,text,client_id,status,created_at,attachment_id) VALUES(?,?,?,'queued',?,?)",
-                    (message_id, text, client_id, self.clock(), attachment_id))
+                    "INSERT INTO replies(message_id,text,client_id,status,created_at,attachment_id,is_notice) VALUES(?,?,?,'queued',?,?,?)",
+                    (message_id, text, client_id, self.clock(), attachment_id,int(notice)))
                 from .message_format import split_text
                 for part, chunk in enumerate(split_text(text) if text else []):
                     self.db.execute("INSERT INTO reply_parts(reply_id,part,text) VALUES(?,?,?)", (client_id, part, chunk))
                 if attachment_id:
                     self.db.execute("INSERT INTO reply_parts(reply_id,part,text,kind) VALUES(?,?,'','media')", (client_id,len(split_text(text)) if text else 0))
-                self.db.execute("UPDATE messages SET state='reply_committed' WHERE id=?", (message_id,))
-        self.report_progress(message_id, not final)
+                if not notice:
+                    self.db.execute("UPDATE messages SET state='reply_committed' WHERE id=?", (message_id,))
+        if not notice:
+            self.report_progress(message_id, not final)
         return self.send_status(message_id, client_id)
 
     def send_status(self, message_id, reply_id=None):
         with self.lock:
             self._message(message_id, self._binding())
             if reply_id is None:
-                reply = self.db.execute("SELECT client_id,status,error FROM replies WHERE message_id=? ORDER BY rowid DESC LIMIT 1", (message_id,)).fetchone()
+                reply = self.db.execute("SELECT client_id,status,error FROM replies WHERE message_id=? AND is_notice=0 ORDER BY rowid DESC LIMIT 1", (message_id,)).fetchone()
             else:
                 reply = self.db.execute("SELECT client_id,status,error FROM replies WHERE message_id=? AND client_id=?", (message_id, reply_id)).fetchone()
                 if reply is None:
@@ -628,7 +632,7 @@ class Store(AttachmentStore):
                         status = "queued"
                         self.db.execute("UPDATE replies SET attempts=0 WHERE client_id=?", (reply["client_id"],))
             self.db.execute("UPDATE replies SET status=?,error=? WHERE client_id=?", (status, diagnostic, reply["client_id"]))
-            if status == "accepted":
+            if status == "accepted" and not self.db.execute("SELECT is_notice FROM replies WHERE client_id=?", (reply["client_id"],)).fetchone()[0]:
                 self.db.execute("UPDATE messages SET state='replied' WHERE id=?", (message_id,))
             if status == "auth_required":
                 self.db.execute("UPDATE binding SET status='auth_required',last_error='auth_required' WHERE id=?", (binding["id"],))
@@ -642,6 +646,25 @@ class Store(AttachmentStore):
                     "UPDATE replies SET status='uncertain',error='restart_during_send' WHERE status='sending' "
                     "AND message_id IN (SELECT id FROM messages WHERE account=? AND peer=?)",
                     (binding["id"], binding["owner"]))
+
+    def resolve_uncertain(self, reply_id, delivered):
+        if type(delivered) is not bool:
+            raise BridgeError("invalid_resolution")
+        with self._transaction():
+            binding=self._binding()
+            row=self.db.execute("SELECT r.* FROM replies r JOIN messages m ON m.id=r.message_id WHERE r.client_id=? AND m.account=? AND m.peer=?", (reply_id,binding["id"],binding["owner"])).fetchone()
+            if row is None or row["status"]!="uncertain":
+                raise BridgeError("uncertain_reply_required")
+            if delivered:
+                part=self.db.execute("SELECT part FROM reply_parts WHERE reply_id=? AND accepted=0 ORDER BY part LIMIT 1", (reply_id,)).fetchone()
+                if part:
+                    self.db.execute("UPDATE reply_parts SET accepted=1 WHERE reply_id=? AND part=?", (reply_id,part[0]))
+            remaining=self.db.execute("SELECT 1 FROM reply_parts WHERE reply_id=? AND accepted=0", (reply_id,)).fetchone()
+            status="queued" if remaining or not delivered else "accepted"
+            self.db.execute("UPDATE replies SET status=?,error=NULL,attempts=0 WHERE client_id=?", (status,reply_id))
+            if status=="accepted" and not row["is_notice"]:
+                self.db.execute("UPDATE messages SET state='replied' WHERE id=?", (row["message_id"],))
+        return self.send_status(row["message_id"],reply_id)
 
     def retry_reply(self, reply_id):
         with self._transaction():
@@ -690,6 +713,8 @@ class Store(AttachmentStore):
             pause = self.db.execute("SELECT resume_at FROM session_pause LIMIT 1").fetchone()
             result["session_retry_at"] = pause[0] if pause else None
             result["pending_processing"] = [{"message_id": r["id"], "read_observed": bool(r["was_read"]), "age_seconds": max(0,int(self.clock()-r["created_at"]))} for r in self.db.execute("SELECT m.id,m.created_at,EXISTS(SELECT 1 FROM tool_calls t WHERE t.message_id=m.id AND t.name='read_weixin_message' AND t.outcome='ok') AS was_read FROM messages m WHERE m.state='pending' ORDER BY m.rowid LIMIT 20")]
+            from .operations import diagnostics
+            result["diagnostics"] = diagnostics(self)
             result["attachments"] = {row[0]: row[1] for row in self.db.execute("SELECT status,count(*) FROM attachments GROUP BY status")}
             if binding and binding["last_error"]:
                 result["last_error"] = _safe_error(binding["last_error"])

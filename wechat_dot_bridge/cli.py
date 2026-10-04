@@ -131,6 +131,8 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
         from .media import configure_network
         configure_network(media_proxy, media_dns)
         media = MediaWorker(store)
+        from .operations import HealthMonitor
+        monitor = HealthMonitor(store)
 
         def run_worker(name, function):
             delay = 0.5
@@ -146,7 +148,7 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
                     except Exception:
                         pass
 
-        for name, function in (("poll", weixin.poll_once), ("send", weixin.send_once), ("event", events.deliver_once), ("media", media.tick)):
+        for name, function in (("poll", weixin.poll_once), ("send", weixin.send_once), ("event", events.deliver_once), ("media", media.tick), ("monitor", monitor.tick)):
             thread = threading.Thread(target=run_worker, args=(name, function), daemon=True, name=name)
             thread.start()
             threads.append(thread)
@@ -227,6 +229,22 @@ def parser():
     commands.add_parser("status", help="Read redacted local status")
     commands.add_parser("pause", help="Disable WeChat polling and sending")
     commands.add_parser("subscription-forever", help="Keep the current owner subscription until cancellation; stop the service first")
+    commands.add_parser("diagnose", help="Show redacted health and stuck work")
+    commands.add_parser("subscriptions", help="List subscription IDs and lifetime, without callback credentials")
+    commands.add_parser("queue", help="List unresolved reply IDs and fixed error categories")
+    cancel = commands.add_parser("cancel-subscription", help="Cancel one subscription; stop service first")
+    cancel.add_argument("subscription_id")
+    retry = commands.add_parser("retry-send", help="Retry an explicitly failed reply; stop service first")
+    retry.add_argument("reply_id")
+    retry = commands.add_parser("retry-attachment", help="Retry a failed download; stop service first")
+    retry.add_argument("attachment_id")
+    backup = commands.add_parser("backup", help="Create a new private SQLite snapshot; stop service first")
+    backup.add_argument("destination")
+    restore = commands.add_parser("restore-backup", help="Restore only into an empty state directory; never overwrite live data")
+    restore.add_argument("source")
+    resolve = commands.add_parser("resolve-send", help="After checking WeChat, resolve the uncertain PART of a reply; stop service first")
+    resolve.add_argument("reply_id")
+    resolve.add_argument("--outcome",choices=["delivered","not-delivered"],required=True)
     enable = commands.add_parser("resume", help="Enable the imported single-owner binding")
     enable.add_argument("--confirm-single-consumer", action="store_true", required=True)
     importer = commands.add_parser("import-binding", help="Import an existing binding without changing its source")
@@ -245,7 +263,11 @@ def main(argv=None):
     try:
         state, hosts, lock_dir, proxy, dns, media_proxy, media_dns = load_config(args)
         state = private_directory(state)
-        if args.command in ("login-start", "login-poll"):
+        if args.command == "restore-backup":
+            from .operations import restore
+            with acquire_lock(state / "worker.lock"):
+                print(canonical(restore(args.source,state)))
+        elif args.command in ("login-start", "login-poll"):
             from .login import start_login, poll_login
             with acquire_lock(state / "worker.lock"):
                 if args.command == "login-start":
@@ -260,11 +282,23 @@ def main(argv=None):
                             code = getpass.getpass("Weixin verification code (hidden): ")
                     result = poll_login(state, verify_code=code)
                 print(canonical(result))
-        elif args.command in ("import-binding", "resume", "pause", "subscription-forever"):
+        elif args.command in ("import-binding", "resume", "pause", "subscription-forever", "cancel-subscription", "retry-send", "retry-attachment", "backup", "resolve-send"):
             # Configuration changes must not race a running tunnel child.
             with acquire_lock(state / "worker.lock"):
                 store = Store(state)
-                if args.command == "import-binding":
+                if args.command == "resolve-send":
+                    result = store.resolve_uncertain(args.reply_id,args.outcome=="delivered")
+                elif args.command == "backup":
+                    from .operations import backup
+                    result = backup(store,args.destination)
+                elif args.command == "retry-send":
+                    result = store.retry_reply(args.reply_id)
+                elif args.command == "retry-attachment":
+                    result = store.retry_attachment(args.attachment_id)
+                elif args.command == "cancel-subscription":
+                    events = Events(store, allowed_hosts=hosts, proxy=proxy, dns=dns, recover_inflight=False)
+                    result = events.cancel_by_id(args.subscription_id)
+                elif args.command == "import-binding":
                     binding = load_existing_binding(args.source, args.account_id)
                     result = store.import_binding(binding)
                 elif args.command == "subscription-forever":
@@ -282,7 +316,9 @@ def main(argv=None):
                 store = None
                 serve(runtime_store, hosts, lock_dir, state, proxy, dns, media_proxy, media_dns)
             else:
-                print(canonical(store.get_status()))
+                from .operations import diagnostics, subscriptions, queue
+                result = diagnostics(store) if args.command == "diagnose" else subscriptions(store) if args.command == "subscriptions" else queue(store) if args.command == "queue" else store.get_status()
+                print(canonical(result))
         return 0
     except BlockingIOError:
         print(canonical({"error": "already_running"}), file=sys.stderr)

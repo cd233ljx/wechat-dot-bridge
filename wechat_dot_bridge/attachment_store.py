@@ -101,7 +101,8 @@ class AttachmentStore:
                             ("pending" if retry else "failed", error, self.clock() + 5 * 2 ** row["attempts"], attachment_id))
 
     def stage_attachment(self, data_base64, kind, name, upload_id=None, offset=0, final=True):
-        if kind not in ("image", "file", "video", "voice") or not isinstance(data_base64, str) or len(data_base64) > ((MAX_STAGE + 2) // 3) * 4:
+        requested_kind = kind
+        if kind not in ("auto", "image", "file", "video", "voice") or not isinstance(data_base64, str) or len(data_base64) > ((MAX_STAGE + 2) // 3) * 4:
             raise BridgeError("media_invalid")
         try:
             data = base64.b64decode(data_base64, validate=True)
@@ -121,7 +122,7 @@ class AttachmentStore:
                     if not final or completed["kind"] != kind or completed["name"] != name or completed["offset"] != offset or completed["digest"] != hashlib.sha256(data).hexdigest():
                         raise BridgeError("upload_conflict")
                     existing = self.read_attachment(completed["attachment_id"])
-                    return {"attachment_id": existing["id"], "kind": kind, "name": name, "size": len(existing["data"])}
+                    return {"attachment_id": existing["id"], "kind": existing["kind"], "name": name, "size": len(existing["data"])}
                 final_digest = hashlib.sha256(data).hexdigest()
                 row = self.db.execute("SELECT * FROM attachment_uploads WHERE id=?", (uid,)).fetchone()
                 previous = row["data"] if row else b""
@@ -144,6 +145,9 @@ class AttachmentStore:
                 self.db.execute("DELETE FROM attachment_uploads WHERE id=?", (uid,))
             elif offset or not final:
                 raise BridgeError("upload_id_required")
+            if kind == "auto":
+                from .artifacts import detect_kind
+                kind = detect_kind(data,name)
             if kind == "image":
                 image_preview(data)
             material = json.dumps([binding["id"], binding["owner"], kind, name]).encode() + data
@@ -159,7 +163,7 @@ class AttachmentStore:
                     self._cache_room(len(data))
                     self.db.execute("UPDATE attachments SET data=?,status='ready',error=NULL,created_at=? WHERE id=?", (data,self.clock(),aid))
             if upload_id is not None:
-                self.db.execute("INSERT INTO completed_uploads VALUES(?,?,?,?,?,?)", (uid, kind, name, offset, final_digest, aid))
+                self.db.execute("INSERT INTO completed_uploads VALUES(?,?,?,?,?,?)", (uid, requested_kind, name, offset, final_digest, aid))
         return {"attachment_id": aid, "kind": kind, "name": name, "size": len(data)}
 
     def cleanup_media(self, retention_days=None, upload_hours=None):

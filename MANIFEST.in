@@ -1,0 +1,6 @@
+include README.md NOTICE.txt LICENSE
+recursive-include docs *.md
+recursive-include scripts *.py *.sh
+recursive-include licenses *.txt
+recursive-include wechat_dot_bridge/codecs *.mjs *.ts *.json
+prune wechat_dot_bridge/codecs/node_modules

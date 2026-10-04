@@ -330,7 +330,7 @@ def secure_post(url, body, headers, allowed_hosts, proxy=None, dns="system"):
 
 
 class Events:
-    def __init__(self, store, allowed_hosts=(), post=None, clock=time.time, proxy=None, dns="system"):
+    def __init__(self, store, allowed_hosts=(), post=None, clock=time.time, proxy=None, dns="system", recover_inflight=True):
         self.store, self.clock = store, clock
         self.allowed_hosts = frozenset(str(host).lower() for host in allowed_hosts)
         if any(not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", host) or ".." in host or host.endswith(".")
@@ -358,7 +358,8 @@ class Events:
                 );
                 CREATE TABLE IF NOT EXISTS event_metadata (key TEXT PRIMARY KEY,value TEXT);
             """)
-            self.store.db.execute("UPDATE deliveries SET status='retry' WHERE status='sending'")
+            if recover_inflight:
+                self.store.db.execute("UPDATE deliveries SET status='retry' WHERE status='sending'")
 
     def _begin(self):
         self.store.db.execute("BEGIN IMMEDIATE")
@@ -377,7 +378,7 @@ class Events:
         self.store.db.execute("INSERT INTO event_metadata(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
 
     def event_definition(self):
-        return {"name": EVENT_NAME, "description": "A new text message from the bound owner in the original Weixin conversation. Read the message by its ID.",
+        return {"name": EVENT_NAME, "description": "A new message from the bound owner: text, image, file, video or voice. Read the message by its ID and process its attachment metadata; follow the owner request to reply or return attachments.",
                 "delivery": ["webhook"], "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False},
                 "payloadSchema": {"type": "object", "properties": {"message_id": {"type": "string"}},
                                   "required": ["message_id"], "additionalProperties": False}}
@@ -502,7 +503,7 @@ class Events:
                             WHERE subscription_id=? AND (status IN ('failed','cancelled','retry') OR
                             (status='acknowledged' AND ?)) AND message_id IN
                             (SELECT m.id FROM messages m WHERE m.state='pending' AND NOT EXISTS
-                            (SELECT 1 FROM replies r WHERE r.message_id=m.id))""", (self.clock(), subscription_id, int(not continuous)))
+                            (SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.is_notice=0))""", (self.clock(), subscription_id, int(not continuous)))
                     self.store.db.execute("""INSERT INTO subscriptions VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(id) DO UPDATE SET secret=excluded.secret,old_secret=excluded.old_secret,
                         rotate_until=excluded.rotate_until,expires_at=excluded.expires_at,verified_until=excluded.verified_until,
@@ -517,6 +518,17 @@ class Events:
                     self.store.db.execute("ROLLBACK")
                     raise
         return {"id": subscription_id, "refreshBefore": None if expires == NO_EXPIRATION else _iso(expires), "cursor": None, "truncated": False}
+
+    def cancel_by_id(self, subscription_id):
+        with self._network_lock, self.store.lock:
+            row = self.store.db.execute("SELECT url FROM subscriptions WHERE id=?", (subscription_id,)).fetchone()
+            if not row:
+                raise BridgeError("unknown_subscription")
+            params = {"name":EVENT_NAME,"arguments":{},"delivery":{"mode":"webhook","url":row[0]}}
+            if self._identity(params,False)[0] != subscription_id:
+                raise BridgeError("subscription_identity_mismatch")
+            self.unsubscribe(params)
+        return {"subscription_id":subscription_id,"status":"cancelled"}
 
     def unsubscribe(self, params):
         subscription_id, _, _, _ = self._identity(params, False)
@@ -548,9 +560,9 @@ class Events:
                         self._end()
                         return False
                     self.store.db.execute("""UPDATE deliveries SET status='cancelled',error='reply_committed'
-                        WHERE status IN ('pending','retry') AND message_id IN (SELECT message_id FROM replies)""")
+                        WHERE status IN ('pending','retry') AND message_id IN (SELECT message_id FROM replies WHERE is_notice=0)""")
                     rows = self.store.db.execute("""SELECT id,created_at FROM messages m WHERE rowid>? AND account=? AND peer=?
-                        AND state='pending' AND NOT EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id)
+                        AND state='pending' AND NOT EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.is_notice=0)
                         AND NOT EXISTS (SELECT 1 FROM attachments a WHERE (a.message_id=m.id OR EXISTS(SELECT 1 FROM attachment_links l WHERE l.message_id=m.id AND l.attachment_id=a.id)) AND a.status IN ('pending','downloading'))
                         AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.subscription_id=? AND d.message_id=m.id)
                         ORDER BY rowid LIMIT 100""", (subscription[5], binding["id"], binding["owner"], subscription[0])).fetchall()

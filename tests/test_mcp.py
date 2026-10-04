@@ -49,7 +49,7 @@ class MCPTests(unittest.TestCase):
 
     def test_exact_tools_and_unbound_status_only(self):
         tools = self.request("tools/list")["result"]["tools"]
-        self.assertEqual({tool["name"] for tool in tools}, {"get_weixin_status", "read_weixin_message", "reply_weixin_message", "get_weixin_send_status", "list_pending_weixin_messages", "read_weixin_attachment", "stage_weixin_attachment", "reply_weixin_attachment", "retry_weixin_operation", "report_weixin_progress"})
+        self.assertEqual({tool["name"] for tool in tools}, {"get_weixin_status", "read_weixin_message", "reply_weixin_message", "get_weixin_send_status", "list_pending_weixin_messages", "read_weixin_attachment", "stage_weixin_attachment", "reply_weixin_attachment", "retry_weixin_operation", "report_weixin_progress", "import_weixin_attachment"})
         self.assertTrue(all(tool["inputSchema"]["additionalProperties"] is False for tool in tools))
         self.assertFalse(self.call("get_weixin_status")["result"]["isError"])
         self.assertTrue(self.call("list_pending_weixin_messages")["result"]["isError"])

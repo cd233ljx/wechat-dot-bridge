@@ -204,4 +204,13 @@ systemctl --user stop wechat-dot-bridge.service
 
 ## 通道修复和可选编解码器
 
-当前 MCP 提供十个工具，新增失败恢复与处理进度。可用 `bash scripts/install-codecs.sh` 安装可选本地音频转换（Node 24+、npm、uv）；不调用模型。完整能力、预算、真人验证边界和回滚说明见 [通道修复对照](docs/CHANNEL_REPAIR.md)。
+当前 MCP 提供十一个工具，新增失败恢复与处理进度。可用 `bash scripts/install-codecs.sh` 安装可选本地音频转换（Node 24+、npm、uv）；不调用模型。完整能力、预算、真人验证边界和回滚说明见 [通道修复对照](docs/CHANNEL_REPAIR.md)。
+
+
+## 安装、维护与验收
+
+- [干净环境安装与发布检查](docs/INSTALL.md)
+- [故障诊断、管理命令、升级与备份恢复](docs/OPERATIONS.md)
+- [真人验收步骤及待确认边界](docs/ACCEPTANCE.md)
+
+已支持 public HTTPS 文件导入和自动媒体类型识别。服务器不会把 dot 的 sandbox 文件路径当成本机路径。故障提示明确标为“桥接状态”，不运行额外模型，不会将原消息标记为处理完成。
