@@ -261,7 +261,7 @@ class IlinkClient:
         }, 15.0, allow_empty=True)
 
 
-def _application_error(response: dict) -> str | None:
+def _application_error(response: dict, *, sendmessage=False) -> str | None:
     if not isinstance(response, dict):
         return "response_invalid"
     known_fields = {"upload_full_url", "upload_param", "typing_ticket", "ret", "errcode", "errmsg", "message_id", "msgs", "get_updates_buf", "longpolling_timeout_ms"}
@@ -279,6 +279,10 @@ def _application_error(response: dict) -> str | None:
         codes.append(value)
     if -14 in codes:
         return "auth_required"
+    # cc-connect dfad194 weixin.go:861 classifies sendmessage ret=-2 by
+    # the code alone. Other endpoints do not share that documented meaning.
+    if sendmessage and response.get("ret") == -2:
+        return "rate_limited"
     if -2 in codes and "prepare failed" in str(response.get("errmsg", "")).lower():
         return "rate_limited"
     if any(code != 0 for code in codes):
@@ -354,9 +358,18 @@ def _normalize_message(message: dict, binding: dict, now: float) -> dict | None:
                     attachments.append({"kind": KINDS[quoted_media["type"]], "name": "quoted", "error": error.code})
         if item["type"] == 1:
             text_item = item.get("text_item")
-            if not isinstance(text_item, dict) or not isinstance(text_item.get("text"), str):
+            if text_item is None:
+                # CC parse.go:24 also skips a nil TextItem. Quote handling
+                # above has already retained any reference on this placeholder.
+                continue
+            if not isinstance(text_item, dict):
                 return None
-            parts.append(text_item["text"])
+            # text,omitempty in CC's typed protocol permits an empty object
+            # placeholder before voice/media. Explicit wrong types stay invalid.
+            text = text_item.get("text", "")
+            if not isinstance(text, str):
+                return None
+            parts.append(text)
         elif item["type"] in KINDS:
             if item["type"] == 3 and isinstance(item.get("voice_item"), dict) and isinstance(item["voice_item"].get("text"), str) and item["voice_item"]["text"].strip():
                 parts.append(item["voice_item"]["text"])
@@ -492,7 +505,7 @@ class WeixinWorker:
         message_id = reply["message_id"]
         try:
             response = self.client.send(binding, reply)
-            error = _application_error(response)
+            error = _application_error(response, sendmessage=True)
             if error:
                 status = error if error in ("auth_required", "context_required") else (
                     "uncertain" if error == "response_invalid" else "failed")

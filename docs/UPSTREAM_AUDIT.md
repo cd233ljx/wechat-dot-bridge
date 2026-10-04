@@ -297,4 +297,25 @@ Store 的 outbox / parts / work 原子事务必须保留，不能拆成各自提
 本轮最终验证：Python 3.11 / 3.14 各 315 项 unittest 通过、零跳过；锁文件、Ruff、
 升级演练、完整本地历史秘密扫描、源码包 / wheel 检查与 checkout 外安装 smoke 均通过。
 新增默认 HTTPCore 路径、EOF 协调退出及跨重启回归；仅替换合成网络端点，不访问生产。
-本次修复在本地完成验证，尚未部署生产，也未发布公共仓库。
+上述 315 项核验完成时尚未部署生产，也未发布公共仓库；实际部署结果另记于
+[历史验证记录](REAL_VALIDATION.md)。
+
+### 部署前补充核验：入站占位与发送限流
+
+再次对照固定版本的完整微信协议链，发现两处同级遗漏并纳入部署前修复：
+
+- 上游 `TextItem == nil` 或文本为空时继续查找后续内容。本桥接此前把缺 `text_item`
+  或缺 `text` 的占位项直接判为整条无效，有效 ASR / 附件可能被过滤而 cursor 仍前进。
+  现在缺失 / null 的 `text_item` 及缺 `text` 的字典视为空占位，先保留引用解析，再处理后项；
+  显式错误类型仍拒绝。字典内 `text:null` 保留严格类型校验，是本项目的适配差异。
+  参考 [空占位处理](https://github.com/chenhg5/cc-connect/blob/dfad19415a38b00b2c5c288610784d1a7eef337f/platform/weixin/parse.go#L24)
+  及 `weixin_test.go` 的 voice / quote 回归。
+- 上游发送链的 `isSendThrottled` 只匹配 `ret=-2`，不依赖 `errmsg`。本桥接此前另要求
+  `prepare failed`，遗漏响应会按一般失败处理，绕过限流冷却并可能追加提示。
+  现在仅对 sendmessage 已确认的 `ret=-2` 启用端点语义，保持失败、冷却、禁止追加提示和
+  不自动重发；不把未经证实的其他端点错误统一改为限流。
+  参考 [发送限流识别与立即失败](https://github.com/chenhg5/cc-connect/blob/dfad19415a38b00b2c5c288610784d1a7eef337f/platform/weixin/weixin.go#L857)。
+
+这两处属于微信协议适配边界；会话 / pending / 终结与取消的再次独立核验仍支持保留主体架构。
+
+补充后的 Python 3.11 / 3.14 完整回归各 321 项通过、零跳过；完整发布检查通过。
