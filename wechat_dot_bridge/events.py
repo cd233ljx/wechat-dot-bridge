@@ -31,7 +31,7 @@ ROTATION_SECONDS = 300
 VERIFICATION_SECONDS = 300
 DEFAULT_TTL_SECONDS = 3600
 # Zero is an internal no-expiration sentinel compatible with existing NOT NULL rows.
-# Explicit ttlMs:null or a local owner policy grants this; finite requests stay finite.
+# Explicit ttlMs:null grants this; a local owner policy pins it until cancellation.
 NO_EXPIRATION = 0
 MAX_TTL_SECONDS = 86400
 NETWORK_TIMEOUT = 10
@@ -451,7 +451,8 @@ class Events:
         requested = params.get("ttlMs", default_ttl)
         if requested is not None and (type(requested) is not int or requested <= 0):
             raise BridgeError("invalid_params")
-        ttl = None if requested is None else min(MAX_TTL_SECONDS, max(60, requested / 1000))
+        owner_forever = bool(local_policy and local_policy[0] == "1")
+        ttl = None if requested is None or owner_forever else min(MAX_TTL_SECONDS, max(60, requested / 1000))
         with self._network_lock:
             now = self.clock()
             with self.store.lock:
@@ -508,7 +509,7 @@ class Events:
                         status='active',start_rowid=excluded.start_rowid""",
                         (subscription_id, principal, EVENT_NAME, "{}", url, secret, old_secret, rotation,
                          expires, self.clock() + VERIFICATION_SECONDS, "active", boundary))
-                    if requested is not None:
+                    if requested is not None and not owner_forever:
                         self.store.db.execute("DELETE FROM event_metadata WHERE key=?", ("nonexpiring_default:" + subscription_id,))
                     self._metadata("last_error", "")
                     self._end()

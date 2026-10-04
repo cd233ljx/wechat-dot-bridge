@@ -120,3 +120,5 @@ dot / Work 的使用仍消耗其正常用量。桥接不新增模型 API 调用�
 进度消息传 final:false，最终回复传 final:true（默认）；长任务可用 report_weixin_progress(active:true) 续期，完成或放弃时传 active:false。
 retry_weixin_operation 可恢复明确失败的回复和附件，不会重发已被接受的部分；uncertain 仍需本人核对。
 插件已更新但原 dot 工具不全时，本次客户端需要重启才能更新。任务本身也要确认没有保留“只处理文字”的旧指令；不创建第二份订阅。
+
+本机 `subscription-forever` 设置对当前订阅持续生效，平台有限 TTL 续订不会覆盖它；取消订阅会清除此设置。它不控制平台任务的启用状态或任务寿命。

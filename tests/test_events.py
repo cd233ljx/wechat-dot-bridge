@@ -225,15 +225,16 @@ class EventTests(unittest.TestCase):
         self.unsubscribe()
         self.assertIsNotNone(self.events.subscribe(self.params)["refreshBefore"])
 
-    def test_local_owner_policy_respects_explicit_finite_refresh(self):
+    def test_local_owner_policy_pins_lifetime_across_finite_refresh(self):
         self.events.subscribe(self.params)
         self.events.set_current_subscription_nonexpiring()
         self.params["ttlMs"] = 60000
-        self.assertIsNotNone(self.events.subscribe(self.params)["refreshBefore"])
+        self.assertIsNone(self.events.subscribe(self.params)["refreshBefore"])
         self.clock.now += 61
-        self.assertEqual(self.events.status()["active_subscriptions"], 0)
-        with self.assertRaisesRegex(BridgeError, "active_subscription_required"):
-            self.events.set_current_subscription_nonexpiring()
+        self.assertEqual(self.events.status()["active_subscriptions"], 1)
+        self.assertIsNone(self.events.subscribe(self.params)["refreshBefore"])
+        self.unsubscribe()
+        self.assertIsNotNone(self.events.subscribe(self.params)["refreshBefore"])
 
     def test_omitted_ttl_keeps_finite_default(self):
         result = self.events.subscribe(self.params)
