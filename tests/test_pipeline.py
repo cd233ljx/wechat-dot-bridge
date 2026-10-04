@@ -44,7 +44,7 @@ class FixtureWeixin(IlinkClient):
         self.send_failure = None
         self.posts = []
 
-    def _post(self, binding, path, body, timeout):
+    def _post(self, binding, path, body, timeout, allow_empty=False):
         if path == "/ilink/bot/getupdates":
             return json.loads(json.dumps(self.poll_response))
         if path != "/ilink/bot/sendmessage":

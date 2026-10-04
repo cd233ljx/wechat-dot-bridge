@@ -3,6 +3,7 @@
 import threading
 import time
 
+from .errors import BridgeError
 from .transport import IlinkClient
 
 
@@ -67,7 +68,6 @@ class TypingIndicator:
                     self.lease_versions.pop(mid, None)
 
     def begin(self, message_id):
-        from .errors import BridgeError
         try:
             self.store.begin_work(message_id)
             self.sync(message_id)
@@ -106,13 +106,21 @@ class TypingIndicator:
             self.warm_failures = min(self.warm_failures + 1, 4)
             self.warm_after = self.clock() + min(30, 5 * 2 ** (self.warm_failures - 1))
 
-    def _cancel(self):
+    def _cancel(self, stopping=False):
         active, self.active = self.active, None
         if active:
             try:
-                self.client.send_typing(active[0], active[1], 2)
+                if stopping:
+                    self.client.stop_typing(active[0], active[1])
+                else:
+                    self.client.send_typing(active[0], active[1], 2)
                 self._observe('stop_ok')
-            except Exception:
+            except Exception as error:
+                # The ordinary stop shares runtime cancellation. Preserve its
+                # target when shutdown interrupts a refresh, so close() can
+                # still perform the isolated, bounded presence cleanup.
+                if not stopping and isinstance(error, BridgeError) and error.code == 'network_cancelled':
+                    self.active = active
                 self._observe('stop_failed')
 
     def tick(self):
@@ -157,4 +165,4 @@ class TypingIndicator:
             self.closed = True
             self.leases.clear()
             self.lease_versions.clear()
-        self._cancel()
+        self._cancel(stopping=True)

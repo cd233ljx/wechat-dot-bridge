@@ -10,7 +10,8 @@ from .media import MAX_CACHE, MAX_MEDIA, MAX_STAGE, image_preview, safe_name
 
 MEDIA_ERRORS = {"media_key_invalid", "media_invalid", "media_endpoint_rejected", "media_too_large",
                 "media_timeout", "media_http_error", "media_http_rejected", "media_network_failed", "media_decryption_failed",
-                "media_image_invalid", "media_cache_full", "media_failed", "media_upload_failed"}
+                "media_image_invalid", "media_cache_full", "media_failed", "media_upload_failed",
+                "media_cancelled", "media_interrupted"}
 
 
 def media_identity(ref):
@@ -86,6 +87,14 @@ class AttachmentStore:
         error = error if error in MEDIA_ERRORS else "media_failed"
         with self._transaction():
             row = self._attachment(attachment_id)
+            if error == 'media_cancelled':
+                # Only an active inbound GET claim can surrender its reserved
+                # attempt. Completed and independently failed rows stay intact.
+                if row['status'] == 'downloading':
+                    self.db.execute("""UPDATE attachments SET status='pending',error=?,
+                        attempts=MAX(0,attempts-1),next_attempt=? WHERE id=?""",
+                        (error, self.clock(), attachment_id))
+                return
             retry = error in {"media_timeout", "media_network_failed", "media_http_error"} and row["attempts"] < 3
             self.db.execute("UPDATE attachments SET status=?,error=?,next_attempt=? WHERE id=?",
                             ("pending" if retry else "failed", error, self.clock() + 5 * 2 ** row["attempts"], attachment_id))

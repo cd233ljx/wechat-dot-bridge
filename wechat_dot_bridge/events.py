@@ -209,7 +209,12 @@ class Events:
                 CREATE TABLE IF NOT EXISTS event_metadata (key TEXT PRIMARY KEY,value TEXT);
             """)
             if recover_inflight:
-                self.store.db.execute("UPDATE deliveries SET status='retry' WHERE status='sending'")
+                # A claim interrupted by process exit is not a confirmed
+                # callback failure. Keep its immutable event identity/body and
+                # restore the retry budget reserved by that incomplete claim.
+                self.store.db.execute("""UPDATE deliveries SET status='retry',
+                    attempts=MAX(0,attempts-1),next_attempt=?,error='callback_interrupted'
+                    WHERE status='sending'""", (self.clock(),))
 
     def _begin(self):
         self.store.db.execute("BEGIN IMMEDIATE")
@@ -457,6 +462,7 @@ class Events:
             mid=json.loads(delivery[1])["data"]["message_id"]
             trace(self.store,mid,"event_start")
             callback_start=time.perf_counter()
+            interrupted = False
             try:
                 status, _ = self.post(subscription[1], delivery[1], headers)
                 if 200 <= status < 300:
@@ -470,17 +476,20 @@ class Events:
                 else:
                     state, error = "failed", "callback_rejected"
             except BridgeError as failure:
-                error = failure.code if failure.code in {"callback_timeout", "callback_dns_failed", "callback_network_failed", "callback_dns_blocked", "callback_tls_failed", "callback_redirect", "callback_response_too_large", "callback_not_allowed", "callback_invalid"} else "callback_failed"
-                state = "retry" if error in {"callback_timeout", "callback_dns_failed", "callback_network_failed"} else "failed"
+                interrupted = failure.code == 'callback_cancelled'
+                error = failure.code if failure.code in {"callback_cancelled", "callback_timeout", "callback_dns_failed", "callback_network_failed", "callback_dns_blocked", "callback_tls_failed", "callback_redirect", "callback_response_too_large", "callback_not_allowed", "callback_invalid"} else "callback_failed"
+                state = "retry" if error in {"callback_cancelled", "callback_timeout", "callback_dns_failed", "callback_network_failed"} else "failed"
             except Exception:
                 state, error = "failed", "callback_failed"
             trace(self.store,mid,"event_result",outcome=state,elapsed_ms=round((time.perf_counter()-callback_start)*1000,3))
-            if state == "retry" and attempts >= MAX_ATTEMPTS:
+            if state == "retry" and not interrupted and attempts >= MAX_ATTEMPTS:
                 state, error = "failed", "retry_exhausted"
             with self.store.lock:
                 self._begin()
                 try:
-                    self.store.db.execute("UPDATE deliveries SET status=?,error=?,next_attempt=? WHERE event_id=?", (state, error, self.clock() + min(300, 2 ** attempts), delivery[0]))
+                    next_attempt = self.clock() if interrupted else self.clock() + min(300, 2 ** attempts)
+                    self.store.db.execute("UPDATE deliveries SET status=?,error=?,next_attempt=?,attempts=? WHERE event_id=?",
+                        (state, error, next_attempt, attempts - 1 if interrupted else attempts, delivery[0]))
                     self._metadata("last_error", error or "")
                     if error == "callback_gone":
                         self.store.db.execute("UPDATE subscriptions SET status='cancelled',secret='',old_secret=NULL WHERE id=?", (subscription[0],))

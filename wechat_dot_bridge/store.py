@@ -34,7 +34,7 @@ SEND_OUTCOMES = frozenset(
 # into one fixed category so callers cannot inadvertently persist credentials.
 SAFE_ERRORS = frozenset({
     "auth_required", "context_required", "fresh_context_required",
-    "network_timeout", "network_error", "api_timeout", "api_network_error",
+    "network_timeout", "network_error", "network_cancelled", "api_timeout", "api_network_error",
     "api_http_error", "invalid_api_response", "invalid_api_json",
     "response_too_large", "api_response_too_large", "poll_rejected",
     "send_rejected", "rate_limited", "restart_during_send",

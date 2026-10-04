@@ -109,6 +109,8 @@ def cdn_request(url, data=None):
         category = {"timeout": "media_timeout", "response_too_large": "media_too_large", "cancelled": "media_cancelled"}.get(error.category, "media_network_failed")
         raise BridgeError(category) from None
     except BridgeError as error:
+        if error.code == 'callback_cancelled':
+            raise BridgeError('media_cancelled') from None
         if error.code.startswith("callback_"):
             raise BridgeError("media_network_failed") from None
         raise
@@ -236,7 +238,9 @@ class MediaWorker:
     def __init__(self, store):
         self.store = store
         with store.lock:
-            store.db.execute("UPDATE attachments SET status=CASE WHEN attempts>=3 THEN 'failed' ELSE 'pending' END,error=CASE WHEN attempts>=3 THEN 'media_timeout' ELSE error END WHERE status='downloading'")
+            store.db.execute("""UPDATE attachments SET status='pending',
+                attempts=MAX(0,attempts-1),error='media_interrupted',next_attempt=?
+                WHERE status='downloading'""", (store.clock(),))
 
     def tick(self):
         row = self.store.next_attachment()

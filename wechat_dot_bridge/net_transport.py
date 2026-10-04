@@ -7,6 +7,7 @@ deadlines, which its default backend does not provide. Nothing is retried.
 
 from dataclasses import dataclass
 import ipaddress
+import json
 import logging
 import queue
 import re
@@ -48,7 +49,8 @@ def cancel_all():
         _cancellation.set()
         requests = list(_active_requests)
     for active in requests:
-        active.cancel()
+        if not active._presence_cleanup:
+            active.cancel()
 
 
 def reset_cancellation():
@@ -112,9 +114,16 @@ def checked_addresses(entries):
 
 def resolve_public_addresses(host, timeout, slots):
     """Bound libc DNS calls without accumulating unlimited stuck resolver threads."""
-    token = cancellation_token()
+    return _resolve_public_addresses(host, timeout, slots, cancellation_token())
+
+
+def _resolve_public_addresses(host, timeout, slots, token, *, deadline=None):
+    """The private resolver also serves the restricted presence-stop cleanup."""
     if token.is_set():
         raise NetworkAbort()
+    deadline = time.monotonic() + timeout if deadline is None else deadline
+    if time.monotonic() >= deadline:
+        raise NetworkFailure("timeout")
     if not slots.acquire(blocking=False):
         raise NetworkFailure("dns_failed")
     resolved = queue.Queue(maxsize=1)
@@ -133,7 +142,6 @@ def resolve_public_addresses(host, timeout, slots):
     except (RuntimeError, OSError):
         slots.release()
         raise NetworkFailure("dns_failed") from None
-    deadline = time.monotonic() + timeout
     while True:
         if token.is_set():
             raise NetworkAbort()
@@ -145,6 +153,10 @@ def resolve_public_addresses(host, timeout, slots):
             break
         except queue.Empty:
             continue
+    if token.is_set():
+        raise NetworkAbort()
+    if time.monotonic() >= deadline:
+        raise NetworkFailure("timeout")
     if not ok:
         raise NetworkFailure("dns_failed")
     return checked_addresses(entries)
@@ -316,6 +328,7 @@ class PinnedRequest:
         self.backend = _PinnedBackend(hostname, addresses, proxy, timeout)
         self.timeout, self.hostname, self.proxy = timeout, hostname, proxy
         self.cancellation = cancellation_token()
+        self._presence_cleanup = False
 
     def cancel(self):
         self.backend.abort(cancelled=True)
@@ -388,3 +401,41 @@ def request(hostname, addresses, method, target, body, headers, *, timeout,
             max_response, proxy=None, body_statuses=None):
     return PinnedRequest(hostname, addresses, timeout, proxy).execute(
         method, target, body, headers, max_response, body_statuses)
+
+
+def presence_stop(hostname, body, headers):
+    """Only a shutdown typing-stop gets an independent, total three-second budget.
+
+    This is a constrained operation rather than a cancellation override on the
+    general request API: method, endpoint, status, payload shape and Tencent
+    hostname are checked here. Business requests remain under cancel_all().
+    """
+    try:
+        value = json.loads(body)
+        if (not isinstance(hostname, str) or not hostname.endswith('.weixin.qq.com')
+                or not re.fullmatch(r'[a-z0-9]+(?:[a-z0-9.-]*[a-z0-9])?', hostname)
+                or '..' in hostname or not isinstance(body, bytes) or len(body) > 32768
+                or not isinstance(value, dict)
+                or set(value) != {'ilink_user_id', 'typing_ticket', 'status', 'base_info'}
+                or type(value['status']) is not int or value['status'] != 2
+                or not isinstance(value['ilink_user_id'], str) or not value['ilink_user_id']
+                or not isinstance(value['typing_ticket'], str) or not value['typing_ticket']):
+            raise NetworkFailure('presence_stop_invalid')
+    except NetworkFailure:
+        raise
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise NetworkFailure('presence_stop_invalid') from None
+    deadline = time.monotonic() + 3
+    cleanup_signal = threading.Event()
+    addresses = _resolve_public_addresses(hostname, deadline - time.monotonic(), DNS_SLOTS,
+                                         cleanup_signal, deadline=deadline)
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise NetworkFailure('timeout')
+    exchange = PinnedRequest(hostname, addresses, remaining)
+    # This private capability exists only after validating the fixed stop
+    # operation. Neither request() nor IlinkClient._post accepts an override.
+    exchange.cancellation = cleanup_signal
+    exchange._presence_cleanup = True
+    exchange.backend.deadline = deadline
+    return exchange.execute('POST', '/ilink/bot/sendtyping', body, headers, 1024 * 1024, {200})

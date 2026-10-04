@@ -55,6 +55,8 @@ wechat-dot-bridge --config CONFIG resolve-send REPLY_ID --outcome not-delivered
 
 启动时 `migrations.py` 使用 `PRAGMA user_version` 记录数据库版本。所有尚未应用的迁移和版本标记在一个事务提交；故障或进程中断回滚，重启从上次已提交版本恢复。未版本化旧库在首次迁移补齐旧回填。高于当前支持范围的版本会以 `database_schema_unsupported` 拒绝打开；遇到该类别保留数据库并使用兼容版本，不能修改版本号绕过检查。
 
+停机取消或未完成 claim 中断后，Events 通知和入站附件下载恢复为待重试，并退回该次未完成 claim 的次数；已确认的超时或服务端临时错误仍受原重试上限约束。Events 恢复沿用同一事件 ID 和内容。微信发送中断保留 `uncertain`，这项恢复不适用于微信消息自动重发。旧版已经写成 `failed` 的记录不能据此自动推断为停机中断。
+
 仓库提供 `uv run --locked --all-extras python scripts/verify-upgrade.py`，在临时目录用固定旧结构和模拟数据验证升级、已发送分段、不确定状态及备份恢复；不依赖旧 Git 历史，不连接微信和真实数据库。需要验证某个实际旧版本时，追加 `--old-revision` 和本地可用的 commit / tag。旧版未保存每条回复的 `final`，迁移只依据保留下来的处理租期等明确证据恢复未完成状态，不推断隐藏的 dot 执行记录，不改变发送结果。
 
 ## 从备份恢复到新目录

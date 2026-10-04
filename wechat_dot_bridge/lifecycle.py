@@ -123,6 +123,20 @@ class WorkStore:
         if (not same_run or not same_members or (new_reply and row['state'] == 'completed')
                 or (active and (row['state'] != 'active' or (row['lease_until'] or 0) <= now))):
             run_id, generation = 'work_' + uuid.uuid4().hex, generation + 1
+            # Changing a group's membership retires every source generation,
+            # including tokens held by members excluded from the new scope.
+            # Keep each source group's remainder together without renewing its
+            # lease or changing completed/interrupted work into active work.
+            for previous_run in {r['run_id'] for r in rows}:
+                remainder = self.db.execute(
+                    'SELECT 1 FROM message_work WHERE run_id=? AND message_id NOT IN (' + placeholders + ') LIMIT 1',
+                    (previous_run, *ids)).fetchone()
+                if remainder:
+                    previous_revision = self.db.execute(
+                        'SELECT max(revision) FROM message_work WHERE run_id=?', (previous_run,)).fetchone()[0]
+                    self.db.execute(
+                        'UPDATE message_work SET run_id=?,revision=?,updated_at=? WHERE run_id=? AND message_id NOT IN (' + placeholders + ')',
+                        ('work_' + uuid.uuid4().hex, previous_revision + 1, now, previous_run, *ids))
         state = 'active' if active else 'completed' if completed else 'interrupted'
         for mid in ids:
             # A completed secondary message must not be reopened by a batch

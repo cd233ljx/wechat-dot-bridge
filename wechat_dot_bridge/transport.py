@@ -18,7 +18,7 @@ import tomllib
 from urllib.parse import urlsplit
 
 from .errors import BridgeError
-from .net_transport import DNS_SLOTS, NetworkFailure, PinnedRequest, resolve_public_addresses
+from .net_transport import DNS_SLOTS, NetworkFailure, PinnedRequest, presence_stop, resolve_public_addresses
 
 
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
@@ -135,6 +135,29 @@ class IlinkClient:
         for connection in connections:
             connection.cancel()
 
+    @staticmethod
+    def _headers(binding):
+        return {
+            "Content-Type": "application/json",
+            "AuthorizationType": "ilink_bot_token",
+            "Authorization": "Bearer " + binding["token"],
+            "X-WECHAT-UIN": base64.b64encode(str(secrets.randbits(32)).encode("ascii")).decode("ascii"),
+            "iLink-App-Id": "bot",
+            "iLink-App-ClientVersion": "256",
+        }
+
+    @staticmethod
+    def _response(response, allow_empty=False):
+        if response.status in (401, 403):
+            raise BridgeError("auth_required")
+        if 300 <= response.status < 400:
+            raise BridgeError("endpoint_rejected")
+        if response.status == 429:
+            raise BridgeError("rate_limited")
+        if response.status != 200:
+            raise BridgeError("http_error")
+        return {} if allow_empty and not response.body.strip() else _json_object(response.body)
+
     def _post(self, binding: dict, path: str, body: dict, timeout: float, allow_empty=False) -> dict:
         binding = _binding(binding)
         host, _origin = _endpoint(binding["base_url"])
@@ -142,28 +165,12 @@ class IlinkClient:
         connection = None
         try:
             encoded = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            headers = {
-                "Content-Type": "application/json",
-                "AuthorizationType": "ilink_bot_token",
-                "Authorization": "Bearer " + binding["token"],
-                "X-WECHAT-UIN": base64.b64encode(str(secrets.randbits(32)).encode("ascii")).decode("ascii"),
-                "iLink-App-Id": "bot",
-                "iLink-App-ClientVersion": "256",
-            }
+            headers = self._headers(binding)
             connection = PinnedRequest(host, _pinned_address(address), timeout)
             with self.connection_lock:
                 self.connections.add(connection)
             response = connection.execute("POST", path, encoded, headers, MAX_RESPONSE_BYTES, {200})
-            if response.status in (401, 403):
-                raise BridgeError("auth_required")
-            if 300 <= response.status < 400:
-                raise BridgeError("endpoint_rejected")
-            if response.status == 429:
-                raise BridgeError("rate_limited")
-            if response.status != 200:
-                raise BridgeError("http_error")
-            raw = response.body
-            return {} if allow_empty and not raw.strip() else _json_object(raw)
+            return self._response(response, allow_empty)
         except BridgeError:
             raise
         except NetworkFailure as error:
@@ -214,6 +221,22 @@ class IlinkClient:
         if error:
             raise BridgeError(error)
 
+    def stop_typing(self, binding, ticket):
+        """Bounded shutdown cleanup; cannot start presence or send a message."""
+        checked = _binding(binding)
+        host, _ = _endpoint(checked['base_url'])
+        ticket = _checked_string(ticket, MAX_CONTEXT_BYTES, "typing_unavailable")
+        body = json.dumps({"ilink_user_id": checked['owner'], "typing_ticket": ticket,
+                           "status": 2, "base_info": self._base_info()},
+                          ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        try:
+            response = presence_stop(host, body, self._headers(checked))
+            error = _application_error(self._response(response, allow_empty=True))
+            if error:
+                raise BridgeError(error)
+        except NetworkFailure as error:
+            raise BridgeError('network_timeout' if error.category == 'timeout' else 'network_error') from None
+
     def send(self, binding: dict, reply: dict) -> dict:
         checked = _binding(binding)
         if not isinstance(reply, dict) or reply.get("peer") != checked["owner"]:
@@ -235,7 +258,7 @@ class IlinkClient:
                 "context_token": context,
                 "item_list": items,
             }, "base_info": self._base_info(),
-        }, 15.0)
+        }, 15.0, allow_empty=True)
 
 
 def _application_error(response: dict) -> str | None:

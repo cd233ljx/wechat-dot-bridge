@@ -248,3 +248,53 @@ CI 从提交的锁文件安装依赖，在 Python 3.11 / 3.14 运行 Ruff 和共
 发布检查包括 required unittest、模拟升级、秘密扫描、源码包 / wheel 资源与许可、
 checkout 外安装 smoke，sdist 包含 uv.lock。生产沿用原绑定、原订阅和私有运行目录，
 先停唯一服务并备份，再同步锁定环境。部署成功和本人微信端实际显示效果分别验证。
+
+## 最终架构核验（2026-10-04）
+
+核验基线为 bridge `28adf13`，下述修复随本轮后续提交交付。
+cc-connect 固定为 `dfad19415a38b00b2c5c288610784d1a7eef337f`；再次核对远端 HEAD
+仍为该版本，本地参考工作区无修改。审查完整微信 Platform、Engine、Session 及相关测试，
+不是只摘取 typing 或发送片段。当前环境没有 Go，本轮读取上游测试，不声称运行过它们。
+
+**结论：在本人单账号、已有 dot、私人 MCP 桥接的范围内，无需整体重构。**
+应保持社区基础设施和持久事务，修正生命周期边界，后续按实际扩展整理接口。
+
+| 对照点 | CC Connect 的完整设计 | 本桥接的适配与判断 |
+| --- | --- | --- |
+| 收信与媒体 | 微信 Platform 负责轮询、上下文、媒体与 typing，再交给 Engine | `IlinkClient` / worker 接收并持久保存消息和 cursor，媒体就绪后通知；保留 |
+| 处理与完成 | Engine 拥有 AgentSession，非终结结果不结束 turn，终结后推进 pending | dot 拥有执行器，桥接保存 `message_work`，进度与完成分开；不复制本地执行队列 |
+| 旧轮次隔离 | Session lock generation 防止旧 holder 影响新 turn | 成员调整时，所有来源组及遗留成员的旧标识一起失效；本轮补齐 |
+| 停机取消 | context 取消与执行失败分开；输入停止使用独立三秒 background context | 通知 / GET 下载保持可恢复，停止输入有独立总期限；本轮补齐 |
+| 发送结果 | Platform 发往通道，Engine 管其执行结果；sendMessage 接受 HTTP 200 空响应 | outbox、已受理分段和 `uncertain` 独立持久保存；补齐空响应兼容 |
+| 基础设施 | 平台、会话与执行器各有职责 | 官方 MCP SDK、AnyIO、HTTPCore、jsonschema、Standard Webhooks、SQLite 与 systemd 已承担通用机制；保留 |
+
+本轮修复四项已复现缺口：
+
+1. A/B/C 拆为 A/B 后，C 的旧 token 还能重并并完成新版 A/B。现在新范围和所有来源组
+   的遗留成员都更换轮次标识；遗留状态、租期与读取记录保留，回复和分组变化一起原子提交。
+   参考 [Session generation fencing](https://github.com/chenhg5/cc-connect/blob/dfad19415a38b00b2c5c288610784d1a7eef337f/core/session.go#L65)。
+2. callback / CDN 的取消类别被当成永久失败，未完成 claim 又消耗重试预算。
+   现在取消和进程中断保留同一通知 ID / body 或待下载附件，并退回未完成 claim 的次数；
+   真实超时 / 临时错误仍有限重试。微信 POST 不参与该恢复，仍为 `uncertain`。
+3. 全局取消后 `typing.close` 的停止请求必然被拦住。现在仅固定 `sendtyping/status=2`
+   可在独立的三秒总期限内做清理，DNS 和请求共享期限，业务取消信号不被重置。
+   刷新被取消时保留待清理目标，避免普通停止请求失败后提前丢掉最后一次清理机会。
+   参考 [微信输入状态清理](https://github.com/chenhg5/cc-connect/blob/dfad19415a38b00b2c5c288610784d1a7eef337f/platform/weixin/weixin.go#L681)。
+4. sendmessage 的 HTTP 200 空或纯空白响应原来被解析成 `response_invalid` / `uncertain`。
+   按上游只对该发送接口接受空响应，持久记为 `accepted`；轮询 / 上传 URL 获取仍要求 JSON，
+   非空错误响应仍校验，且 `accepted` 只表示接口受理，不表示微信端确认送达。
+   参考 [sendMessage 响应处理](https://github.com/chenhg5/cc-connect/blob/dfad19415a38b00b2c5c288610784d1a7eef337f/platform/weixin/client.go#L175)。
+
+剩余维护项可以渐进处理：Events 表结构的后续变更纳入统一版本迁移；通用 DNS / 代理
+辅助从 Events 私有方法收敛到网络层；为 Store mixin 补内部宿主契约；减少 SDK / 工具定义
+和运维 helper 的延迟导入回边。当前未复现这些耦合导致的运行故障，不把它们列为开源阻碍。
+Store 的 outbox / parts / work 原子事务必须保留，不能拆成各自提交的仓库。
+
+通知 ACK 不等于 dot 开始或完成执行。无轮次 token 的旧调用维持兼容语义，不能声称能识别
+旧执行者；附件读取只续期当前关联的活跃本人工作，不完成或复活任务。已由旧版写成失败的
+记录不能自动推断为中断，以上修复不追溯重放它们，也不承诺微信客户端恒显示输入提示。
+
+本轮最终验证：Python 3.11 / 3.14 各 315 项 unittest 通过、零跳过；锁文件、Ruff、
+升级演练、完整本地历史秘密扫描、源码包 / wheel 检查与 checkout 外安装 smoke 均通过。
+新增默认 HTTPCore 路径、EOF 协调退出及跨重启回归；仅替换合成网络端点，不访问生产。
+本次修复在本地完成验证，尚未部署生产，也未发布公共仓库。

@@ -118,6 +118,117 @@ class ProcessingStoreTests(unittest.TestCase):
         self.assertEqual(self.store.work_status(b)['state'], 'completed')
         self.assertEqual(self.store.send_status(a)['work'], final['work'])
 
+    def test_excluded_members_old_token_cannot_modify_new_group(self):
+        for operation in ('heartbeat', 'completion', 'interim_reply', 'final_reply'):
+            with self.subTest(operation=operation):
+                a, b, c = [self.message(operation + source) for source in ('a', 'b', 'c')]
+                for mid in (a, b, c):
+                    self.token(mid)
+                group = self.store.report_progress(a, message_ids=[a, b, c])['work']
+                old = {key: group[key] for key in ('processing_id', 'revision')}
+                self.store.report_progress(a, message_ids=[a, b], **old)
+                before = {mid: self.store.work_status(mid) for mid in (a, b, c)}
+                replies_before = self.store.db.execute('SELECT count(*) FROM replies').fetchone()[0]
+                with self.assertRaisesRegex(BridgeError, 'processing_generation_stale'):
+                    if operation in ('heartbeat', 'completion'):
+                        self.store.report_progress(c, active=operation == 'heartbeat',
+                            completed=operation == 'completion', message_ids=[a, b, c], **old)
+                    else:
+                        self.store.queue_reply(c, operation, operation,
+                            final=operation == 'final_reply', message_ids=[a, b, c], **old)
+                self.assertEqual({mid: self.store.work_status(mid) for mid in (a, b, c)}, before)
+                self.assertEqual(self.store.db.execute('SELECT count(*) FROM replies').fetchone()[0], replies_before)
+                self.assertEqual(set(self.store.work_members(a)), {a, b})
+                self.assertEqual(self.store.work_members(c), [c])
+
+    def test_partial_merge_retires_all_source_groups_and_preserves_remainders(self):
+        a, b, c, d, e, f = [self.message(source) for source in 'abcdef']
+        for mid in (a, b, c, d, e, f):
+            self.token(mid)
+        left = self.store.report_progress(a, message_ids=[a, b, c])['work']
+        left_token = {key: left[key] for key in ('processing_id', 'revision')}
+        self.now += 30
+        right = self.store.report_progress(d, message_ids=[d, e, f])['work']
+        right_token = {key: right[key] for key in ('processing_id', 'revision')}
+        before = {mid: self.store.work_status(mid) for mid in (a, b, c, d, e, f)}
+        mirrors = dict(self.store.db.execute('SELECT message_id,expires FROM processing'))
+        self.now += 20
+        merged = self.store.report_progress(a, message_ids=[a, d], **left_token)['work']
+        self.assertEqual(set(self.store.work_members(a)), {a, d})
+        self.assertEqual(set(self.store.work_members(b)), {b, c})
+        self.assertEqual(set(self.store.work_members(e)), {e, f})
+        self.assertEqual(len({self.store.work_status(mid)['processing_id'] for mid in (a, b, e)}), 3)
+        for mid in (b, c, e, f):
+            value = self.store.work_status(mid)
+            self.assertNotEqual(value['processing_id'], before[mid]['processing_id'])
+            self.assertGreater(value['revision'], before[mid]['revision'])
+            self.assertEqual(value['state'], before[mid]['state'])
+            self.assertEqual(value['expires_at'], before[mid]['expires_at'])
+            self.assertEqual(self.store.db.execute('SELECT expires FROM processing WHERE message_id=?', (mid,)).fetchone()[0], mirrors[mid])
+        for mid, old in ((b, left_token), (e, right_token)):
+            with self.assertRaisesRegex(BridgeError, 'processing_generation_stale'):
+                self.store.queue_reply(mid, 'late merged completion', 'late-' + mid,
+                                       message_ids=[a, b, c, d, e, f], **old)
+        current = {key: merged[key] for key in ('processing_id', 'revision')}
+        self.store.report_progress(a, active=False, completed=True, **current)
+        self.assertEqual({row['message_id'] for row in self.store.list_pending()}, {b, c, e, f})
+        recovered = self.store.read_message(b)['processing']
+        self.assertEqual(recovered['processing_id'], self.store.work_status(c)['processing_id'])
+        self.assertEqual(recovered['expires_at'], left['expires_at'])
+
+    def test_regrouping_preserves_excluded_terminal_or_expired_state(self):
+        for state in ('completed', 'interrupted', 'failed', 'expired'):
+            with self.subTest(state=state):
+                a, b, c = [self.message(state + source) for source in ('a', 'b', 'c')]
+                for mid in (a, b, c):
+                    self.token(mid)
+                self.store.report_progress(a, message_ids=[a, b, c])
+                if state in ('completed', 'interrupted'):
+                    self.store.report_progress(a, active=False, completed=state == 'completed')
+                elif state == 'failed':
+                    self.store.db.execute("UPDATE message_work SET state='failed',lease_until=NULL WHERE message_id IN (?,?,?)", (a, b, c))
+                    self.store.db.execute('DELETE FROM processing WHERE message_id IN (?,?,?)', (a, b, c))
+                else:
+                    self.now += 301
+                previous = {mid: dict(self.store.db.execute('SELECT * FROM message_work WHERE message_id=?', (mid,)).fetchone()) for mid in (b, c)}
+                self.store.queue_reply(a, 'new scoped progress', state, final=False, message_ids=[a])
+                for mid in (b, c):
+                    row = self.store.db.execute('SELECT * FROM message_work WHERE message_id=?', (mid,)).fetchone()
+                    self.assertNotEqual(row['run_id'], previous[mid]['run_id'])
+                    self.assertGreater(row['revision'], previous[mid]['revision'])
+                    for key in ('state', 'lease_until', 'read_at'):
+                        self.assertEqual(row[key], previous[mid][key])
+                self.assertEqual(set(self.store.work_members(b)), {b, c})
+                if state != 'completed':
+                    resumed = self.store.read_message(b)['processing']
+                    self.assertEqual(resumed['state'], 'active')
+                    self.assertEqual(self.store.work_status(c), resumed)
+
+    def test_failed_scope_transition_rolls_back_remainders_and_reply(self):
+        for operation in ('progress', 'reply'):
+            with self.subTest(operation=operation):
+                a, b, c = [self.message(operation + source) for source in ('a', 'b', 'c')]
+                for mid in (a, b, c):
+                    self.token(mid)
+                self.store.report_progress(a, message_ids=[a, b, c])
+                before = [tuple(row) for row in self.store.db.execute('SELECT * FROM message_work ORDER BY message_id')]
+                mirrors = [tuple(row) for row in self.store.db.execute('SELECT * FROM processing ORDER BY message_id')]
+                replies = self.store.db.execute('SELECT count(*) FROM replies').fetchone()[0]
+                # Abort the selected member update after the excluded members
+                # have already been forked and the reply has been inserted.
+                self.store.db.execute("CREATE TEMP TRIGGER abort_scope_change BEFORE UPDATE ON message_work WHEN NEW.message_id='" + a + "' BEGIN SELECT RAISE(ABORT, 'fixture_scope_failure'); END")
+                try:
+                    with self.assertRaisesRegex(BridgeError, 'database_unavailable'):
+                        if operation == 'progress':
+                            self.store.report_progress(a, message_ids=[a, b])
+                        else:
+                            self.store.queue_reply(a, 'scoped progress', 'rollback', final=False, message_ids=[a, b])
+                finally:
+                    self.store.db.execute('DROP TRIGGER abort_scope_change')
+                self.assertEqual([tuple(row) for row in self.store.db.execute('SELECT * FROM message_work ORDER BY message_id')], before)
+                self.assertEqual([tuple(row) for row in self.store.db.execute('SELECT * FROM processing ORDER BY message_id')], mirrors)
+                self.assertEqual(self.store.db.execute('SELECT count(*) FROM replies').fetchone()[0], replies)
+
     def test_group_unread_guard_rolls_back_queue_and_membership(self):
         a, b = self.message('a'), self.message('b')
         self.token(a)
