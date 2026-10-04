@@ -26,6 +26,13 @@ class TypingIndicator:
             if not self.closed and len(self.leases) < 128:
                 self.leases.setdefault(message_id, self.clock() + 300)
 
+    def progress(self, message_id, active=True):
+        with self.lock:
+            if active and not self.closed:
+                self.leases[message_id] = self.clock() + 300
+            else:
+                self.leases.pop(message_id, None)
+
     def _cancel(self):
         active, self.active = self.active, None
         if active:

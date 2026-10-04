@@ -182,6 +182,20 @@ class IlinkClient:
 
     def __init__(self, clock=time.time):
         self.clock = clock
+        self.poll_timeout = 40.0
+        self.connections = set()
+        self.connection_lock = __import__("threading").Lock()
+
+    def cancel(self):
+        with self.connection_lock:
+            connections = list(self.connections)
+        for connection in connections:
+            try:
+                if connection.sock:
+                    connection.sock.shutdown(socket.SHUT_RDWR)
+                connection.close()
+            except OSError:
+                pass
 
     def _post(self, binding: dict, path: str, body: dict, timeout: float, allow_empty=False) -> dict:
         binding = _binding(binding)
@@ -199,12 +213,16 @@ class IlinkClient:
                 "iLink-App-ClientVersion": "256",
             }
             connection = _PinnedHTTPSConnection(host, address, timeout)
+            with self.connection_lock:
+                self.connections.add(connection)
             connection.request("POST", path, body=encoded, headers=headers)
             response = connection.getresponse()
             if response.status in (401, 403):
                 raise BridgeError("auth_required")
             if 300 <= response.status < 400:
                 raise BridgeError("endpoint_rejected")
+            if response.status == 429:
+                raise BridgeError("rate_limited")
             if response.status != 200:
                 raise BridgeError("http_error")
             raw = response.read(MAX_RESPONSE_BYTES + 1)
@@ -219,6 +237,8 @@ class IlinkClient:
             raise BridgeError("network_error") from None
         finally:
             if connection is not None:
+                with self.connection_lock:
+                    self.connections.discard(connection)
                 try:
                     connection.close()
                 except OSError:
@@ -230,9 +250,13 @@ class IlinkClient:
 
     def poll(self, binding: dict) -> dict:
         checked = _binding(binding)
-        return self._post(checked, "/ilink/bot/getupdates", {
+        response = self._post(checked, "/ilink/bot/getupdates", {
             "get_updates_buf": checked["cursor"], "base_info": self._base_info(),
-        }, 40.0)
+        }, self.poll_timeout)
+        timeout = response.get("longpolling_timeout_ms")
+        if type(timeout) is int and 0 < timeout <= 120000:
+            self.poll_timeout = timeout / 1000 + 5
+        return response
 
     def typing_ticket(self, binding, context_token):
         checked = _binding(binding)
@@ -389,6 +413,8 @@ def _normalize_message(message: dict, binding: dict, now: float) -> dict | None:
     except UnicodeError:
         return None
     identifier = _numeric_identifier(message.get("message_id"))
+    if identifier is None and isinstance(message.get("message_id"), str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}",message["message_id"]) and not message["message_id"].isdigit():
+        identifier = message["message_id"]
     if identifier == "0":
         identifier = None
     if identifier is None:
@@ -430,13 +456,20 @@ class WeixinWorker:
     def __init__(self, store, client=None):
         self.store = store
         self.client = client if client is not None else IlinkClient()
+        self.send_after = 0
 
-    def _record_error(self, code: str):
+    def _record_error(self, code: str, stale=False):
         self.store.record_error(code)
         if code == "auth_required":
             self.store.set_enabled(False)
+            if stale and hasattr(self.store, "pause_session"):
+                self.store.pause_session()
+        elif code == "rate_limited":
+            self.send_after = time.monotonic() + 30
 
     def poll_once(self) -> bool:
+        if hasattr(self.store,"resume_session"):
+            self.store.resume_session()
         binding = self.store.get_binding()
         if not binding or not binding.get("enabled"):
             return False
@@ -444,7 +477,7 @@ class WeixinWorker:
             response = self.client.poll(binding)
             error = _application_error(response)
             if error:
-                self._record_error(error)
+                self._record_error(error, stale=response.get("ret") == -14 or response.get("errcode") == -14)
                 return False
             messages = response.get("msgs", [])
             cursor = response.get("get_updates_buf", binding.get("cursor", ""))
@@ -466,6 +499,8 @@ class WeixinWorker:
             return False
 
     def send_once(self) -> bool:
+        if time.monotonic() < self.send_after:
+            return False
         binding = self.store.get_binding()
         if not binding or not binding.get("enabled"):
             return False
@@ -480,7 +515,7 @@ class WeixinWorker:
                 status = error if error in ("auth_required", "context_required") else (
                     "uncertain" if error == "response_invalid" else "failed")
                 self.store.finish_send(message_id, status, error, reply_id=reply.get("reply_id"))
-                self._record_error(error)
+                self._record_error(error, stale=response.get("ret") == -14 or response.get("errcode") == -14)
             else:
                 self.store.finish_send(message_id, "accepted", reply_id=reply.get("reply_id"))
                 if response.get("message_id") and hasattr(self.store, "remember_sent_quote"):
@@ -491,7 +526,7 @@ class WeixinWorker:
                 self.store.record_error(None)
         except BridgeError as error:
             status = error.code if error.code in ("auth_required", "context_required") else (
-                "failed" if error.code in ("endpoint_rejected", "dns_rejected", "binding_invalid", "invalid_reply") or error.code.startswith("media_") else "uncertain")
+                "failed" if error.code in ("endpoint_rejected", "dns_rejected", "binding_invalid", "invalid_reply", "rate_limited") or error.code.startswith("media_") else "uncertain")
             self.store.finish_send(message_id, status, error.code, reply_id=reply.get("reply_id"))
             self._record_error(error.code)
         except (UnicodeError, ValueError, TypeError, OverflowError):

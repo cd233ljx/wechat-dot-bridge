@@ -38,7 +38,7 @@ class AttachmentStore:
     def _cache_room(self, size):
         total = self.db.execute("SELECT COALESCE(SUM(length(data)),0) FROM attachments").fetchone()[0]
         total += self.db.execute("SELECT COALESCE(SUM(length(data)),0) FROM attachment_uploads").fetchone()[0]
-        if size > MAX_MEDIA or total + size > MAX_CACHE:
+        if size > MAX_MEDIA or total + size > getattr(self,"media_policy",{}).get("cache_mib",MAX_CACHE//1048576)*1048576:
             raise BridgeError("media_cache_full")
 
     def _ingest_attachments(self, binding, message_id, refs):
@@ -153,11 +153,19 @@ class AttachmentStore:
                 self.db.execute("""INSERT INTO attachments
                     (id,account,peer,kind,name,descriptor,data,status,created_at) VALUES(?,?,?,?,?,'{}',?,'ready',?)""",
                     (aid, binding["id"], binding["owner"], kind, name, data,self.clock()))
+            else:
+                existing = self.db.execute("SELECT status FROM attachments WHERE id=?", (aid,)).fetchone()
+                if existing["status"] == "expired":
+                    self._cache_room(len(data))
+                    self.db.execute("UPDATE attachments SET data=?,status='ready',error=NULL,created_at=? WHERE id=?", (data,self.clock(),aid))
             if upload_id is not None:
                 self.db.execute("INSERT INTO completed_uploads VALUES(?,?,?,?,?,?)", (uid, kind, name, offset, final_digest, aid))
         return {"attachment_id": aid, "kind": kind, "name": name, "size": len(data)}
 
-    def cleanup_media(self, retention_days=7, upload_hours=24):
+    def cleanup_media(self, retention_days=None, upload_hours=None):
+        policy = getattr(self,"media_policy",{})
+        retention_days = retention_days if retention_days is not None else policy.get("retention_days",7)
+        upload_hours = upload_hours if upload_hours is not None else policy.get("upload_hours",24)
         with self._transaction():
             self.db.execute("DELETE FROM attachment_uploads WHERE updated<?", (self.clock()-upload_hours*3600,))
             changed = self.db.execute("""UPDATE attachments SET data=NULL,status='expired',error=NULL

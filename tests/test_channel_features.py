@@ -91,7 +91,7 @@ class ChannelFeatures(unittest.TestCase):
         client = Mock()
         client._post.return_value = {'upload_param': 'fixture'}
         for data, expected, encoding in [(b'#!AMR\nfixture', 3, 0), (b'\x02#!SILK_V3fixture', 3, 1), (b'RIFFfixture', 4, None)]:
-            with patch('wechat_dot_bridge.media.cdn_request', return_value=(b'', 'fixture')):
+            with patch('wechat_dot_bridge.audio.available', return_value=False), patch('wechat_dot_bridge.media.cdn_request', return_value=(b'', 'fixture')):
                 item = upload_item(client, self.binding, dict(data=data, kind='voice', name='voice.bin'))
             self.assertEqual(item['type'], expected)
             if expected == 3:
@@ -109,7 +109,7 @@ class ChannelFeatures(unittest.TestCase):
             self.assertIn('[引用缓存]\n' + expected, row['text'])
 
     def test_markdown_preserves_code_and_urls(self):
-        from wechat_dot_bridge.message_format import markdown_to_text
+        from wechat_dot_bridge.message_format import _plain_markdown as markdown_to_text
         rendered = markdown_to_text('# Title\n**bold** [link](https://example.com)\n```python\nvalue = "**keep**"\n```\n')
         self.assertEqual(rendered, 'Title\nbold link (https://example.com)\nvalue = "**keep**"\n')
 

@@ -195,6 +195,8 @@ class Store(AttachmentStore):
                         self.db.execute("UPDATE reply_parts SET kind='media' WHERE reply_id=? AND part=?", (row["client_id"],last["part"]))
                     else:
                         self.db.execute("INSERT INTO reply_parts(reply_id,part,text,kind) VALUES(?,?,'','media')", (row["client_id"],last["part"]+1 if last else 0))
+            self.db.execute("CREATE TABLE IF NOT EXISTS session_pause (account TEXT PRIMARY KEY, resume_at REAL NOT NULL)")
+            self.db.execute("CREATE TABLE IF NOT EXISTS processing (message_id TEXT PRIMARY KEY REFERENCES messages(id), expires REAL NOT NULL)")
             self.db.execute("""CREATE TABLE IF NOT EXISTS tool_calls (
                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, message_id TEXT,
                 outcome TEXT NOT NULL, created_at REAL NOT NULL)""")
@@ -341,6 +343,21 @@ class Store(AttachmentStore):
             if enabled and binding["status"] != "ready":
                 raise BridgeError("account_not_ready")
             self.db.execute("UPDATE binding SET enabled=? WHERE id=?", (int(enabled), binding["id"]))
+            self.db.execute("DELETE FROM session_pause WHERE account=?", (binding["id"],))
+
+    def pause_session(self):
+        # Tencent's documented stale-session cooldown; explicit operator disable cancels it.
+        with self._transaction():
+            binding = self._binding()
+            self.db.execute("UPDATE binding SET enabled=0,status='auth_required',last_error='auth_required' WHERE id=?", (binding["id"],))
+            self.db.execute("INSERT OR REPLACE INTO session_pause VALUES(?,?)", (binding["id"],self.clock()+3600))
+
+    def resume_session(self):
+        with self._transaction():
+            rows = self.db.execute("SELECT account FROM session_pause WHERE resume_at<=?", (self.clock(),)).fetchall()
+            for row in rows:
+                self.db.execute("UPDATE binding SET enabled=1,status='ready' WHERE id=?", (row["account"],))
+                self.db.execute("DELETE FROM session_pause WHERE account=?", (row["account"],))
 
     def record_error(self, code):
         diagnostic = None if code is None else _safe_error(code)
@@ -398,9 +415,9 @@ class Store(AttachmentStore):
                 cached_aids = []
                 for quote in quotes:
                     sid = quote.get("source_id")
-                    if not isinstance(sid, str) or not sid.isdigit() or len(sid) > 20:
+                    if not isinstance(sid, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", sid):
                         continue
-                    cached = self.db.execute("SELECT id,text FROM messages WHERE account=? AND peer=? AND source_id=?", (binding["id"], peer, "message:" + str(int(sid)))).fetchone()
+                    cached = self.db.execute("SELECT id,text FROM messages WHERE account=? AND peer=? AND source_id IN (?,?)", (binding["id"], peer, "message:" + (str(int(sid)) if sid.isdigit() else sid), "message:item:" + sid)).fetchone()
                     if cached:
                         quote_text = cached["text"]
                         cached_aids.extend(r[0] for r in self.db.execute("SELECT id FROM attachments WHERE message_id=? UNION SELECT attachment_id FROM attachment_links WHERE message_id=?", (cached["id"],cached["id"])))
@@ -435,7 +452,7 @@ class Store(AttachmentStore):
         return added
 
     def remember_sent_quote(self, source_id, reply):
-        if not source_id.isdigit() or len(source_id) > 20:
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", source_id):
             return
         with self._transaction():
             attachment = reply.get("attachment")
@@ -446,6 +463,15 @@ class Store(AttachmentStore):
             message = self._message(message_id, self._binding())
             return {"message_id": message["id"], "text": message["text"], "created_at": message["created_at"],
                     "attachments": self.attachment_metadata(message_id)}
+
+    def report_progress(self, message_id, active=True):
+        with self._transaction():
+            self._message(message_id, self._binding())
+            if active:
+                self.db.execute("INSERT INTO processing VALUES(?,?) ON CONFLICT(message_id) DO UPDATE SET expires=excluded.expires", (message_id,self.clock()+300))
+            else:
+                self.db.execute("DELETE FROM processing WHERE message_id=?", (message_id,))
+        return {"message_id":message_id,"processing":active}
 
     def typing_target(self, message_ids):
         """Internal route only for pending owner messages dot has actually read."""
@@ -458,9 +484,9 @@ class Store(AttachmentStore):
             placeholders = ",".join("?" for _ in message_ids)
             rows = self.db.execute(
                 "SELECT m.id FROM messages m WHERE m.id IN (" + placeholders + ") "
-                "AND m.account=? AND m.peer=? AND m.state='pending' "
-                "AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.message_id=m.id)",
-                (*message_ids, binding["id"], binding["owner"])).fetchall()
+                "AND m.account=? AND m.peer=? AND ((m.state='pending' "
+                "AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.message_id=m.id)) OR EXISTS(SELECT 1 FROM processing p WHERE p.message_id=m.id AND p.expires>?))",
+                (*message_ids, binding["id"], binding["owner"],self.clock())).fetchall()
             context = self._latest_context(binding)
             if not rows or not context:
                 return None
@@ -477,7 +503,7 @@ class Store(AttachmentStore):
                 "ORDER BY created_at,rowid LIMIT ?", (binding["id"], binding["owner"], limit)).fetchall()
             return [{"message_id": row["id"], "created_at": row["created_at"]} for row in rows]
 
-    def queue_reply(self, message_id, text, reply_key=None, attachment_id=None):
+    def queue_reply(self, message_id, text, reply_key=None, attachment_id=None, final=True):
         size = _text_bytes(text)
         if size is None or size > MAX_REPLY_BYTES or (not text.strip() and attachment_id is None):
             raise BridgeError("invalid_reply_text")
@@ -516,6 +542,7 @@ class Store(AttachmentStore):
                 if attachment_id:
                     self.db.execute("INSERT INTO reply_parts(reply_id,part,text,kind) VALUES(?,?,'','media')", (client_id,len(split_text(text)) if text else 0))
                 self.db.execute("UPDATE messages SET state='reply_committed' WHERE id=?", (message_id,))
+        self.report_progress(message_id, not final)
         return self.send_status(message_id, client_id)
 
     def send_status(self, message_id, reply_id=None):
@@ -660,6 +687,8 @@ class Store(AttachmentStore):
                       "account_status": binding["status"] if binding else "not_bound",
                       "pending": pending, "reply_status": counts, "active_subscriptions": active}
             result["recent_tool_calls"] = [dict(r) for r in self.db.execute("SELECT name,outcome,created_at FROM tool_calls ORDER BY id DESC LIMIT 10")]
+            pause = self.db.execute("SELECT resume_at FROM session_pause LIMIT 1").fetchone()
+            result["session_retry_at"] = pause[0] if pause else None
             result["pending_processing"] = [{"message_id": r["id"], "read_observed": bool(r["was_read"]), "age_seconds": max(0,int(self.clock()-r["created_at"]))} for r in self.db.execute("SELECT m.id,m.created_at,EXISTS(SELECT 1 FROM tool_calls t WHERE t.message_id=m.id AND t.name='read_weixin_message' AND t.outcome='ok') AS was_read FROM messages m WHERE m.state='pending' ORDER BY m.rowid LIMIT 20")]
             result["attachments"] = {row[0]: row[1] for row in self.db.execute("SELECT status,count(*) FROM attachments GROUP BY status")}
             if binding and binding["last_error"]:

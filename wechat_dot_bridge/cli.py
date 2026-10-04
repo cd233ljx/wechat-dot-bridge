@@ -68,8 +68,17 @@ def load_config(args):
             config = json.loads(path.read_text())
         except (OSError, ValueError):
             raise BridgeError("config_invalid") from None
-        if not isinstance(config, dict) or set(config) - {"state_dir", "callback_hosts", "lock_dir", "callback_proxy", "callback_dns", "media_proxy", "media_dns"}:
+        if not isinstance(config, dict) or set(config) - {"state_dir", "callback_hosts", "lock_dir", "callback_proxy", "callback_dns", "media_proxy", "media_dns", "media_policy"}:
             raise BridgeError("config_invalid")
+    policy = config.get("media_policy", {})
+    bounds = {"cache_mib": (20, 65536), "retention_days": (1, 3650), "upload_hours": (1, 8760)}
+    if not isinstance(policy,dict) or set(policy)-set(bounds):
+        raise BridgeError("config_invalid")
+    for key,value in policy.items():
+        low,high = bounds[key]
+        if type(value) is not int or not low <= value <= high:
+            raise BridgeError("config_invalid")
+    args.media_policy = policy
     state = args.state_dir or config.get("state_dir") or str(Path.home() / ".local/share/wechat-dot-bridge")
     hosts = config.get("callback_hosts", [])
     if not isinstance(hosts, list) or len(hosts) > 3:
@@ -124,9 +133,11 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
         media = MediaWorker(store)
 
         def run_worker(name, function):
-            while not stop.wait(0.5):
+            delay = 0.5
+            while not stop.wait(delay):
                 try:
-                    function()
+                    result = function()
+                    delay = min(30, max(1, delay * 2)) if name == "poll" and not result else 0.5
                 except Exception:
                     # Never print network exceptions, request bodies or credentials.
                     try:
@@ -139,6 +150,17 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
             thread = threading.Thread(target=run_worker, args=(name, function), daemon=True, name=name)
             thread.start()
             threads.append(thread)
+
+        def maintain_cache():
+            while not stop.wait(3600):
+                try:
+                    store.cleanup_media()
+                except Exception:
+                    pass
+
+        thread = threading.Thread(target=maintain_cache, daemon=True, name="cache")
+        thread.start()
+        threads.append(thread)
 
         def run_typing():
             try:
@@ -182,6 +204,8 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
                 sys.stdout.flush()
     finally:
         stop.set()
+        if "weixin" in locals():
+            weixin.client.cancel()
         for thread in threads:
             thread.join(timeout=1)
         for signum, handler in old_handlers.items():
@@ -252,6 +276,7 @@ def main(argv=None):
                 print(canonical(result))
         else:
             store = Store(state)
+            store.media_policy = args.media_policy
             if args.command == "serve":
                 runtime_store = store
                 store = None

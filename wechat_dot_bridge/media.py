@@ -198,14 +198,18 @@ def fetch(ref):
 
 def upload_item(client, binding, attachment):
     data, kind = attachment["data"], attachment["kind"]
-    # Raw SILK can be returned as a file; native voice synthesis is not implied.
+    # Optional local conversion follows the upstream SILK codec implementation.
     if kind == "voice":
         if data.startswith(b"#!AMR\n"):
             voice_encoding = 0
         elif data.startswith((b"#!SILK_V3", b"\x02#!SILK_V3")):
             voice_encoding = 1
         else:
-            kind = "file"
+            from .audio import available, to_silk
+            if available():
+                data, voice_encoding = to_silk(data), 1
+            else:
+                kind = "file"
     key, filekey = secrets.token_bytes(16), secrets.token_hex(16)
     encrypted = crypt(data, key)
     result = client._post(binding, "/ilink/bot/getuploadurl", {

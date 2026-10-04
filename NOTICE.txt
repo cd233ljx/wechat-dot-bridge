@@ -13,3 +13,9 @@ and Pillow (MIT-CMU), installed separately with their distribution notices.
 https://github.com/pyca/cryptography
 https://github.com/python-pillow/Pillow
 This project is independent and is not endorsed by OpenAI or Tencent.
+The Markdown filter in wechat_dot_bridge/codecs/markdown-filter.ts is copied
+unchanged from Tencent/openclaw-weixin revision 24de5c9eb0dd5e595d7e2d090ed8a3f82870d42c.
+The optional local audio helper uses silk-wasm 3.7.1 (MIT); its notice is in
+licenses/silk-wasm-MIT.txt. Node and imageio-ffmpeg/FFmpeg are installed separately,
+not bundled into this repository. FFmpeg builds have their own LGPL/GPL notices;
+redistribution must retain the build's license and source obligations.

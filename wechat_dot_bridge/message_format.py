@@ -61,6 +61,21 @@ def quote_content(ref):
 
 
 def markdown_to_text(text):
+    """Use the upstream Weixin-compatible parser when Node is installed."""
+    import shutil
+    from pathlib import Path
+    from .audio import _run
+    from .errors import BridgeError
+    node = shutil.which("node")
+    if node:
+        try:
+            return _run([node, str(Path(__file__).parent / "codecs/markdown.mjs")], text.encode(), 262144).decode()
+        except BridgeError:
+            pass
+    return _plain_markdown(text)
+
+
+def _plain_markdown(text):
     """Plain Weixin rendering with code contents and link destinations preserved."""
     import re
     output, fenced = [], False

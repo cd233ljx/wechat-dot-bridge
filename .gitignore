@@ -18,3 +18,5 @@ private*.json
 private*.yaml
 config/bridge.json
 config/tunnel.yaml
+
+node_modules/

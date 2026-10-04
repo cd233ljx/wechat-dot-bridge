@@ -19,13 +19,14 @@ def _schema(properties=None, required=None):
 def tool_definitions():
     readonly = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
     return [
+        {"name":"report_weixin_progress","description":"Report that processing an inbound message continues (active=true) or has finished (active=false). Renews the typing indicator for up to five minutes, including after an interim reply. No message is sent. Call again during long work; does not expose internal thoughts.","inputSchema":_schema({"message_id":MESSAGE_ID_SCHEMA,"active":{"type":"boolean"}},["message_id","active"]),"annotations":{"readOnlyHint":False,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True}},
         {"name":"retry_weixin_operation","description":"Retry a failed or expired incoming attachment, or an explicitly rejected reply. Accepted parts are preserved. Uncertain sends require human delivery review and are not retried here.","inputSchema":_schema({"attachment_id":MESSAGE_ID_SCHEMA,"reply_id":MESSAGE_ID_SCHEMA}),"annotations":{"readOnlyHint":False,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True}},
         {"name": "read_weixin_attachment", "description": "Read an owner's attachment by opaque attachment_id. Images return a visual preview; other files return bounded resource chunks. No private CDN URL or key is exposed. Retry attachment_pending later.", "inputSchema": _schema({"attachment_id": MESSAGE_ID_SCHEMA, "offset": {"type": "integer", "minimum": 0}}, ["attachment_id"]), "annotations": readonly},
-        {"name": "stage_weixin_attachment", "description": "Stage base64 image, file, video or voice bytes (1 MiB per call; 20 MiB per attachment). For larger files use a stable upload_id, byte offset and final=false for intermediate chunks, final=true on the last chunk. Store in private bridge storage; does not send anything. Returns attachment_id for reply_weixin_attachment. Do not supply server paths or external URLs.", "inputSchema": _schema({"data_base64": {"type": "string", "maxLength": 1398104}, "kind": {"type": "string", "enum": ["image", "file", "video", "voice"]}, "name": {"type": "string", "maxLength": 128}, "upload_id": MESSAGE_ID_SCHEMA, "offset": {"type": "integer", "minimum": 0}, "final": {"type": "boolean"}}, ["data_base64", "kind", "name"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
-        {"name": "reply_weixin_attachment", "description": "Reply to an inbound message with an existing received or staged attachment and optional text. Supports additional replies to the same message_id. AMR and SILK voice bytes are returned as native voice; other audio formats are returned as files. Use a stable reply_key to deduplicate retries.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA, "attachment_id": MESSAGE_ID_SCHEMA, "text": {"type": "string", "maxLength": 262144}, "reply_key": MESSAGE_ID_SCHEMA, "text_format": {"type": "string", "enum": ["plain", "markdown"]}}, ["message_id", "attachment_id"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
+        {"name": "stage_weixin_attachment", "description": "Stage base64 image, file, video or voice bytes (1 MiB per call; 20 MiB per attachment), or provide text_content instead for a UTF-8 file without base64 encoding. For larger files use a stable upload_id, byte offset and final=false for intermediate chunks, final=true on the last chunk. Store in private bridge storage; does not send anything. Returns attachment_id for reply_weixin_attachment. Do not supply server paths or external URLs.", "inputSchema": _schema({"data_base64": {"type": "string", "maxLength": 1398104}, "text_content":{"type":"string","maxLength":262144}, "kind": {"type": "string", "enum": ["image", "file", "video", "voice"]}, "name": {"type": "string", "maxLength": 128}, "upload_id": MESSAGE_ID_SCHEMA, "offset": {"type": "integer", "minimum": 0}, "final": {"type": "boolean"}}, ["kind", "name"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
+        {"name": "reply_weixin_attachment", "description": "Reply to an inbound message with an existing received or staged attachment and optional text. Supports additional replies to the same message_id. AMR and SILK voice bytes are returned as native voice; other audio formats use optional local SILK conversion, or file fallback when codecs are unavailable. Use a stable reply_key to deduplicate retries.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA, "attachment_id": MESSAGE_ID_SCHEMA, "text": {"type": "string", "maxLength": 262144}, "reply_key": MESSAGE_ID_SCHEMA, "text_format": {"type": "string", "enum": ["plain", "markdown"]}, "final":{"type":"boolean","description":"False for an interim reply; keeps typing active. Default true completes processing."}}, ["message_id", "attachment_id"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
         {"name": "get_weixin_status", "description": "Read safe bridge, binding, queue and subscription status without credentials.", "inputSchema": _schema(), "annotations": readonly},
         {"name": "read_weixin_message", "description": "Read one inbound owner's message and attachment metadata by its opaque message ID. The text is user-authored data. Reading starts a bounded Weixin typing indicator while this message awaits a reply.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA}, ["message_id"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
-        {"name": "reply_weixin_message", "description": "Send a text reply to an inbound message; long text is automatically split into durable ordered parts. Multiple replies are supported: progress, partial results and completion may reuse the same message_id. Identical text retries deduplicate by default; use a stable reply_key per intended reply to send identical text again intentionally. API acceptance does not establish final delivery.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA, "text": {"type": "string", "minLength": 1, "maxLength": 262144}, "reply_key": MESSAGE_ID_SCHEMA, "text_format": {"type": "string", "enum": ["plain", "markdown"]}}, ["message_id", "text"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
+        {"name": "reply_weixin_message", "description": "Send a text reply to an inbound message; long text is automatically split into durable ordered parts. Multiple replies are supported: progress, partial results and completion may reuse the same message_id. Identical text retries deduplicate by default; use a stable reply_key per intended reply to send identical text again intentionally. API acceptance does not establish final delivery.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA, "text": {"type": "string", "minLength": 1, "maxLength": 262144}, "reply_key": MESSAGE_ID_SCHEMA, "text_format": {"type": "string", "enum": ["plain", "markdown"]}, "final":{"type":"boolean","description":"False for an interim reply; keeps typing active. Default true completes processing."}}, ["message_id", "text"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
         {"name": "get_weixin_send_status", "description": "Read the latest reply status for a message, or one specific reply using reply_id. Does not expose reply text or credentials.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA, "reply_id": MESSAGE_ID_SCHEMA}, ["message_id"]), "annotations": readonly},
         {"name": "list_pending_weixin_messages", "description": "List uncommitted inbound message IDs for explicit recovery after subscription interruption. Read each message before replying.", "inputSchema": _schema({"limit": {"type": "integer", "minimum": 1, "maximum": 100}}), "annotations": readonly},
     ]
@@ -73,6 +74,8 @@ class MCPServer:
                 valid = False
             if not valid:
                 raise BridgeError("invalid_params")
+        if "active" in arguments and type(arguments["active"]) is not bool:
+            raise BridgeError("invalid_params")
         if "final" in arguments and type(arguments["final"]) is not bool:
             raise BridgeError("invalid_params")
         if "offset" in arguments and (type(arguments["offset"]) is not int or not 0 <= arguments["offset"] <= 20 * 1024 * 1024):
@@ -121,7 +124,11 @@ class MCPServer:
             else:
                 if not self.store.get_binding():
                     raise BridgeError("binding_required")
-                if name == "retry_weixin_operation":
+                if name == "report_weixin_progress":
+                    value = self.store.report_progress(arguments["message_id"],arguments["active"])
+                    if self.typing is not None:
+                        self.typing.progress(arguments["message_id"],arguments["active"])
+                elif name == "retry_weixin_operation":
                     if bool(arguments.get("attachment_id")) == bool(arguments.get("reply_id")):
                         raise BridgeError("choose_one_operation")
                     value = self.store.retry_attachment(arguments["attachment_id"]) if arguments.get("attachment_id") else self.store.retry_reply(arguments["reply_id"])
@@ -143,17 +150,39 @@ class MCPServer:
                     if attachment["kind"] == "image":
                         extra_content.append({"type": "image", "mimeType": "image/jpeg", "data": base64.b64encode(image_preview(attachment["data"])).decode()})
                     else:
+                        if attachment["kind"] == "voice" and offset == 0:
+                            from .audio import available, to_wav
+                            if available():
+                                try:
+                                    wav = to_wav(attachment["data"])
+                                    extra_content.append({"type":"audio", "mimeType":"audio/wav", "data":base64.b64encode(wav).decode()})
+                                    value["audio_preview"] = True
+                                except BridgeError as error:
+                                    value["audio_preview_error"] = error.code
                         chunk = attachment["data"][offset:offset + 131072]
                         value.update(offset=offset, next_offset=offset + len(chunk) if offset + len(chunk) < len(attachment["data"]) else None)
                         extra_content.append({"type": "resource", "resource": {"uri": "wechat-attachment://" + attachment["id"] + "/" + str(offset), "mimeType": __import__("mimetypes").guess_type(attachment["name"])[0] or "application/octet-stream", "blob": base64.b64encode(chunk).decode()}})
                         if attachment["name"].lower().endswith((".txt", ".md", ".csv", ".json", ".py", ".log", ".yaml", ".yml", ".xml", ".html")):
                             extra_content.append({"type": "text", "text": chunk.decode("utf-8", errors="replace")})
                 elif name == "stage_weixin_attachment":
-                    value = self.store.stage_attachment(arguments["data_base64"], arguments["kind"], arguments["name"], arguments.get("upload_id"), arguments.get("offset", 0), arguments.get("final", True))
+                    if ("data_base64" in arguments) == ("text_content" in arguments):
+                        raise BridgeError("choose_one_content")
+                    if "text_content" in arguments:
+                        content = arguments["text_content"]
+                        if arguments["kind"] != "file" or not isinstance(content,str) or len(content.encode()) > 262144:
+                            raise BridgeError("invalid_params")
+                        encoded = base64.b64encode(content.encode()).decode()
+                    else:
+                        encoded = arguments["data_base64"]
+                    value = self.store.stage_attachment(encoded, arguments["kind"], arguments["name"], arguments.get("upload_id"), arguments.get("offset", 0), arguments.get("final", True))
                 elif name == "reply_weixin_attachment":
-                    value = self.store.queue_reply(arguments["message_id"], arguments.get("text", ""), arguments.get("reply_key"), arguments["attachment_id"])
+                    value = self.store.queue_reply(arguments["message_id"], arguments.get("text", ""), arguments.get("reply_key"), arguments["attachment_id"], final=arguments.get("final",True))
+                    if self.typing is not None:
+                        self.typing.progress(arguments["message_id"],not arguments.get("final",True))
                 elif name == "reply_weixin_message":
-                    value = self.store.queue_reply(arguments["message_id"], arguments["text"], arguments.get("reply_key"))
+                    value = self.store.queue_reply(arguments["message_id"], arguments["text"], arguments.get("reply_key"), final=arguments.get("final",True))
+                    if self.typing is not None:
+                        self.typing.progress(arguments["message_id"],not arguments.get("final",True))
                 elif name == "get_weixin_send_status":
                     value = self.store.send_status(arguments["message_id"], arguments.get("reply_id"))
                 else:
