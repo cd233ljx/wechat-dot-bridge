@@ -78,3 +78,107 @@ cc-connect 首次输入请求失败会结束该次输入提示；本桥接保留
 这是桥接自身适配，不是上游的重试参数。获取票据后重新检查处理租期，防止已经
 结束或到期的任务启动输入状态。新增仅含固定类别和计数的进程内诊断，便于区分
 尚未读取与输入接口失败，既不记录凭据，也不影响消息回复。
+
+## 完整链路与技术栈审查（2026-10-04）
+
+审查基线：bridge `9ffdd66`；cc-connect `dfad19415a38b00b2c5c288610784d1a7eef337f`。
+本轮通过远端 HEAD 核对，本地 cc-connect 快照与查询时的远端一致。
+对照范围包含微信 adapter 的收发 / 媒体 / typing / context / 限流、Engine 的
+会话锁 / 等待队列 / EventResult / EventError / 取消，以及相关测试。
+这是设计审查，不是“已按上游完成全部重构”的声明；以下问题尚未修复。
+复现只用临时数据库、合成字节和模拟 callback，没有读取生产正文或发送微信。
+
+### 已复现的问题
+
+| 优先级 | 触发与当前结果 | 根因与修改方向 |
+| --- | --- | --- |
+| P1 | `final=False` 的进度回复一入队就从 `list_pending` 消失；发送受理后消息状态变成 `replied`。续期到期或进程中断后，恢复入口不能列出这个未完成任务 | `store.py:list_pending / queue_reply / finish_send` 将是否提交回复、是否受理发送当成任务状态。持久化独立处理轮次和完成标记；恢复应能列出已经发过进度但没有终结的任务 |
+| P1 | 先提交进度，再提交完成回复，再重放原进度的同一 reply_key；发送被去重，但 typing 重新变为可启动 | `queue_reply` 的去重分支之后仍无条件调用 `report_progress`，MCP 又更新内存租期。幂等需要覆盖全部状态副作用，旧进度重试不能反向覆盖新完成状态；保存轮次 / 版本及 final 语义 |
+| P2 | 同一批十条 ready 来信，模拟回调的投递位置为 `5,10,2,7,6,9,4,3,8,1` | `events.py:deliver_once` 对相同 next_attempt 按 event_id 的哈希排序。首次投递需保留入站序号；重试和未就绪媒体的越过策略应显式定义。平台 ACK 只证明接收通知，仍不等于执行顺序 |
+| P2 | 合成 UTF-8 文件在第 131072 字节跨越一个汉字，拼接各块 text 不能还原原文；拼接 blob 可以完全还原 | `mcp.py:read_weixin_attachment` 每块单独 `decode(errors='replace')`。文本分块需有字符边界或可续接的解码语义，二进制 offset 与文本游标不能混淆；同时减少 text + base64 的重复上下文负担 |
+| P2 | 发送明确返回 rate_limited 后，HealthMonitor 又给同条来信排入一条状态消息 | `operations.py:HealthMonitor.tick` 只检查 reply_failed 类别，没有排除 rate_limited。worker 的三十秒冷却仅延迟该通知；应与 cc-connect 一样避免在限流失败后追加失败通知 |
+
+复现结果摘要：`interim_reply_missing_from_recovery=True`、
+`interim_reply_state=replied`、`replaying_old_progress_reopens_typing=True`、
+`rate_limit_generates_extra_notice=True`、`utf8_text_roundtrip_matches=False`、
+`binary_roundtrip_matches=True`、`batch_callback_order_matches_ingest=False`。
+这些是修复前观察，不是预期验收值，也不代表已证明它们都是当天生产现象的原因。
+
+### 生命周期层缺口
+
+cc-connect 的 [Engine](https://github.com/chenhg5/cc-connect/blob/dfad19415a38b00b2c5c288610784d1a7eef337f/core/engine.go)
+先创建可接收等待消息的会话状态再抢执行锁；繁忙时只排队，收到终结 `EventResult`
+再推进下一项，非终结结果不触发完成副作用。它还覆盖启动时来信、释放锁与排队竞争、
+会话死亡后的等待消息处理。我们目前只有逐消息通知和逐回复 outbox，没有等价的
+“哪一次处理认领了哪些来信、是否仍在运行、是否终结”的持久层。
+
+因此，连续文字和文件由 dot 合并回答时，桥接没有显式记录合并关系的入口；
+另一条消息的回复不能安全证明旧文件任务已完成。先前移除等待提醒只解决误提示，
+没有解决这层关联关系。不能通过“同会话最近回过话”自动清空旧来信。
+
+建议建立三套独立状态，而非继续复用 messages.state：
+
+1. 来信 / 事件：已持久接收、媒体准备、待通知、通知已 ACK；带稳定入站序号。
+2. 处理轮次：待领取、处理中、已完成 / 失败 / 中断；明确关联 message_ids，保存
+   领取版本与租期。dot 可显式说明一次处理覆盖了哪些已经读取的来信；终结必须幂等。
+3. 微信发送：queued / sending / accepted / failed / uncertain；分段和幂等键沿用。
+   处理完成与发送被受理分别报告，不能把 accepted 当送达。
+
+领取与续期失效后应进入可恢复状态，不能凭超时自动宣布 dot 失败或启动第二个模型。
+租期和终结操作需要版本检查，避免迟到进度复活旧轮次。事件通知可以继续作为唤醒信号；
+在没有显式领取 / 完成协议前，不能贸然通过“只发第一条事件”把后面的消息永久堵住。
+这部分是适配云端 dot 的方案，不是声称 cc-connect 的内存队列可以直接作为我们的持久队列。
+
+### 输入与附件的剩余差异
+
+[微信 adapter](https://github.com/chenhg5/cc-connect/blob/dfad19415a38b00b2c5c288610784d1a7eef337f/platform/weixin/weixin.go)
+在收到来信后预热 typing ticket，Engine 在真正处理时启动输入状态并管理停止函数。
+我们上一轮只完成票据复用与重试，尚未做收信后的异步预热；附件分块读取也没有关联
+处理轮次来续期。应由明确的处理轮次统一输入状态和有效活动，保留有限期限，避免
+诊断读取 / 旧消息读取被误认为新的任务处理。客户端最终是否显示仍不由桥接保证。
+
+cc-connect 的 [SaveFilesToDisk](https://github.com/chenhg5/cc-connect/blob/dfad19415a38b00b2c5c288610784d1a7eef337f/core/message.go)
+把附件保存为消息范围内的独立文件供本地 Agent 使用。云端 dot 无法读取本机路径，
+我们仍需附件工具，但应提供明确的内容类型、大小、完整性与分页语义；先修文本边界，
+再验证平台支持的原生文件资源方式，不能捏造本机与云端 sandbox 互通。
+
+### 技术栈判断与社区组件
+
+当前依赖入口是 `pyproject.toml` 和 `codecs/package.json`：主进程为 Python 3.11+，
+存储使用标准库 SQLite；并发、MCP 分发、参数校验、HTTP/DNS 与 webhook 签名主要手写。
+第三方必需 Python 运行依赖仅 cryptography 和 Pillow。已有官方 Tunnel、systemd、
+silk-wasm、ffmpeg 和腾讯 Markdown 过滤器复用，并不是所有底层都自行实现。
+问题在于通用协议基础设施承担得过多，同时业务状态模型未单独建立。
+
+- **MCP SDK 优先替换手写协议层。** 官方 [Python SDK v2](https://github.com/modelcontextprotocol/python-sdk/releases/tag/v2.0.0)
+  已明确支持 2026-07-28、server/discover 和 stdio，不能再以“新协议必然只能手写”作为默认理由。
+  本轮另外检查 SDK 源码 `2118f14f8a19bc158d8a1cf90af58d85d187f849`：
+  `src/mcp/server/extension.py` 有新增方法扩展；但未找到本项目的 `events/subscribe` /
+  `events/list` webhook 实现，默认能力生成也没有 events 项。与
+  [OpenAI MCP Events](https://developers.openai.com/plugins/build/mcp-events) 的差异
+  需要薄适配与合约测试，不能拿 SDK 的 subscriptions/listen 冒充 webhook。
+- **网络与退出协调应集中。** [HTTPX 的 transport 接口](https://www.python-httpx.org/advanced/transports/)
+  允许定制网络实现，可评估统一连接池、超时与测试入口；IP 固定和代理 CONNECT
+  等安全约束仍需验证，不能换成默认客户端就算兼容。微信发送在写出后超时必须保留 uncertain，
+  不挂通用自动重试装饰器。配合 SDK 的 AnyIO 统一任务取消，避免继续累积独立线程退出规则。
+- **依赖需可重现。** Python 目前只有版本范围，Node 已有 package-lock；采用
+  [uv 的锁定 / 同步机制](https://docs.astral.sh/uv/concepts/projects/sync/)
+  固定开发与部署环境，更新通过验证后显式推进；锁住应用依赖不等于必须给库依赖全写死。
+- **签名优先参考维护中的库。** [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks)
+  有 Python 参考实现；其价值包括互操作测试。采用前测试 UTF-8 原始字节、UTC 时间与双签名轮换，
+  不为替换二十行 HMAC 而引入不同协议行为。
+- **SQLite 与 systemd 可以保留。** 它们本来就是成熟基础设施，单账号场景不需要仅为“框架化”
+  引入 Redis / Celery / Kubernetes。数据库原子入站 + cursor、持久 outbox、uncertain 保护和
+  私有权限检查值得保留；应在其上建立独立业务状态，而非从头重写存储。
+
+### 可审查的实施顺序
+
+1. 先将本轮五个合成复现固化为修复回归，修正排序、UTF-8 和限流通知；不改生产绑定或订阅。
+2. 定义处理轮次及其与来信 / 回复的关系，覆盖进度回复后崩溃、重复工具请求、迟到续期、
+   多消息合并完成和 uncertain。只有这层明确，才能统一 typing 与恢复入口。
+3. 在隔离环境用官方 MCP SDK 跑现有工具和 webhook 的线协议合约测试；确认日志与遥测脱敏，
+   再迁移分发与校验。自研仅保留确实缺失的 Events 适配和微信业务边界。
+4. 引入锁文件，逐步收敛网络和运行时；一次只迁移一个边界，不在同次升级叠加状态库、SDK、
+   网络库全部替换。每步都有模拟重启 / 升级验收后再更新生产。
+
+本轮修改仅记录审查结果和社区优先原则，没有对生产做上述迁移，也没有关闭功能来冒充设计完善。

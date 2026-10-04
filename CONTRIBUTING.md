@@ -18,6 +18,28 @@ Node 24+ 用于可选 Markdown 解析和本地音频转换。音频安装见 [IN
 
 测试使用临时专用目录、内存 / 模拟 transport 和合成消息；不导入真实绑定，不读取生产 SQLite，不发送微信或访问真实 callback。测试凭据使用明显的 `fixture` / `test` 占位值。需要真实微信验证时由部署者在明确的测试窗口执行 [验收清单](docs/ACCEPTANCE.md)，只记录布尔结果、计数和固定错误类别。
 
+## 技术栈与复用原则
+
+优先采用社区基础设施和成熟设计，避免长期维护自己的通用框架。当前实现仍有明显的原型特征，以下是源码盘点，不代表目标架构已经落地。
+
+| 层 | 当前实现 | 后续方向 |
+| --- | --- | --- |
+| 语言 / 打包 | Python 3.11+、setuptools、venv / pip；Python 无锁文件 | 保留 Python；采用 uv 锁定应用运行与开发环境，保留可发布的 pyproject 元数据 |
+| dot 连接 | 官方 Tunnel client、stdio、systemd 用户服务 | 保留官方 Tunnel 和 systemd |
+| MCP | 手写 JSON-RPC 分发、Schema、校验、协议版本与错误映射 | 优先验证官方 Python MCP SDK v2；标准部分交给 SDK，Events 差异放在薄适配层 |
+| 网络 | http.client、socket、ssl，分别实现 API / 回调网络与 DNS，媒体复用回调传输 | 评估 HTTPX 传输接口，收敛统一适配器；保留 IP 固定、TLS 核验、禁用环境代理、有限响应和不确定发送不重试 |
+| 并发 | 手写 threading worker、锁、轮询和退出协调 | 随 SDK 迁移验证 AnyIO 任务组与取消机制，保持明确数据库事务边界 |
+| 存储 | 标准库 sqlite3、显式 SQL、原子迁移、数据库中的入站 / 出站队列 | 保留单机 SQLite；先补齐处理轮次的持久状态 |
+| Webhook | 按 Standard Webhooks 手写 HMAC 与轮换签名 | 优先采用 standardwebhooks 参考实现或共享测试向量，验证精确签名字节和密钥轮换兼容 |
+| 媒体 | cryptography、Pillow；可选 Node 24+、silk-wasm、ffmpeg；腾讯 Markdown 过滤器 | 保留现有社区复用，集中维护许可与固定版本 |
+| 验证 | unittest、模拟 transport、升级 / 打包 / 秘密扫描脚本，仓库包含 GitHub Actions | 保留有效测试；补跨层故障场景、SDK 合约测试、锁文件检查，逐步加入 Ruff / 类型检查 |
+
+官方 SDK 已提供 MCP 2026-07-28 的发现和 stdio 支持，但其标准订阅与本项目使用的 webhook Events 不是同一个接口。必须先证明 `server/discover` 的 `events` 能力、三个 `events/*` 方法、回调验证 / 签名及现有 11 个工具兼容；不能只因 SDK 能启动就宣称迁移成功。确认默认日志、验证错误和遥测不会带出正文或凭据。
+
+选型验收顺序是：固定版本与许可 → 最小离线兼容实验 → 数据 / 状态迁移与故障回归 → 原有部署路径验收。每个自研例外要写出社区方案无法覆盖的具体能力。当前单账号场景继续使用 SQLite 和 systemd；引入 Redis、外部任务队列或 Web 框架应由明确需求驱动。
+
+详细依据、已复现问题和迁移顺序见 [UPSTREAM_AUDIT](docs/UPSTREAM_AUDIT.md)。以上是选型方向，本轮审查未安装或切换生产依赖。
+
 ## 模块职责
 
 | 位置 | 职责 |
