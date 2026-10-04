@@ -26,6 +26,12 @@ class AttachmentStore:
         self.db.execute("""CREATE TABLE IF NOT EXISTS completed_uploads (
             id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
             offset INTEGER NOT NULL, digest TEXT NOT NULL, attachment_id TEXT NOT NULL)""")
+        self.db.execute("""CREATE TABLE IF NOT EXISTS attachment_links (
+            message_id TEXT NOT NULL REFERENCES messages(id), attachment_id TEXT NOT NULL REFERENCES attachments(id),
+            PRIMARY KEY(message_id,attachment_id))""")
+        if "created_at" not in {r["name"] for r in self.db.execute("PRAGMA table_info(attachments)")}:
+            self.db.execute("ALTER TABLE attachments ADD COLUMN created_at REAL NOT NULL DEFAULT 0")
+            self.db.execute("UPDATE attachments SET created_at=? WHERE created_at=0", (self.clock(),))
         if "attachment_id" not in {r["name"] for r in self.db.execute("PRAGMA table_info(replies)")}:
             self.db.execute("ALTER TABLE replies ADD COLUMN attachment_id TEXT")
 
@@ -41,15 +47,15 @@ class AttachmentStore:
             error = ref.get("error")
             error = error if error in MEDIA_ERRORS else "media_invalid" if error else None
             self.db.execute("""INSERT INTO attachments
-                (id,account,peer,message_id,kind,name,descriptor,status,error)
-                VALUES(?,?,?,?,?,?,?,?,?)""", (aid, binding["id"], binding["owner"], message_id,
-                ref["kind"], safe_name(ref.get("name")), json.dumps(ref), "failed" if error else "pending", error))
+                (id,account,peer,message_id,kind,name,descriptor,status,error,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?)""", (aid, binding["id"], binding["owner"], message_id,
+                ref["kind"], safe_name(ref.get("name")), json.dumps(ref), "failed" if error else "pending", error,self.clock()))
 
     def attachment_metadata(self, message_id):
         with self.lock:
             self._message(message_id, self._binding())
             return [dict(r) for r in self.db.execute(
-                "SELECT id AS attachment_id,kind,name,status,error,length(data) AS size FROM attachments WHERE message_id=? ORDER BY rowid", (message_id,))]
+                "SELECT id AS attachment_id,kind,name,status,error,length(data) AS size FROM attachments WHERE message_id=? OR id IN (SELECT attachment_id FROM attachment_links WHERE message_id=?) ORDER BY rowid", (message_id,message_id))]
 
     def _attachment(self, attachment_id):
         binding = self._binding()
@@ -63,7 +69,7 @@ class AttachmentStore:
         with self.lock:
             row = self._attachment(attachment_id)
             if row["status"] != "ready":
-                raise BridgeError(row["error"] or "attachment_pending")
+                raise BridgeError(row["error"] or ("attachment_expired" if row["status"] == "expired" else "attachment_pending"))
             return {key: row[key] for key in ("id", "kind", "name", "data")}
 
     def next_attachment(self):
@@ -145,8 +151,29 @@ class AttachmentStore:
             if not self.db.execute("SELECT 1 FROM attachments WHERE id=?", (aid,)).fetchone():
                 self._cache_room(len(data))
                 self.db.execute("""INSERT INTO attachments
-                    (id,account,peer,kind,name,descriptor,data,status) VALUES(?,?,?,?,?,'{}',?,'ready')""",
-                    (aid, binding["id"], binding["owner"], kind, name, data))
+                    (id,account,peer,kind,name,descriptor,data,status,created_at) VALUES(?,?,?,?,?,'{}',?,'ready',?)""",
+                    (aid, binding["id"], binding["owner"], kind, name, data,self.clock()))
             if upload_id is not None:
                 self.db.execute("INSERT INTO completed_uploads VALUES(?,?,?,?,?,?)", (uid, kind, name, offset, final_digest, aid))
         return {"attachment_id": aid, "kind": kind, "name": name, "size": len(data)}
+
+    def cleanup_media(self, retention_days=7, upload_hours=24):
+        with self._transaction():
+            self.db.execute("DELETE FROM attachment_uploads WHERE updated<?", (self.clock()-upload_hours*3600,))
+            changed = self.db.execute("""UPDATE attachments SET data=NULL,status='expired',error=NULL
+                WHERE status='ready' AND created_at<?
+                AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.state='pending' AND
+                    (m.id=attachments.message_id OR EXISTS(SELECT 1 FROM attachment_links l WHERE l.message_id=m.id AND l.attachment_id=attachments.id)))
+                AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.attachment_id=attachments.id
+                    AND r.status IN ('queued','sending','uncertain','context_required','auth_required'))""", (self.clock()-retention_days*86400,)).rowcount
+            return changed
+
+    def retry_attachment(self, attachment_id):
+        with self._transaction():
+            row = self._attachment(attachment_id)
+            if row["status"] in ('ready','pending','downloading'):
+                return {"attachment_id":attachment_id,"status":row["status"]}
+            if not json.loads(row["descriptor"]).get("url"):
+                raise BridgeError("attachment_source_unavailable")
+            self.db.execute("UPDATE attachments SET status='pending',attempts=0,error=NULL,next_attempt=0,created_at=? WHERE id=?", (self.clock(),attachment_id))
+            return {"attachment_id":attachment_id,"status":"pending"}

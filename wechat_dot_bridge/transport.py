@@ -389,6 +389,14 @@ def _normalize_message(message: dict, binding: dict, now: float) -> dict | None:
     except UnicodeError:
         return None
     identifier = _numeric_identifier(message.get("message_id"))
+    if identifier == "0":
+        identifier = None
+    if identifier is None:
+        for item in items:
+            item_id = item.get("msg_id")
+            if isinstance(item_id, str) and item_id.strip() and len(item_id) <= 256:
+                identifier = "item:" + item_id.strip()
+                break
     if identifier is not None:
         source_id = "message:" + identifier
     else:

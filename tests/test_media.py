@@ -140,11 +140,13 @@ class MediaTests(unittest.TestCase):
 
         with patch("wechat_dot_bridge.media.cdn_request", side_effect=cdn):
             self.assertTrue(WeixinWorker(self.store, client).send_once())
-        request = posts[0][1]
+            self.assertTrue(WeixinWorker(self.store, client).send_once())
+        request = posts[1][1]
         self.assertEqual(crypt(uploads[0], bytes.fromhex(request["aeskey"]), True), self.data)
         msg = posts[-1][1]["msg"]
         self.assertEqual(msg["to_user_id"], "fixture-owner")
-        self.assertEqual([x["type"] for x in msg["item_list"]], [1, 2])
+        self.assertEqual([x["type"] for x in msg["item_list"]], [2])
+        self.assertEqual([x["type"] for x in posts[0][1]["msg"]["item_list"]], [1])
         self.assertEqual(self.store.send_status(mid, first["reply_id"])["status"], "accepted")
         self.assertEqual(self.store.queue_reply(mid, "完成")["status"], "queued")
 

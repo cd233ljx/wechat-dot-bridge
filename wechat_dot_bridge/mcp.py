@@ -19,6 +19,7 @@ def _schema(properties=None, required=None):
 def tool_definitions():
     readonly = {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}
     return [
+        {"name":"retry_weixin_operation","description":"Retry a failed or expired incoming attachment, or an explicitly rejected reply. Accepted parts are preserved. Uncertain sends require human delivery review and are not retried here.","inputSchema":_schema({"attachment_id":MESSAGE_ID_SCHEMA,"reply_id":MESSAGE_ID_SCHEMA}),"annotations":{"readOnlyHint":False,"destructiveHint":False,"idempotentHint":True,"openWorldHint":True}},
         {"name": "read_weixin_attachment", "description": "Read an owner's attachment by opaque attachment_id. Images return a visual preview; other files return bounded resource chunks. No private CDN URL or key is exposed. Retry attachment_pending later.", "inputSchema": _schema({"attachment_id": MESSAGE_ID_SCHEMA, "offset": {"type": "integer", "minimum": 0}}, ["attachment_id"]), "annotations": readonly},
         {"name": "stage_weixin_attachment", "description": "Stage base64 image, file, video or voice bytes (1 MiB per call; 20 MiB per attachment). For larger files use a stable upload_id, byte offset and final=false for intermediate chunks, final=true on the last chunk. Store in private bridge storage; does not send anything. Returns attachment_id for reply_weixin_attachment. Do not supply server paths or external URLs.", "inputSchema": _schema({"data_base64": {"type": "string", "maxLength": 1398104}, "kind": {"type": "string", "enum": ["image", "file", "video", "voice"]}, "name": {"type": "string", "maxLength": 128}, "upload_id": MESSAGE_ID_SCHEMA, "offset": {"type": "integer", "minimum": 0}, "final": {"type": "boolean"}}, ["data_base64", "kind", "name"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False}},
         {"name": "reply_weixin_attachment", "description": "Reply to an inbound message with an existing received or staged attachment and optional text. Supports additional replies to the same message_id. AMR and SILK voice bytes are returned as native voice; other audio formats are returned as files. Use a stable reply_key to deduplicate retries.", "inputSchema": _schema({"message_id": MESSAGE_ID_SCHEMA, "attachment_id": MESSAGE_ID_SCHEMA, "text": {"type": "string", "maxLength": 262144}, "reply_key": MESSAGE_ID_SCHEMA, "text_format": {"type": "string", "enum": ["plain", "markdown"]}}, ["message_id", "attachment_id"]), "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": True}},
@@ -82,6 +83,28 @@ class MCPServer:
             raise BridgeError("invalid_params")
 
     def _call(self, params):
+        name = params.get("name")
+        if name not in {t["name"] for t in tool_definitions()}:
+            return self._dispatch_call(params)
+        args = params.get("arguments", {})
+        mid = args.get("message_id") if isinstance(args,dict) else None
+        if not isinstance(mid,str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}",mid):
+            mid = None
+        outcome = "internal_error"
+        try:
+            result = self._dispatch_call(params)
+            outcome = self._safe_reason(result.get("structuredContent",{}).get("error", "ok"))
+            return result
+        except BridgeError as error:
+            outcome = self._safe_reason(error.code)
+            raise
+        finally:
+            try:
+                self.store.record_tool_call(name,mid,outcome)
+            except Exception:
+                pass
+
+    def _dispatch_call(self, params):
         if set(params) - {"name", "arguments", "_meta"}:
             raise BridgeError("invalid_params")
         name, arguments = params.get("name"), params.get("arguments", {})
@@ -98,7 +121,11 @@ class MCPServer:
             else:
                 if not self.store.get_binding():
                     raise BridgeError("binding_required")
-                if name == "read_weixin_message":
+                if name == "retry_weixin_operation":
+                    if bool(arguments.get("attachment_id")) == bool(arguments.get("reply_id")):
+                        raise BridgeError("choose_one_operation")
+                    value = self.store.retry_attachment(arguments["attachment_id"]) if arguments.get("attachment_id") else self.store.retry_reply(arguments["reply_id"])
+                elif name == "read_weixin_message":
                     value = self.store.read_message(arguments["message_id"])
                     if self.typing is not None:
                         self.typing.begin(arguments["message_id"])

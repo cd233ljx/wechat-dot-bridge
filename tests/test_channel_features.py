@@ -112,3 +112,33 @@ class ChannelFeatures(unittest.TestCase):
         from wechat_dot_bridge.message_format import markdown_to_text
         rendered = markdown_to_text('# Title\n**bold** [link](https://example.com)\n```python\nvalue = "**keep**"\n```\n')
         self.assertEqual(rendered, 'Title\nbold link (https://example.com)\nvalue = "**keep**"\n')
+
+    def test_zero_message_ids_do_not_collapse_different_messages(self):
+        def wire(seq):
+            return dict(from_user_id='owner',message_type=1,message_state=2,message_id=0,seq=seq,client_id=str(seq),item_list=[dict(type=1,text_item=dict(text='fixture'))])
+        a,b=[_normalize_message(wire(n),self.binding,1) for n in (1,2)]
+        self.assertNotEqual(a['source_id'],b['source_id'])
+
+    def test_quoted_attachment_shares_content_and_download_state(self):
+        self.store.ingest('bot',[dict(source_id='message:2',peer='owner',text='file',created_at=2,context_token='fixture',attachments=[dict(kind='file',name='test.txt',url='fixture')])],'2')
+        aid=self.store.db.execute('SELECT id FROM attachments').fetchone()[0]
+        self.store.db.execute("UPDATE attachments SET status='downloading',attempts=3")
+        self.store.ingest('bot',[dict(source_id='message:3',peer='owner',text='quote',created_at=3,context_token='fixture',quotes=[dict(source_id='2')])],'3')
+        self.store.finish_attachment(aid,b'fixture')
+        mid=self.store.db.execute("SELECT id FROM messages WHERE source_id='message:3'").fetchone()[0]
+        meta=self.store.attachment_metadata(mid)
+        self.assertEqual(meta[0]['attachment_id'],aid)
+        self.assertEqual(meta[0]['status'],'ready')
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM attachments').fetchone()[0],1)
+
+    def test_retry_rejected_reply_preserves_accepted_parts(self):
+        receipt=self.store.queue_reply(self.mid,'x'*8000)
+        first=self.store.claim_send()
+        self.store.finish_send(self.mid,'accepted',reply_id=first['reply_id'])
+        second=self.store.claim_send()
+        self.store.finish_send(self.mid,'failed','gateway_error',second['reply_id'])
+        self.store.retry_reply(receipt['reply_id'])
+        self.assertEqual(self.store.claim_send()['client_id'],second['client_id'])
+        self.store.finish_send(self.mid,'uncertain',reply_id=second['reply_id'])
+        with self.assertRaisesRegex(BridgeError,'delivery_uncertain_review_required'):
+            self.store.retry_reply(receipt['reply_id'])

@@ -550,7 +550,7 @@ class Events:
                         WHERE status IN ('pending','retry') AND message_id IN (SELECT message_id FROM replies)""")
                     rows = self.store.db.execute("""SELECT id,created_at FROM messages m WHERE rowid>? AND account=? AND peer=?
                         AND state='pending' AND NOT EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id)
-                        AND NOT EXISTS (SELECT 1 FROM attachments a WHERE a.message_id=m.id AND a.status IN ('pending','downloading'))
+                        AND NOT EXISTS (SELECT 1 FROM attachments a WHERE (a.message_id=m.id OR EXISTS(SELECT 1 FROM attachment_links l WHERE l.message_id=m.id AND l.attachment_id=a.id)) AND a.status IN ('pending','downloading'))
                         AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.subscription_id=? AND d.message_id=m.id)
                         ORDER BY rowid LIMIT 100""", (subscription[5], binding["id"], binding["owner"], subscription[0])).fetchall()
                     for message_id, created_at in rows:

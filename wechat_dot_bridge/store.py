@@ -186,6 +186,18 @@ class Store(AttachmentStore):
             self.db.execute("""CREATE TABLE IF NOT EXISTS reply_parts (
                 reply_id TEXT NOT NULL, part INTEGER NOT NULL, text TEXT NOT NULL,
                 accepted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(reply_id,part))""")
+            part_columns = {r["name"] for r in self.db.execute("PRAGMA table_info(reply_parts)")}
+            if "kind" not in part_columns:
+                self.db.execute("ALTER TABLE reply_parts ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'")
+                for row in self.db.execute("SELECT client_id FROM replies WHERE attachment_id IS NOT NULL AND status IN ('queued','failed','context_required','auth_required')").fetchall():
+                    last = self.db.execute("SELECT part,text FROM reply_parts WHERE reply_id=? ORDER BY part DESC LIMIT 1", (row["client_id"],)).fetchone()
+                    if last and not last["text"]:
+                        self.db.execute("UPDATE reply_parts SET kind='media' WHERE reply_id=? AND part=?", (row["client_id"],last["part"]))
+                    else:
+                        self.db.execute("INSERT INTO reply_parts(reply_id,part,text,kind) VALUES(?,?,'','media')", (row["client_id"],last["part"]+1 if last else 0))
+            self.db.execute("""CREATE TABLE IF NOT EXISTS tool_calls (
+                id INTEGER PRIMARY KEY, name TEXT NOT NULL, message_id TEXT,
+                outcome TEXT NOT NULL, created_at REAL NOT NULL)""")
             if self.db.execute("SELECT count(*) FROM binding").fetchone()[0] > 1:
                 raise BridgeError("invalid_binding_state")
         except (sqlite3.Error, BridgeError) as error:
@@ -391,7 +403,7 @@ class Store(AttachmentStore):
                     cached = self.db.execute("SELECT id,text FROM messages WHERE account=? AND peer=? AND source_id=?", (binding["id"], peer, "message:" + str(int(sid)))).fetchone()
                     if cached:
                         quote_text = cached["text"]
-                        cached_aids.extend(r[0] for r in self.db.execute("SELECT id FROM attachments WHERE message_id=?", (cached["id"],)))
+                        cached_aids.extend(r[0] for r in self.db.execute("SELECT id FROM attachments WHERE message_id=? UNION SELECT attachment_id FROM attachment_links WHERE message_id=?", (cached["id"],cached["id"])))
                     else:
                         sent = self.db.execute("SELECT text,attachment_id FROM sent_quotes WHERE source_id=?", (sid,)).fetchone()
                         if not sent:
@@ -409,10 +421,8 @@ class Store(AttachmentStore):
                     "VALUES(?,?,?,?,?,?,?)",
                     (identifier, binding["id"], peer, source, text, created_at, context))
                 self._ingest_attachments(binding, identifier, refs)
-                for index, aid in enumerate(cached_aids):
-                    target = "att_" + hashlib.sha256((identifier + ":quote:" + str(index)).encode()).hexdigest()
-                    self.db.execute("""INSERT OR IGNORE INTO attachments(id,account,peer,message_id,kind,name,descriptor,data,status,error,attempts,next_attempt)
-                        SELECT ?,account,peer,?,kind,name,descriptor,data,CASE WHEN status='downloading' THEN 'pending' ELSE status END,error,attempts,next_attempt FROM attachments WHERE id=?""", (target, identifier, aid))
+                for aid in cached_aids:
+                    self.db.execute("INSERT OR IGNORE INTO attachment_links VALUES(?,?)", (identifier,aid))
                 added += 1
             latest_context = self._latest_context(binding)
             if latest_context and (previous_context is None or latest_context["id"] != previous_context["id"]):
@@ -501,8 +511,10 @@ class Store(AttachmentStore):
                     "INSERT INTO replies(message_id,text,client_id,status,created_at,attachment_id) VALUES(?,?,?,'queued',?,?)",
                     (message_id, text, client_id, self.clock(), attachment_id))
                 from .message_format import split_text
-                for part, chunk in enumerate(split_text(text)):
+                for part, chunk in enumerate(split_text(text) if text else []):
                     self.db.execute("INSERT INTO reply_parts(reply_id,part,text) VALUES(?,?,?)", (client_id, part, chunk))
+                if attachment_id:
+                    self.db.execute("INSERT INTO reply_parts(reply_id,part,text,kind) VALUES(?,?,'','media')", (client_id,len(split_text(text)) if text else 0))
                 self.db.execute("UPDATE messages SET state='reply_committed' WHERE id=?", (message_id,))
         return self.send_status(message_id, client_id)
 
@@ -549,12 +561,12 @@ class Store(AttachmentStore):
             self.db.execute(
                 "UPDATE replies SET status='sending',error=NULL,context_id=?,attempts=attempts+1 WHERE client_id=?",
                 (context["id"], row["client_id"]))
-            part = self.db.execute("SELECT part,text FROM reply_parts WHERE reply_id=? AND accepted=0 ORDER BY part LIMIT 1", (row["client_id"],)).fetchone()
+            part = self.db.execute("SELECT part,text,kind FROM reply_parts WHERE reply_id=? AND accepted=0 ORDER BY part LIMIT 1", (row["client_id"],)).fetchone()
             remaining = self.db.execute("SELECT count(*) FROM reply_parts WHERE reply_id=? AND accepted=0", (row["client_id"],)).fetchone()[0]
             return {"message_id": row["message_id"], "reply_id": row["client_id"], "text": part["text"] if part else row["text"],
                     "client_id": row["client_id"] + ("_part_" + str(part["part"]) if part and part["part"] else ""), "peer": row["peer"],
                     "context_token": context["context_token"],
-                    **({"attachment": self.read_attachment(row["attachment_id"])} if row["attachment_id"] and remaining <= 1 else {})}
+                    **({"attachment": self.read_attachment(row["attachment_id"])} if row["attachment_id"] and (not part or part["kind"] == "media") else {})}
 
     def finish_send(self, message_id, status, error=None, reply_id=None):
         if not isinstance(status, str) or status not in SEND_OUTCOMES:
@@ -604,6 +616,26 @@ class Store(AttachmentStore):
                     "AND message_id IN (SELECT id FROM messages WHERE account=? AND peer=?)",
                     (binding["id"], binding["owner"]))
 
+    def retry_reply(self, reply_id):
+        with self._transaction():
+            binding = self._binding()
+            row = self.db.execute("SELECT r.* FROM replies r JOIN messages m ON m.id=r.message_id WHERE r.client_id=? AND m.account=? AND m.peer=?", (reply_id,binding["id"],binding["owner"])).fetchone()
+            if not row:
+                raise BridgeError("unknown_reply")
+            if row["status"] == "uncertain":
+                raise BridgeError("delivery_uncertain_review_required")
+            if row["status"] in ('failed','context_required','auth_required'):
+                self.db.execute("UPDATE replies SET status='queued',attempts=0,error=NULL WHERE client_id=?", (reply_id,))
+            mid = row["message_id"]
+        return self.send_status(mid,reply_id)
+
+    def record_tool_call(self, name, message_id, outcome):
+        with self._transaction():
+            if message_id and not self.db.execute("SELECT 1 FROM messages WHERE id=?", (message_id,)).fetchone():
+                message_id = None
+            self.db.execute("INSERT INTO tool_calls(name,message_id,outcome,created_at) VALUES(?,?,?,?)", (name,message_id,outcome,self.clock()))
+            self.db.execute("DELETE FROM tool_calls WHERE id <= (SELECT COALESCE(MAX(id),0)-1000 FROM tool_calls)")
+
     def get_status(self):
         with self.lock:
             binding = self.db.execute("SELECT * FROM binding LIMIT 1").fetchone()
@@ -627,6 +659,8 @@ class Store(AttachmentStore):
             result = {"bound": bool(binding), "enabled": bool(binding and binding["enabled"]),
                       "account_status": binding["status"] if binding else "not_bound",
                       "pending": pending, "reply_status": counts, "active_subscriptions": active}
+            result["recent_tool_calls"] = [dict(r) for r in self.db.execute("SELECT name,outcome,created_at FROM tool_calls ORDER BY id DESC LIMIT 10")]
+            result["pending_processing"] = [{"message_id": r["id"], "read_observed": bool(r["was_read"]), "age_seconds": max(0,int(self.clock()-r["created_at"]))} for r in self.db.execute("SELECT m.id,m.created_at,EXISTS(SELECT 1 FROM tool_calls t WHERE t.message_id=m.id AND t.name='read_weixin_message' AND t.outcome='ok') AS was_read FROM messages m WHERE m.state='pending' ORDER BY m.rowid LIMIT 20")]
             result["attachments"] = {row[0]: row[1] for row in self.db.execute("SELECT status,count(*) FROM attachments GROUP BY status")}
             if binding and binding["last_error"]:
                 result["last_error"] = _safe_error(binding["last_error"])
