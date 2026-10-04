@@ -85,6 +85,78 @@ class TypingTests(unittest.TestCase):
         self.assertEqual(set(client._post.call_args.args[2]), {"ilink_user_id", "typing_ticket", "status", "base_info"})
         self.assertTrue(client._post.call_args.kwargs["allow_empty"])
 
+    def test_new_inbound_context_reuses_peer_ticket(self):
+        self.indicator.begin(self.mid)
+        self.indicator.tick()
+        self.store.ingest('fixture-account', [dict(source_id='2', peer='fixture-owner',
+            text='next', created_at=1800000001, context_token='new-context')], '2')
+        self.now = 5
+        self.indicator.tick()
+        self.assertEqual(self.client.typing_ticket.call_count, 1)
+        self.assertEqual(self.client.send_typing.call_count, 2)
+        self.now = 601
+        self.indicator.progress(self.mid)
+        self.indicator.tick()
+        self.assertEqual(self.client.typing_ticket.call_count, 2)
+        self.assertEqual(self.client.typing_ticket.call_args.args[1], 'new-context')
+
+    def test_transient_failure_recovers_during_short_reply_window(self):
+        self.client.typing_ticket.side_effect = [RuntimeError('PRIVATE'), 'fixture-ticket']
+        self.indicator.begin(self.mid)
+        self.indicator.tick()
+        self.now = 4
+        self.indicator.tick()
+        self.client.send_typing.assert_not_called()
+        self.now = 5
+        self.indicator.tick()
+        self.client.send_typing.assert_called_once()
+        self.assertEqual(self.client.send_typing.call_args.args[-1], 1)
+        self.assertIsNone(self.indicator.status()['last_error'])
+
+    def test_persistent_failures_back_off_and_new_work_starts_immediately_after_idle(self):
+        self.client.typing_ticket.side_effect = RuntimeError('PRIVATE')
+        self.indicator.begin(self.mid)
+        for at, next_at in [(0, 5), (5, 15), (15, 35), (35, 65)]:
+            self.now = at
+            self.indicator.tick()
+            self.assertEqual(self.indicator.next_send, next_at)
+        self.indicator.progress(self.mid, False)
+        self.indicator.tick()
+        self.client.typing_ticket.side_effect = None
+        self.indicator.begin(self.mid)
+        self.indicator.tick()
+        self.client.send_typing.assert_called_once()
+
+    def test_finishing_or_expiring_during_ticket_request_does_not_start_typing(self):
+        for finish in ('stop', 'expire'):
+            with self.subTest(finish=finish):
+                indicator = TypingIndicator(self.store, self.client, lambda: self.now)
+                indicator.begin(self.mid)
+                def ticket(*args):
+                    if finish == 'stop':
+                        indicator.progress(self.mid, False)
+                    else:
+                        self.now += 301
+                    return 'fixture-ticket'
+                self.client.typing_ticket.side_effect = ticket
+                indicator.tick()
+                self.client.send_typing.assert_not_called()
+                indicator.close()
+
+    def test_status_exposes_fixed_outcomes_without_private_data(self):
+        from wechat_dot_bridge.events import Events
+        from wechat_dot_bridge.mcp import MCPServer
+        import json
+        self.client.send_typing.side_effect = RuntimeError('PRIVATE fixture-ticket fixture-context')
+        self.indicator.begin(self.mid)
+        self.indicator.tick()
+        server = MCPServer(self.store, Events(self.store, []), typing=self.indicator)
+        status = server._call({'name': 'get_weixin_status', 'arguments': {}})['structuredContent']['typing']
+        self.assertEqual(status['outcomes'], {'ticket_ok': 1, 'start_failed': 1, 'stop_failed': 1})
+        self.assertEqual(status['last_error'], 'stop_failed')
+        for secret in ('PRIVATE', 'fixture-ticket', 'fixture-context', 'fixture-owner'):
+            self.assertNotIn(secret, json.dumps(status))
+
 
 if __name__ == "__main__":
     unittest.main()

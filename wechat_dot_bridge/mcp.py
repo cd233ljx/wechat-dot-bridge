@@ -125,6 +125,8 @@ class MCPServer:
                 value = self.store.get_status()
                 value["events"] = self.events.status()
                 value["active_subscriptions"] = value["events"]["active_subscriptions"]
+                if self.typing is not None:
+                    value["typing"] = self.typing.status()
             else:
                 if not self.store.get_binding():
                     raise BridgeError("binding_required")
