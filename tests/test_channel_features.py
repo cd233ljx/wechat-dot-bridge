@@ -174,3 +174,69 @@ class ChannelFeatures(unittest.TestCase):
         wire=dict(message_id=50,from_user_id='owner',message_type=1,message_state=2,item_list=[dict(type=1,msg_id='item-50',text_item=dict(text='fixture'))])
         result=_normalize_message(wire,self.binding,3)
         self.assertEqual(result['aliases'],['50','item-50'])
+
+    def test_unknown_items_preserve_text_and_explain_unsupported_content(self):
+        wire=dict(message_id=80,from_user_id='owner',message_type=1,message_state=2,
+                  item_list=[dict(type=99,secret_payload='never expose'),dict(type=1,text_item=dict(text='question'))])
+        result=_normalize_message(wire,self.binding,3)
+        self.assertIn('question',result['text'])
+        self.assertIn('暂不支持',result['text'])
+        self.assertNotIn('secret_payload',str(result))
+        self.assertNotIn('never expose',str(result))
+        wire['item_list']=wire['item_list'][:1]
+        self.assertIn('暂不支持',_normalize_message(wire,self.binding,3)['text'])
+
+    def test_inline_media_and_cached_quote_do_not_download_twice(self):
+        key=base64.b64encode(b'x'*16).decode()
+        image=dict(type=2,image_item=dict(media=dict(encrypt_query_param='fixture',aes_key=key)))
+        wire=dict(message_id=81,from_user_id='owner',message_type=1,message_state=2,item_list=[image,image])
+        self.store.ingest('bot',[_normalize_message(wire,self.binding,3)],'a')
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM attachments').fetchone()[0],1)
+        quoted=dict(type=1,text_item=dict(text='question'),ref_msg=dict(svr_id='81',message_item=image))
+        wire.update(message_id=82,item_list=[quoted])
+        self.store.ingest('bot',[_normalize_message(wire,self.binding,4)],'b')
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM attachments').fetchone()[0],1)
+        mid=self.store.db.execute("SELECT id FROM messages WHERE source_id='message:82'").fetchone()[0]
+        self.assertEqual(len(self.store.attachment_metadata(mid)),1)
+
+    def test_outbound_quotes_are_scoped_and_keep_same_id_in_other_scopes(self):
+        self.store.remember_sent_quote('500',dict(text='first scope'))
+        self.store.db.execute("INSERT INTO sent_quote_cache VALUES('other','owner','500','other scope',NULL)")
+        self.restart()
+        self.store.ingest('bot',[dict(source_id='message:90',peer='owner',text='question',created_at=4,quotes=[dict(source_id='500')])],'a')
+        mid=self.store.db.execute("SELECT id FROM messages WHERE source_id='message:90'").fetchone()[0]
+        text=self.store.read_message(mid)['text']
+        self.assertIn('first scope',text)
+        self.assertNotIn('other scope',text)
+
+    def test_legacy_quote_migration_preserves_unambiguous_cache(self):
+        self.store.db.execute("INSERT INTO sent_quotes VALUES('600','legacy reply',NULL)")
+        self.store.db.execute("DROP TABLE sent_quote_cache")
+        self.restart()
+        self.assertEqual(self.store.db.execute("SELECT text FROM sent_quote_cache WHERE source_id='600'").fetchone()[0],'legacy reply')
+        self.store.db.execute("DELETE FROM sent_quote_cache")
+        self.restart()
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM sent_quote_cache").fetchone()[0],0)
+
+    def test_image_bad_hex_key_falls_back_to_valid_media_key(self):
+        from wechat_dot_bridge.media import descriptor
+        key=b'x'*16
+        item=dict(type=2,image_item=dict(aeskey='bad',media=dict(encrypt_query_param='fixture',aes_key=base64.b64encode(key).decode())))
+        self.assertEqual(descriptor(item)['key'],key.hex())
+        item['image_item']['media']['aes_key']='bad'
+        with self.assertRaises(BridgeError):descriptor(item)
+
+    def test_expired_quote_cache_uses_fresh_inline_media(self):
+        image=dict(type=2,image_item=dict(media=dict(encrypt_query_param='fixture',aes_key=base64.b64encode(b'x'*16).decode())))
+        wire=dict(message_id=101,from_user_id='owner',message_type=1,message_state=2,item_list=[image]*9)
+        normalized=_normalize_message(wire,self.binding,3)
+        self.assertEqual(len(normalized['attachments']),1)
+        self.assertNotIn('error',normalized['attachments'][0])
+        self.store.ingest('bot',[normalized],'a')
+        self.store.db.execute("UPDATE attachments SET status='expired'")
+        wire.update(message_id=102,item_list=[dict(type=1,text_item=dict(text='question'),ref_msg=dict(svr_id='101',message_item=image))])
+        self.store.ingest('bot',[_normalize_message(wire,self.binding,4)],'b')
+        mid=self.store.db.execute("SELECT id FROM messages WHERE source_id='message:102'").fetchone()[0]
+        meta=self.store.attachment_metadata(mid)
+        self.assertEqual(len(meta),1)
+        self.assertEqual(meta[0]['status'],'pending')

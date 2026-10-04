@@ -413,7 +413,17 @@ def _normalize_message(message: dict, binding: dict, now: float) -> dict | None:
                 except BridgeError as error:
                     attachments.append({"kind": KINDS[item["type"]], "name": KINDS[item["type"]], "error": error.code})
         else:
-            return None
+            # Preserve readable content when future protocol items accompany it.
+            parts.append("[暂不支持的微信内容类型：" + str(item["type"]) + "]")
+    from .attachment_store import media_identity
+    unique_attachments,seen_media=[],set()
+    for attachment in attachments:
+        identity=media_identity(attachment)
+        if identity is not None:
+            if identity in seen_media:continue
+            seen_media.add(identity)
+        unique_attachments.append(attachment)
+    attachments=unique_attachments
     if len(attachments) > 8:
         attachments = [{"kind": "file", "name": "attachments", "error": "media_too_large"}]
     text = "\n".join(parts)

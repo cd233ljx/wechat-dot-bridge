@@ -161,7 +161,12 @@ def descriptor(item):
     cdn_parts(url)
     key = None
     if kind == "image" and body.get("aeskey"):
-        key = key_bytes(body["aeskey"], True)
+        try:
+            key = key_bytes(body["aeskey"], True)
+        except BridgeError:
+            # cc-connect prefers valid image hex keys, then the CDN media key.
+            if not ref.get("aes_key"):raise
+            key = key_bytes(ref["aes_key"])
     elif ref.get("aes_key"):
         key = key_bytes(ref["aes_key"])
     elif kind != "image":

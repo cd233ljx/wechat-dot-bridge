@@ -190,6 +190,17 @@ class Store(AttachmentStore):
                 self.db.execute("ALTER TABLE replies ADD COLUMN is_notice INTEGER NOT NULL DEFAULT 0")
             self.db.execute("""CREATE TABLE IF NOT EXISTS sent_quotes (
                 source_id TEXT PRIMARY KEY, text TEXT NOT NULL, attachment_id TEXT)""")
+            # Older outbound caches had no account/conversation key. Only migrate
+            # when the retained message history proves a single binding scope.
+            fresh_quotes = not self.db.execute("SELECT 1 FROM sqlite_master WHERE name='sent_quote_cache'").fetchone()
+            self.db.execute("""CREATE TABLE IF NOT EXISTS sent_quote_cache (
+                account TEXT NOT NULL,peer TEXT NOT NULL,source_id TEXT NOT NULL,
+                text TEXT NOT NULL,attachment_id TEXT,PRIMARY KEY(account,peer,source_id))""")
+            if fresh_quotes:
+                scopes=self.db.execute("SELECT DISTINCT account,peer FROM messages").fetchall()
+                current=self.db.execute("SELECT id,owner FROM binding").fetchall()
+                if len(scopes)==1 and len(current)==1 and tuple(scopes[0])==tuple(current[0]):
+                    self.db.execute("INSERT OR IGNORE INTO sent_quote_cache SELECT ?,?,source_id,text,attachment_id FROM sent_quotes",tuple(scopes[0]))
             self.db.execute("""CREATE TABLE IF NOT EXISTS reply_parts (
                 reply_id TEXT NOT NULL, part INTEGER NOT NULL, text TEXT NOT NULL,
                 accepted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(reply_id,part))""")
@@ -442,7 +453,7 @@ class Store(AttachmentStore):
                         resolved=cached["id"];status="cached_inbound";quote_text=cached["text"]
                         cached_aids.extend(r[0] for r in self.db.execute("SELECT id FROM attachments WHERE message_id=? UNION SELECT attachment_id FROM attachment_links WHERE message_id=?", (resolved,resolved)))
                     elif sid:
-                        sent=self.db.execute("SELECT text,attachment_id FROM sent_quotes WHERE source_id=?", (sid,)).fetchone()
+                        sent=self.db.execute("SELECT text,attachment_id FROM sent_quote_cache WHERE account=? AND peer=? AND source_id=?", (binding["id"],peer,sid)).fetchone()
                         if sent:
                             status="cached_outbound";quote_text=sent["text"]
                             if sent["attachment_id"]: cached_aids.append(sent["attachment_id"])
@@ -467,7 +478,23 @@ class Store(AttachmentStore):
                     self.db.execute("INSERT INTO message_quotes VALUES(?,?,?,?,?,?)", (identifier,position,has_id,status,resolved,shape))
                 from .timing import record as trace
                 trace(self,identifier,"received",at=received_at)
-                self._ingest_attachments(binding, identifier, refs)
+                # Inline quote media and a cache hit may describe the same bytes.
+                from .attachment_store import media_identity
+                inline_refs={media_identity(ref) for ref in refs if media_identity(ref) is not None}
+                cached_refs=set()
+                reusable_aids=[]
+                for aid in dict.fromkeys(cached_aids):
+                    cached_attachment=self.db.execute("SELECT descriptor,status FROM attachments WHERE id=?",(aid,)).fetchone()
+                    if cached_attachment is None:continue
+                    identity=media_identity(json.loads(cached_attachment["descriptor"]))
+                    if cached_attachment["status"] in ("ready","pending","downloading"):
+                        if identity is not None:cached_refs.add(identity)
+                    elif identity in inline_refs:
+                        # Fresh inline metadata can recover an expired/failed cache.
+                        continue
+                    reusable_aids.append(aid)
+                cached_aids=reusable_aids
+                self._ingest_attachments(binding, identifier, [ref for ref in refs if media_identity(ref) is None or media_identity(ref) not in cached_refs])
                 for aid in cached_aids:
                     self.db.execute("INSERT OR IGNORE INTO attachment_links VALUES(?,?)", (identifier,aid))
                 added += 1
@@ -488,7 +515,11 @@ class Store(AttachmentStore):
             return
         with self._transaction():
             attachment = reply.get("attachment")
-            self.db.execute("INSERT OR REPLACE INTO sent_quotes VALUES(?,?,?)", (source_id, reply["text"], attachment["id"] if attachment else None))
+            binding=self._binding()
+            if reply.get("message_id"):
+                self._message(reply["message_id"],binding)
+            self.db.execute("INSERT OR REPLACE INTO sent_quote_cache VALUES(?,?,?,?,?)",
+                            (binding["id"],binding["owner"],source_id,reply["text"],attachment["id"] if attachment else None))
 
     def read_message(self, message_id):
         with self.lock:

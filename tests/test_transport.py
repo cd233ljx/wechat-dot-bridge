@@ -215,7 +215,6 @@ class MessageAndWorkerTests(unittest.TestCase):
                  message(room_id="fixture-room"), message(delete_time_ms=1700000000123),
                  message(to_user_id="other@im.bot"), message(to_user_id=None),
                  message(message_type=2), message(message_type=True), message(message_state=1),
-                 message(item_list=[{"type": 99}]),
                  message(item_list=[{"type": 1, "text_item": {"text": " "}}])]
         for case in cases:
             with self.subTest(case=case):

@@ -13,6 +13,12 @@ MEDIA_ERRORS = {"media_key_invalid", "media_invalid", "media_endpoint_rejected",
                 "media_image_invalid", "media_cache_full", "media_failed", "media_upload_failed"}
 
 
+def media_identity(ref):
+    if ref.get("error") or not ref.get("url"):
+        return None
+    return (ref.get("kind"),ref.get("url"),ref.get("key"),safe_name(ref.get("name")))
+
+
 class AttachmentStore:
     def _init_media(self):
         self.db.execute("""CREATE TABLE IF NOT EXISTS attachments (
@@ -42,7 +48,12 @@ class AttachmentStore:
             raise BridgeError("media_cache_full")
 
     def _ingest_attachments(self, binding, message_id, refs):
+        seen=set()
         for index, ref in enumerate(refs):
+            identity=media_identity(ref)
+            if identity is not None:
+                if identity in seen:continue
+                seen.add(identity)
             aid = "att_" + hashlib.sha256((message_id + ":" + str(index)).encode()).hexdigest()
             error = ref.get("error")
             error = error if error in MEDIA_ERRORS else "media_invalid" if error else None
