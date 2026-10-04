@@ -395,8 +395,9 @@ class StoreTests(unittest.TestCase):
     def test_foreign_directory_owner_or_public_permissions_are_rejected(self):
         public = Path(self.temporary.name) / "public-state"
         public.mkdir(mode=0o755)
+        public.chmod(0o755)  # Exercise unsafe permissions even under a private umask.
         self.expect_error("unsafe_state_directory", Store, public)
-        with patch("wechat_dot_bridge.store.os.geteuid", return_value=os.geteuid() + 1):
+        with patch("wechat_dot_bridge.private_paths.os.geteuid", return_value=os.geteuid() + 1):
             self.expect_error("unsafe_state_directory", Store, self.directory)
 
     def test_symlink_directory_and_database_never_modify_target(self):

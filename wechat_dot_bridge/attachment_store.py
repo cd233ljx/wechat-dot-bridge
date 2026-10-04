@@ -4,6 +4,12 @@ import base64
 import hashlib
 import json
 import re
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from contextlib import AbstractContextManager
+    from sqlite3 import Connection, Row
 
 from .errors import BridgeError
 from .media import MAX_CACHE, MAX_MEDIA, MAX_STAGE, image_preview, safe_name
@@ -21,6 +27,21 @@ def media_identity(ref):
 
 
 class AttachmentStore:
+    """Mixin hosted by Store's one connection and reentrant lock.
+
+    Owner checks and transactions belong to the host; this mixin does not
+    initialize a database or commit independently of a larger Store operation.
+    """
+
+    if TYPE_CHECKING:
+        db: Connection
+        lock: AbstractContextManager[object]
+        clock: Callable[[], float]
+
+        def _binding(self) -> Row: ...
+        def _message(self, message_id: str, binding: Row) -> Row: ...
+        def _transaction(self) -> AbstractContextManager[None]: ...
+
     def _cache_room(self, size):
         total = self.db.execute("SELECT COALESCE(SUM(length(data)),0) FROM attachments").fetchone()[0]
         total += self.db.execute("SELECT COALESCE(SUM(length(data)),0) FROM attachment_uploads").fetchone()[0]

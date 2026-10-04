@@ -13,8 +13,6 @@
 
 当前是 **0.1.0 实验性版本**，面向 Linux / systemd 和本人单账号私聊。具体能力和微信端确认情况见 [能力说明](docs/CAPABILITIES.md)。
 
-目前还有两点在打磨：微信输入提示可能间断，首次回复也会受 dot 调度和任务耗时影响。
-
 ## 开始使用
 
 接入需要已有 dot、个人开发者插件权限，以及仅自己可用的 [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) 和 [MCP Events](https://developers.openai.com/plugins/build/mcp-events) 能力。先确认账户具备这些条件，再准备 Python 3.11+ 和 uv。

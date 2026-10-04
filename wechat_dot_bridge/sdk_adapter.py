@@ -22,7 +22,7 @@ from mcp.shared.message import SessionMessage
 from pydantic import ConfigDict, ValidationError
 
 from .errors import BridgeError
-from .mcp import COMPATIBLE_VERSIONS, PROTOCOL, SERVER_INFO, tool_definitions
+from .tool_contract import COMPATIBLE_VERSIONS, PROTOCOL, SERVER_INFO, safe_reason, tool_definitions
 
 MAX_RPC_BYTES = 2 * 1024 * 1024
 _FRAME_TOO_LARGE = "\x00bridge_request_too_large\n"
@@ -39,8 +39,7 @@ def _error(code, message, reason=None):
 def _bridge_error(error):
     # Reuse the business error vocabulary, never an exception's text or URL.
     reason = error.code
-    from .mcp import MCPServer
-    reason = MCPServer._safe_reason(reason)
+    reason = safe_reason(reason)
     if reason.startswith("callback_") or reason == "challenge_failed":
         return _error(-32015, "CallbackEndpointError", reason)
     if reason in {"invalid_params", "invalid_signing_secret", "replay_not_supported", "unknown_tool", "unsupported_protocol"}:
@@ -163,9 +162,8 @@ class _PrivateWriteStream:
         if isinstance(message, types.JSONRPCError):
             error = message.error
             safe_data = error.data if (isinstance(error.data, dict) and set(error.data) == {"reason"}) else None
-            from .mcp import MCPServer
             if safe_data:
-                safe_data = {"reason": MCPServer._safe_reason(safe_data["reason"])}
+                safe_data = {"reason": safe_reason(safe_data["reason"])}
             # Errors raised by SDK classifiers must not return the supplied
             # method, malformed parameter values or callback addresses.
             messages = {-32600: "Invalid request", -32601: "Method not found", -32602: "Invalid params",

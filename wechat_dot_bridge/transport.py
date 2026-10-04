@@ -1,4 +1,4 @@
-"""Private, text-only Weixin transport; no model or agent backend lives here."""
+"""Private Weixin message and media transport; no model or agent backend."""
 
 from __future__ import annotations
 

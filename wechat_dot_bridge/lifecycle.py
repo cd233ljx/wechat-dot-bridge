@@ -1,6 +1,12 @@
 """Durable owner processing, independent from notifications and send acceptance."""
 
 import uuid
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
+    from contextlib import AbstractContextManager
+    from sqlite3 import Connection, Row
 
 from .errors import BridgeError
 
@@ -9,6 +15,22 @@ UNFINISHED = ('waiting', 'active', 'interrupted', 'failed')
 
 
 class WorkStore:
+    """Mixin sharing Store's owner guards, connection, lock and transaction.
+
+    Attachment ownership comes from the same AttachmentStore composition.
+    Helpers without a transaction wrapper participate in the host transaction.
+    """
+
+    if TYPE_CHECKING:
+        db: Connection
+        lock: AbstractContextManager[object]
+        clock: Callable[[], float]
+
+        def _binding(self) -> Row: ...
+        def _message(self, message_id: str, binding: Row) -> Row: ...
+        def _attachment(self, attachment_id: str) -> Row: ...
+        def _transaction(self) -> AbstractContextManager[None]: ...
+
     def _ensure_work(self, message_id):
         self.db.execute("""INSERT OR IGNORE INTO message_work
             (message_id,run_id,revision,state,updated_at)

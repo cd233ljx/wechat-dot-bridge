@@ -184,7 +184,28 @@ def _processing_lifecycle(db, clock):
     db.execute('DELETE FROM processing')
 
 
-MIGRATIONS = (_core, _inbound_quotes, _media, _outbound, _timing, _retired_messages, _processing_lifecycle)
+def _events(db, clock):
+    # These tables used to be created lazily by Events, after Store's versioned
+    # upgrade had already committed. Adopt any complete or interrupted legacy
+    # initialization without changing subscriptions, immutable payloads or
+    # delivery outcomes. Runtime claim recovery is separate from schema work.
+    db.execute("""CREATE TABLE IF NOT EXISTS subscriptions (
+        id TEXT PRIMARY KEY, principal TEXT NOT NULL, name TEXT NOT NULL,
+        arguments TEXT NOT NULL, url TEXT NOT NULL, secret TEXT NOT NULL,
+        old_secret TEXT, rotate_until REAL, expires_at REAL NOT NULL,
+        verified_until REAL NOT NULL, status TEXT NOT NULL, start_rowid INTEGER NOT NULL
+    )""")
+    db.execute("""CREATE TABLE IF NOT EXISTS deliveries (
+        event_id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL,
+        message_id TEXT NOT NULL, body BLOB NOT NULL, status TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL,
+        error TEXT, UNIQUE(subscription_id,message_id)
+    )""")
+    db.execute("CREATE TABLE IF NOT EXISTS event_metadata (key TEXT PRIMARY KEY,value TEXT)")
+
+
+MIGRATIONS = (_core, _inbound_quotes, _media, _outbound, _timing, _retired_messages,
+              _processing_lifecycle, _events)
 SCHEMA_VERSION = len(MIGRATIONS)
 
 

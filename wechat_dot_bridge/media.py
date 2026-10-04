@@ -19,7 +19,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from PIL import Image
 
 from .errors import BridgeError
-from .net_transport import NetworkFailure, request, cancellation_token, wait_for_retry
+from .net_transport import NetworkFailure, request, cancellation_token, wait_for_retry, proxy_port, resolve_addresses
 
 CDN_HOST = "novac2c.cdn.weixin.qq.com"
 CDN_BASE = "https://" + CDN_HOST + "/c2c"
@@ -31,8 +31,10 @@ NETWORK_DNS = "system"
 
 
 def configure_network(proxy=None, dns="system"):
-    from .events import _proxy_port
-    _proxy_port(proxy)
+    try:
+        proxy_port(proxy)
+    except NetworkFailure:
+        raise BridgeError("media_network_invalid") from None
     if dns not in ("system", "google"):
         raise BridgeError("media_network_invalid")
     global NETWORK_PROXY, NETWORK_DNS
@@ -91,12 +93,11 @@ def cdn_parts(url):
 
 def cdn_request(url, data=None):
     # Caller authorizes the exact CDN before shared DNS or connection I/O.
-    from .events import _public_addresses, _google_addresses
     p = cdn_parts(url)
     if data is not None and len(data) > MAX_MEDIA + 16:
         raise BridgeError("media_too_large")
     try:
-        addresses = _google_addresses(CDN_HOST, NETWORK_PROXY) if NETWORK_DNS == "google" else _public_addresses(CDN_HOST)
+        addresses = resolve_addresses(CDN_HOST, dns=NETWORK_DNS, proxy=NETWORK_PROXY)
         limit = MAX_MEDIA + 16 if data is None else 65536
         response = request(CDN_HOST, addresses, "POST" if data is not None else "GET",
                            p.path + ("?" + p.query if p.query else ""), data,
@@ -108,12 +109,6 @@ def cdn_request(url, data=None):
     except NetworkFailure as error:
         category = {"timeout": "media_timeout", "response_too_large": "media_too_large", "cancelled": "media_cancelled"}.get(error.category, "media_network_failed")
         raise BridgeError(category) from None
-    except BridgeError as error:
-        if error.code == 'callback_cancelled':
-            raise BridgeError('media_cancelled') from None
-        if error.code.startswith("callback_"):
-            raise BridgeError("media_network_failed") from None
-        raise
 
 
 def descriptor(item):

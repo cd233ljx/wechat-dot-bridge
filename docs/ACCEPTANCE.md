@@ -1,6 +1,6 @@
 # 当前部署验收清单（0.1.0 / Early Access）
 
-本清单用于自己的 Linux / systemd、本人单账号私聊部署。复用时每项从待验证开始，填写版本、日期、布尔结果、计数和固定错误类别。[历史真人记录](REAL_VALIDATION.md)提供已有证据；下面的历史证据栏不能代替本次部署验收。本地测试、callback `2xx` 与 API `accepted` 也不能代替手机端确认。
+本清单用于自己的 Linux / systemd、本人单账号私聊部署。复用时每项从待验证开始，填写版本、日期、布尔结果、计数和固定错误类别。[历史真人记录](history/REAL_VALIDATION.md)提供已有证据；下面的历史证据栏不能代替本次部署验收。本地测试、callback `2xx` 与 API `accepted` 也不能代替手机端确认。
 
 不要记录真实 Tunnel identity、个人路径、微信 owner、token、callback URL / secret、二维码、手机号、消息正文、文件名或附件内容。消息 ID 可用本地测试编号代替。
 

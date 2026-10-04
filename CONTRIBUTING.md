@@ -46,13 +46,17 @@ SDK 依赖约束固定在 2.3 系列，锁文件选定 2.3.0。由于公开 stdi
 
 ## 模块职责
 
+源码保留在 `wechat_dot_bridge/`，测试、安装脚本和许可各有独立目录。`docs/` 放当前指南，
+`docs/history/` 保留过往审查与部署证据；文档入口见 [导航](docs/README.md)。
+
 | 位置 | 职责 |
 | --- | --- |
 | `cli.py`、`__main__.py` | 本地命令、配置校验、stdio runtime 与进程锁 |
 | `store.py`、`lifecycle.py`、`migrations.py` | 持久消息 / 处理轮次 / 回复状态、幂等、租期、事务与版本化数据库升级 |
 | `transport.py`、`login.py` | 微信协议、轮询 / 发送、明确选择的绑定导入与二维码流程 |
-| `mcp.py`、`sdk_adapter.py`、`events.py`、`webhook_signing.py` | 业务工具、官方 MCP runtime 薄适配、webhook 订阅和有界投递 |
-| `net_transport.py` | HTTPCore 统一传输的目标固定、总体期限与取消适配 |
+| `mcp.py`、`sdk_adapter.py`、`tool_contract.py`、`events.py`、`webhook_signing.py` | 业务工具、独立工具契约、官方 MCP runtime 薄适配、webhook 订阅和有界投递 |
+| `net_transport.py` | HTTPCore 统一传输、公共 DNS / DoH、代理校验、目标固定、总体期限与取消适配 |
+| `private_paths.py` | 不依赖数据库初始化的私有目录和文件校验 |
 | `attachment_store.py`、`attachment_content.py`、`media.py`、`artifacts.py` | 私有附件、独立字节 / UTF-8 文本分页、媒体传输和公开 HTTPS 文件导入 |
 | `typing.py`、`timing.py` | 有限输入提示与不含正文的阶段计时 |
 | `audio.py`、`message_format.py`、`codecs/` | 可选本地编码转换和微信文本适配 |
@@ -68,6 +72,10 @@ SDK 依赖约束固定在 2.3 系列，锁文件选定 2.3.0。由于公开 stdi
 ## 数据库变更
 
 数据库版本使用 `PRAGMA user_version`，迁移集中在 `migrations.py`。已发布迁移保持不变，新变更追加新版本。所有待迁移步骤及版本标记在同一个事务提交；失败或中断不留下“已建表但未回填”的完成标记。旧未版本化库需兼容升级，超出支持范围的版本必须以 `database_schema_unsupported` 拒绝。
+
+版本 8 将订阅、投递和 Events metadata 一起纳入迁移，接管已有表而不重建或改变原结果。
+Events 构造只按显式选项恢复中断的投递 claim，不再建表；只读视图不会提交调用方事务。
+Store 的工作与附件 mixin 共用连接、可重入锁、owner 校验和事务，宿主要求以类型注解注明。
 
 迁移测试应验证历史回填、故障注入后的回滚 / 重启、已受理分段、`uncertain` 和去重依据。清理已完成历史时保留待处理、未确认发送及去重墓碑，不能把旧消息重新当作新消息。
 

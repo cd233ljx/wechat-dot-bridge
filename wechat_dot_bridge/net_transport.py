@@ -15,6 +15,7 @@ import socket
 import ssl
 import threading
 import time
+from urllib.parse import urlencode
 
 import httpcore
 
@@ -39,6 +40,8 @@ _active_lock = threading.Lock()
 _active_requests = set()
 _cancellation = threading.Event()
 DNS_SLOTS = threading.BoundedSemaphore(4)
+DNS_TIMEOUT = 10.0
+MAX_DNS_RESPONSE = 32768
 
 
 def cancellation_token():
@@ -115,9 +118,68 @@ def checked_addresses(entries):
         raise NetworkFailure("dns_failed") from None
 
 
-def resolve_public_addresses(host, timeout, slots):
+def resolve_public_addresses(host, timeout=DNS_TIMEOUT, slots=None):
     """Bound libc DNS calls without accumulating unlimited stuck resolver threads."""
-    return _resolve_public_addresses(host, timeout, slots, cancellation_token())
+    return _resolve_public_addresses(host, timeout, DNS_SLOTS if slots is None else slots, cancellation_token())
+
+
+def resolve_addresses(host, *, dns="system", proxy=None, timeout=DNS_TIMEOUT, slots=None):
+    """Resolve a caller-authorized hostname, with no route or credential input.
+
+    Google DoH uses a fixed public provider address and provider TLS identity.
+    Its answer only supplies numeric endpoints: aliases never become new DNS
+    requests, and every application exchange still verifies the original host.
+    """
+    proxy_port(proxy)
+    if dns == "system":
+        return resolve_public_addresses(host, timeout, slots)
+    if dns != "google":
+        raise NetworkFailure("dns_invalid")
+    if (not isinstance(host, str) or not host or len(host) > 253
+            or any(ord(character) <= 32 or character in "/\\?#@" for character in host)):
+        raise NetworkFailure("dns_failed")
+    addresses = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, ("8.8.8.8", 443))]
+    try:
+        response = request("dns.google", addresses, "GET",
+                           "/resolve?" + urlencode({"name": host, "type": "A"}), None,
+                           {"Accept": "application/dns-json"}, timeout=timeout,
+                           max_response=MAX_DNS_RESPONSE, proxy=proxy, body_statuses={200})
+    except NetworkFailure as error:
+        # A provider answer limit is unrelated to the caller's media size cap.
+        if error.category == "response_too_large":
+            raise NetworkFailure("dns_response_too_large") from None
+        raise
+    if 300 <= response.status < 400:
+        raise NetworkFailure("redirect")
+    if response.status != 200:
+        raise NetworkFailure("dns_failed")
+    try:
+        value = json.loads(response.body)
+    except (ValueError, TypeError, UnicodeError, RecursionError):
+        raise NetworkFailure("dns_failed") from None
+    if (not isinstance(value, dict) or type(value.get("Status")) is not int or value["Status"] != 0
+            or value.get("TC") is True or not isinstance(value.get("Answer"), list)
+            or not 1 <= len(value["Answer"]) <= 16):
+        raise NetworkFailure("dns_failed")
+    result = []
+    for record in value["Answer"]:
+        if (not isinstance(record, dict) or type(record.get("type")) is not int
+                or record["type"] not in (1, 5) or not isinstance(record.get("data"), str)):
+            raise NetworkFailure("dns_failed")
+        if record["type"] == 5:
+            if (not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}\.?", record["data"])
+                    or ".." in record["data"]):
+                raise NetworkFailure("dns_failed")
+            continue
+        address = public_ip(record["data"])
+        if address.version != 4:
+            raise NetworkFailure("dns_failed")
+        entry = (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, (str(address), 443))
+        if entry not in result:
+            result.append(entry)
+    if not result:
+        raise NetworkFailure("dns_failed")
+    return result
 
 
 def _resolve_public_addresses(host, timeout, slots, token, *, deadline=None):

@@ -30,6 +30,7 @@ def inspect_packages(directory):
         names = package.namelist()
         required = ("wechat_dot_bridge/migrations.py", "wechat_dot_bridge/maintenance.py",
                     "wechat_dot_bridge/sdk_adapter.py", "wechat_dot_bridge/net_transport.py",
+                    "wechat_dot_bridge/tool_contract.py", "wechat_dot_bridge/private_paths.py",
                     "wechat_dot_bridge/lifecycle.py", "wechat_dot_bridge/webhook_signing.py",
                     "wechat_dot_bridge/codecs/markdown-filter.ts", "wechat_dot_bridge/codecs/audio.mjs")
         if any(name not in names for name in required):
@@ -45,7 +46,8 @@ def inspect_packages(directory):
         for document in ("README.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md", ".gitignore",
                          "scripts/check_release.py", "scripts/verify-upgrade.py", "scripts/scan_secrets.py",
                          "tests/network_fixtures.py", "tests/test_upgrade_script.py",
-                         "docs/INSTALL.md", "docs/DOT_SETUP.md", "docs/RELEASING.md", "docs/OPERATIONS.md", "uv.lock"):
+                         "docs/README.md", "docs/INSTALL.md", "docs/DOT_SETUP.md", "docs/RELEASING.md", "docs/OPERATIONS.md",
+                         "docs/UPSTREAM_AUDIT.md", "docs/history/UPSTREAM_AUDIT.md", "docs/history/REAL_VALIDATION.md", "uv.lock"):
             if not any(name.endswith("/" + document) for name in source_names):
                 raise ValueError("source_document_missing")
     forbidden = re.compile(r"(?:^|/)(?:node_modules|\.git|runtime|state|secrets)(?:/|$)|\.(?:sqlite\w*|db|key|pem)$|(?:^|/)\.env(?:\.|$)")

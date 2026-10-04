@@ -11,20 +11,18 @@ import ipaddress
 import json
 import re
 import secrets
-import socket
 import threading
 import time
 from datetime import datetime, timezone
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlsplit
 
 from .errors import BridgeError
-from .net_transport import DNS_SLOTS, NetworkFailure, proxy_port, public_ip, request, resolve_public_addresses
+from .net_transport import DNS_SLOTS, MAX_DNS_RESPONSE, NetworkFailure, proxy_port, request, resolve_addresses
 from .webhook_signing import signed_headers
 
 EVENT_NAME = "weixin.message"
 MAX_BODY = 262144
 MAX_RESPONSE = 65536
-MAX_DNS_RESPONSE = 32768
 MAX_ATTEMPTS = 5
 ROTATION_SECONDS = 300
 VERIFICATION_SECONDS = 300
@@ -43,13 +41,6 @@ def _proxy_port(proxy):
         return proxy_port(proxy)
     except NetworkFailure:
         raise BridgeError("invalid_callback_proxy") from None
-
-
-def _public_ip(value):
-    try:
-        return public_ip(value)
-    except NetworkFailure:
-        raise BridgeError("callback_dns_blocked") from None
 
 
 def _json_bytes(value):
@@ -99,7 +90,7 @@ def _callback_parts(url, allowed_hosts):
 
 def _public_addresses(host):
     try:
-        return resolve_public_addresses(host, DNS_TIMEOUT, _DNS_SLOTS)
+        return resolve_addresses(host, timeout=DNS_TIMEOUT, slots=_DNS_SLOTS)
     except NetworkFailure as error:
         category = {"timeout": "callback_timeout", "dns_blocked": "callback_dns_blocked", "cancelled": "callback_cancelled"}.get(error.category, "callback_dns_failed")
         raise BridgeError(category) from None
@@ -122,44 +113,16 @@ def _https_request(host, addresses, method, target, body, headers, proxy=None, m
 
 
 def _google_addresses(host, proxy=None):
-    """Explicit Google DoH: fixed public IP, provider TLS, only the approved name."""
+    """Callback-specific errors around the shared, caller-authorized resolver."""
     _proxy_port(proxy)
-    google_ip = "8.8.8.8"
-    _public_ip(google_ip)
-    addresses = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, (google_ip, 443))]
-    target = "/resolve?" + urlencode({"name": host, "type": "A"})
-    status, body = _https_request("dns.google", addresses, "GET", target, None,
-                                  {"Accept": "application/dns-json"}, proxy, MAX_DNS_RESPONSE)
-    if status != 200:
-        raise BridgeError("callback_dns_failed")
     try:
-        value = json.loads(body)
-    except (ValueError, TypeError, UnicodeError):
-        raise BridgeError("callback_dns_failed") from None
-    if (not isinstance(value, dict) or type(value.get("Status")) is not int or value["Status"] != 0 or
-            value.get("TC") is True or not isinstance(value.get("Answer"), list) or
-            not 1 <= len(value["Answer"]) <= 16):
-        raise BridgeError("callback_dns_failed")
-    result = []
-    for record in value["Answer"]:
-        if (not isinstance(record, dict) or type(record.get("type")) is not int or
-                record["type"] not in (1, 5) or not isinstance(record.get("data"), str)):
-            raise BridgeError("callback_dns_failed")
-        if record["type"] == 5:
-            # DNS aliases may accompany the final A records. Never connect to
-            # or separately resolve the alias; TLS still verifies the approved host.
-            if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}\.?", record["data"]) or ".." in record["data"]:
-                raise BridgeError("callback_dns_failed")
-            continue
-        ip = _public_ip(record["data"])
-        if ip.version != 4:
-            raise BridgeError("callback_dns_failed")
-        entry = (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, (str(ip), 443))
-        if entry not in result:
-            result.append(entry)
-    if not result:
-        raise BridgeError("callback_dns_failed")
-    return result
+        return resolve_addresses(host, dns="google", proxy=proxy, timeout=DNS_TIMEOUT)
+    except NetworkFailure as error:
+        category = {"timeout": "callback_timeout", "dns_blocked": "callback_dns_blocked",
+                    "dns_failed": "callback_dns_failed", "cancelled": "callback_cancelled",
+                    "tls": "callback_tls_failed", "redirect": "callback_redirect",
+                    "dns_response_too_large": "callback_response_too_large"}.get(error.category, "callback_network_failed")
+        raise BridgeError(category) from None
 
 
 def secure_post(url, body, headers, allowed_hosts, proxy=None, dns="system"):
@@ -192,23 +155,10 @@ class Events:
         self.post = post or (lambda url, body, headers: secure_post(url, body, headers, self.allowed_hosts, proxy, dns))
         # Serializes verification, delivery, refresh and cancellation within one owner process.
         self._network_lock = threading.RLock()
-        with self.store.lock:
-            self.store.db.executescript("""
-                CREATE TABLE IF NOT EXISTS subscriptions (
-                    id TEXT PRIMARY KEY, principal TEXT NOT NULL, name TEXT NOT NULL,
-                    arguments TEXT NOT NULL, url TEXT NOT NULL, secret TEXT NOT NULL,
-                    old_secret TEXT, rotate_until REAL, expires_at REAL NOT NULL,
-                    verified_until REAL NOT NULL, status TEXT NOT NULL, start_rowid INTEGER NOT NULL
-                );
-                CREATE TABLE IF NOT EXISTS deliveries (
-                    event_id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL,
-                    message_id TEXT NOT NULL, body BLOB NOT NULL, status TEXT NOT NULL,
-                    attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL,
-                    error TEXT, UNIQUE(subscription_id,message_id)
-                );
-                CREATE TABLE IF NOT EXISTS event_metadata (key TEXT PRIMARY KEY,value TEXT);
-            """)
-            if recover_inflight:
+        # Schema belongs to Store's atomic, versioned migration chain. A
+        # read-only Events view must not commit another caller's transaction.
+        if recover_inflight:
+            with self.store._transaction():
                 # A claim interrupted by process exit is not a confirmed
                 # callback failure. Keep its immutable event identity/body and
                 # restore the retry budget reserved by that incomplete claim.

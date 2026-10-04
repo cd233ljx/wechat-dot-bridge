@@ -47,7 +47,7 @@ def diagnostics(store, threshold=300):
 
 
 def backup(store, destination):
-    from .store import _private_directory
+    from .private_paths import _private_directory
     path=Path(destination).absolute()
     for item in (path,*path.parents):
         if item.is_symlink():
@@ -120,7 +120,7 @@ class HealthMonitor:
 
 def restore(source,directory):
     import stat
-    from .store import _private_directory
+    from .private_paths import _private_directory
     directory = _private_directory(directory)
     source=Path(source).absolute()
     for item in (source,*source.parents):

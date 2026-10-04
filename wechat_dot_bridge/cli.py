@@ -92,18 +92,15 @@ def load_config(args):
     if not isinstance(state, str) or not isinstance(locks, str):
         raise BridgeError("config_invalid")
     proxy = config.get("callback_proxy")
-    if proxy is not None:
-        match = re.fullmatch(r"http://127\.0\.0\.1:([0-9]{1,5})", proxy) if isinstance(proxy, str) else None
-        if not match or not 1 <= int(match[1]) <= 65535:
-            raise BridgeError("config_invalid")
     dns = config.get("callback_dns", "system")
     if dns not in ("system", "google"):
         raise BridgeError("config_invalid")
     media_proxy, media_dns = config.get("media_proxy"), config.get("media_dns", "system")
-    from .events import _proxy_port
+    from .net_transport import NetworkFailure, proxy_port
     try:
-        _proxy_port(media_proxy)
-    except BridgeError:
+        proxy_port(proxy)
+        proxy_port(media_proxy)
+    except NetworkFailure:
         raise BridgeError("config_invalid") from None
     if media_dns not in ("system", "google"):
         raise BridgeError("config_invalid")

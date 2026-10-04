@@ -32,7 +32,19 @@ CREATE TABLE replies (
 CREATE TABLE reply_parts (
     reply_id TEXT NOT NULL, part INTEGER NOT NULL, text TEXT NOT NULL,
     accepted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(reply_id,part));
+CREATE TABLE subscriptions (
+    id TEXT PRIMARY KEY, principal TEXT NOT NULL, name TEXT NOT NULL,
+    arguments TEXT NOT NULL, url TEXT NOT NULL, secret TEXT NOT NULL,
+    old_secret TEXT, rotate_until REAL, expires_at REAL NOT NULL,
+    verified_until REAL NOT NULL, status TEXT NOT NULL, start_rowid INTEGER NOT NULL);
+CREATE TABLE deliveries (
+    event_id TEXT PRIMARY KEY, subscription_id TEXT NOT NULL,
+    message_id TEXT NOT NULL, body BLOB NOT NULL, status TEXT NOT NULL,
+    attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL,
+    error TEXT, UNIQUE(subscription_id,message_id));
+CREATE TABLE event_metadata (key TEXT PRIMARY KEY,value TEXT);
 """
+EVENT_TABLES = ("subscriptions", "deliveries", "event_metadata")
 
 
 def legacy_fixture(state):
@@ -53,6 +65,13 @@ def legacy_fixture(state):
                        [("fixture-reply", 0, "x" * 3800, 1),
                         ("fixture-reply", 1, "x" * 3800, 0),
                         ("fixture-reply", 2, "x" * 2400, 0)])
+        db.execute("INSERT INTO subscriptions VALUES(?,?,?,?,?,?,?,150,0,130,'active',0)",
+                   ("fixture-subscription", '["fixture","owner"]', "weixin.message", "{}",
+                    "https://callback.example.com/synthetic", "fixture-secret", "fixture-old-secret"))
+        body = b'{"id":"fixture-event","data":{"message_id":"fixture-message"}}'
+        db.execute("INSERT INTO deliveries VALUES(?,?,?,?,?,2,105,NULL)",
+                   ("fixture-event", "fixture-subscription", "fixture-message", body, "sending"))
+        db.execute("INSERT INTO event_metadata VALUES('nonexpiring_default:fixture-subscription','1')")
         db.commit()
 
 
@@ -89,11 +108,24 @@ r=s.claim_send();s.finish_send(mid,'accepted',reply_id=r['reply_id']);s.claim_se
         raise ValueError("old_revision_fixture_failed")
 
 
+def event_snapshot(db):
+    tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    return {table: [tuple(row) for row in db.execute("SELECT * FROM " + table + " ORDER BY rowid")]
+            for table in EVENT_TABLES if table in tables}
+
+
 def verify(state, temporary):
+    from wechat_dot_bridge.migrations import SCHEMA_VERSION
     from wechat_dot_bridge.operations import backup, restore
     from wechat_dot_bridge.store import Store
 
+    with closing(sqlite3.connect(state / "bridge.sqlite3")) as db:
+        original_events = event_snapshot(db)
     with closing(Store(state)) as store:
+        assert store.db.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION
+        events = event_snapshot(store.db)
+        assert set(events) == set(EVENT_TABLES)
+        assert all(events[table] == rows for table, rows in original_events.items())
         store.recover_inflight()
         row = store.db.execute("SELECT client_id,message_id,status FROM replies").fetchone()
         assert row["status"] == "uncertain"
@@ -105,6 +137,7 @@ def verify(state, temporary):
     recovered.mkdir(mode=0o700)
     restore(snapshot, recovered)
     with closing(Store(recovered)) as store:
+        assert event_snapshot(store.db) == events
         assert not store.get_binding()["enabled"]
         assert store.claim_send() is None
         store.set_enabled(True)

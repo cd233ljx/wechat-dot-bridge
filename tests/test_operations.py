@@ -11,6 +11,7 @@ from wechat_dot_bridge.events import Events
 from wechat_dot_bridge.operations import HealthMonitor,diagnostics,subscriptions,backup
 from wechat_dot_bridge.artifacts import detect_kind,stage_bytes,download,url_parts
 from wechat_dot_bridge.errors import BridgeError
+from wechat_dot_bridge.net_transport import NetworkFailure
 from test_media import picture
 
 
@@ -125,14 +126,14 @@ class OperationsTests(unittest.TestCase):
     def test_import_rejects_internal_paths_and_private_dns(self):
         for url in ['sandbox:/mnt/data/private.txt','http://example.com/file','https://user:secret@example.com/file']:
             with self.assertRaises(BridgeError):url_parts(url)
-        with patch('wechat_dot_bridge.events._public_addresses',side_effect=BridgeError('callback_dns_blocked')):
+        with patch('wechat_dot_bridge.artifacts.resolve_addresses',side_effect=NetworkFailure('dns_blocked')):
             with self.assertRaisesRegex(BridgeError,'artifact_endpoint_rejected'):download('https://example.com/file?PRIVATE_SECRET')
 
     def test_https_import_revalidates_redirect_and_omits_auth(self):
         from wechat_dot_bridge.net_transport import NetworkResponse
         first = NetworkResponse(302, b'', ((b'location', b'https://cdn.example.com/file?PRIVATE_SECRET'),))
         second = NetworkResponse(200, b'hello', ((b'content-length', b'5'),))
-        with patch('wechat_dot_bridge.events._public_addresses', return_value=[(2, 1, 6, ('93.184.216.34', 443))]) as dns, patch('wechat_dot_bridge.artifacts.request', side_effect=[first, second]) as request:
+        with patch('wechat_dot_bridge.artifacts.resolve_addresses', return_value=[(2, 1, 6, ('93.184.216.34', 443))]) as dns, patch('wechat_dot_bridge.artifacts.request', side_effect=[first, second]) as request:
             self.assertEqual(download('https://example.com/file'), b'hello')
         self.assertEqual(dns.call_count, 2)
         self.assertEqual(request.call_count, 2)

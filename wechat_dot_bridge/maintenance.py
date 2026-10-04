@@ -186,7 +186,7 @@ def maintain(store):
 def managed_backup(store, directory, keep=7):
     """Snapshot before rotation; manage only files created by this command."""
     from .operations import backup
-    from .store import _private_directory
+    from .private_paths import _private_directory
     if type(keep) is not int or not 1 <= keep <= 1000:
         raise BridgeError("invalid_backup_keep")
     directory = _private_directory(directory)

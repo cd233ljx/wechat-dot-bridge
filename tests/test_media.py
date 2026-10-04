@@ -71,7 +71,7 @@ class MediaTests(unittest.TestCase):
         for url in ["https://127.0.0.1/c2c/download", "https://evil.example/c2c/download",
                     CDN_BASE.replace("https", "http") + "/download", CDN_BASE + "/unexpected",
                     "https://novac2c.cdn.weixin.qq.com.evil.example/c2c/download"]:
-            with self.subTest(url=url), patch("wechat_dot_bridge.events._public_addresses") as dns:
+            with self.subTest(url=url), patch("wechat_dot_bridge.media.resolve_addresses") as dns:
                 with self.assertRaises(BridgeError):
                     cdn_request(url)
                 dns.assert_not_called()
@@ -182,9 +182,9 @@ class MediaTests(unittest.TestCase):
         configure_network('http://127.0.0.1:7890', 'google')
         addresses = [(2, 1, 6, ('93.184.216.34', 443))]
         try:
-            with patch('wechat_dot_bridge.events._google_addresses', return_value=addresses) as resolve, patch('wechat_dot_bridge.media.request', return_value=NetworkResponse(200, b'fixture', ())) as request:
+            with patch('wechat_dot_bridge.media.resolve_addresses', return_value=addresses) as resolve, patch('wechat_dot_bridge.media.request', return_value=NetworkResponse(200, b'fixture', ())) as request:
                 self.assertEqual(cdn_request(CDN_BASE + '/download?encrypted_query_param=fixture')[0], b'fixture')
-                resolve.assert_called_once_with('novac2c.cdn.weixin.qq.com', 'http://127.0.0.1:7890')
+                resolve.assert_called_once_with('novac2c.cdn.weixin.qq.com', dns='google', proxy='http://127.0.0.1:7890')
                 self.assertEqual(request.call_args.args[:3], ('novac2c.cdn.weixin.qq.com', addresses, 'GET'))
                 self.assertEqual(request.call_args.kwargs['proxy'], 'http://127.0.0.1:7890')
                 self.assertNotIn('Authorization', request.call_args.args[5])

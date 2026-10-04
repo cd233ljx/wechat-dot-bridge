@@ -3,7 +3,7 @@ import base64
 import hashlib
 from urllib.parse import urlsplit,urljoin
 from .errors import BridgeError
-from .net_transport import NetworkFailure, request
+from .net_transport import NetworkFailure, request, resolve_addresses
 from .media import MAX_MEDIA, MAX_STAGE, safe_name
 
 
@@ -34,11 +34,10 @@ def url_parts(url):
 
 def download(url):
     from . import media
-    from .events import _public_addresses, _google_addresses
     for hop in range(4):
         p = url_parts(url)
         try:
-            addresses = _google_addresses(p.hostname, media.NETWORK_PROXY) if media.NETWORK_DNS == 'google' else _public_addresses(p.hostname)
+            addresses = resolve_addresses(p.hostname, dns=media.NETWORK_DNS, proxy=media.NETWORK_PROXY)
             response = request(p.hostname, addresses, 'GET', (p.path or '/') + ('?' + p.query if p.query else ''),
                                None, {}, timeout=20, max_response=MAX_MEDIA,
                                proxy=media.NETWORK_PROXY, body_statuses={200})

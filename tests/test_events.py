@@ -16,6 +16,7 @@ from wechat_dot_bridge.events import (Events, MAX_ATTEMPTS, MAX_DNS_RESPONSE,
                                       _google_addresses, _https_request,
                                       secure_post, signed_headers)
 from wechat_dot_bridge.store import Store
+from wechat_dot_bridge.net_transport import NetworkResponse
 
 
 class FakeClock:
@@ -345,7 +346,7 @@ class EventTests(unittest.TestCase):
 class NetworkTests(unittest.TestCase):
     def test_bad_proxy_and_dns_options_reject_before_network(self):
         invalid = ["http://localhost:9000", "http://127.0.0.1:0", "http://127.0.0.1:65536", "https://127.0.0.1:9000", "http://127.0.0.1:9000/", "http://127.0.0.1:9000?q=x", "http://127.0.0.1:9000#x", "http://user:pass@127.0.0.1:9000", "http://127.0.0.1:9000\n", "http://192.168.1.1:9000"]
-        with patch("wechat_dot_bridge.events.socket.getaddrinfo") as dns, patch("wechat_dot_bridge.events._https_request") as request:
+        with patch("wechat_dot_bridge.net_transport.socket.getaddrinfo") as dns, patch("wechat_dot_bridge.events._https_request") as request:
             for proxy in invalid:
                 with self.assertRaisesRegex(BridgeError, "invalid_callback_proxy"):
                     secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"}, proxy=proxy, dns="google")
@@ -355,7 +356,7 @@ class NetworkTests(unittest.TestCase):
             request.assert_not_called()
 
     def test_allowlist_is_checked_before_google_dns(self):
-        with patch("wechat_dot_bridge.events._google_addresses") as doh, patch("wechat_dot_bridge.events.socket.getaddrinfo") as dns:
+        with patch("wechat_dot_bridge.events._google_addresses") as doh, patch("wechat_dot_bridge.net_transport.socket.getaddrinfo") as dns:
             with self.assertRaisesRegex(BridgeError, "callback_not_allowed"):
                 secure_post("https://unapproved.example.com/private", b"{}", {}, {"callback.example.com"}, proxy="http://127.0.0.1:9000", dns="google")
             doh.assert_not_called()
@@ -365,15 +366,19 @@ class NetworkTests(unittest.TestCase):
         answer = json.dumps({"Status": 0, "Answer": [{"type": 5, "data": "alias.example.net."}, {"type": 1, "data": "93.184.216.34"}]}).encode()
         webhook_headers = {"webhook-id": "fixture-event", "webhook-signature": "fixture-secret", "X-MCP-Subscription-Id": "fixture-subscription"}
         proxy = "http://127.0.0.1:9000"
-        with patch("wechat_dot_bridge.events.socket.getaddrinfo") as system_dns, patch("wechat_dot_bridge.events._https_request", side_effect=[(200, answer), (204, b"")]) as request:
+        with patch("wechat_dot_bridge.net_transport.socket.getaddrinfo") as system_dns, \
+                patch("wechat_dot_bridge.net_transport.request", return_value=NetworkResponse(200, answer, ())) as resolver, \
+                patch("wechat_dot_bridge.events._https_request", return_value=(204, b"")) as request:
             result = secure_post("https://callback.example.com/private-route?callback=fixture", b'{"fixture":"private-body"}', webhook_headers, {"callback.example.com"}, proxy=proxy, dns="google")
             self.assertEqual(result, (204, b""))
-            first, second = request.call_args_list
+            first, second = resolver.call_args, request.call_args
             self.assertEqual(first.args[0], "dns.google")
             self.assertEqual(first.args[1][0][3], ("8.8.8.8", 443))
             self.assertEqual(first.args[2:5], ("GET", "/resolve?name=callback.example.com&type=A", None))
             self.assertEqual(first.args[5], {"Accept": "application/dns-json"})
-            self.assertEqual(first.args[6:], (proxy, MAX_DNS_RESPONSE))
+            self.assertEqual(first.kwargs['proxy'], proxy)
+            self.assertEqual(first.kwargs['max_response'], MAX_DNS_RESPONSE)
+            self.assertEqual(first.kwargs['body_statuses'], {200})
             self.assertNotIn("private", str(first))
             self.assertNotIn("fixture-secret", str(first))
             self.assertEqual(second.args[0], "callback.example.com")
@@ -391,10 +396,13 @@ class NetworkTests(unittest.TestCase):
                  b'{"Status":0,"Answer":[{"type":1,"data":"2606:4700::1111"}]}',
                  json.dumps({"Status": 0, "Answer": [{"type": 1, "data": "93.184.216.34"}] * 17}).encode()]
         for answer in cases:
-            with patch("wechat_dot_bridge.events.socket.getaddrinfo") as system_dns, patch("wechat_dot_bridge.events._https_request", return_value=(200, answer)) as request:
+            with patch("wechat_dot_bridge.net_transport.socket.getaddrinfo") as system_dns, \
+                    patch("wechat_dot_bridge.net_transport.request", return_value=NetworkResponse(200, answer, ())) as request, \
+                    patch("wechat_dot_bridge.events._https_request") as callback:
                 with self.assertRaises(BridgeError):
                     secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"}, proxy="http://127.0.0.1:9000", dns="google")
                 request.assert_called_once()
+                callback.assert_not_called()
                 system_dns.assert_not_called()
 
     def test_google_redirect_and_size_bound_stop_before_callback(self):
@@ -402,7 +410,7 @@ class NetworkTests(unittest.TestCase):
         for result, code in [(NetworkResponse(302, b"", ()), "callback_redirect"),
                              (NetworkFailure("response_too_large"), "callback_response_too_large")]:
             kwargs = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
-            with patch("wechat_dot_bridge.events.socket.getaddrinfo") as dns, patch("wechat_dot_bridge.events.request", **kwargs) as request:
+            with patch("wechat_dot_bridge.net_transport.socket.getaddrinfo") as dns, patch("wechat_dot_bridge.net_transport.request", **kwargs) as request:
                 with self.assertRaisesRegex(BridgeError, code):
                     secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"}, proxy="http://127.0.0.1:9000", dns="google")
                 request.assert_called_once()
@@ -418,7 +426,7 @@ class NetworkTests(unittest.TestCase):
             return []
 
         try:
-            with patch("wechat_dot_bridge.events.DNS_TIMEOUT", 0.01), patch("wechat_dot_bridge.events.socket.getaddrinfo", side_effect=delayed):
+            with patch("wechat_dot_bridge.events.DNS_TIMEOUT", 0.01), patch("wechat_dot_bridge.net_transport.socket.getaddrinfo", side_effect=delayed):
                 with self.assertRaisesRegex(BridgeError, "callback_timeout"):
                     secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"})
         finally:
@@ -426,7 +434,7 @@ class NetworkTests(unittest.TestCase):
 
     def test_url_rejections_make_no_dns_or_connection(self):
         cases = ["http://callback.example.com/x", "https://callback.example.com.evil.com/x", "https://user:pass@callback.example.com/x", "https://callback.example.com:8443/x", "https://callback.example.com/x#fragment", "https://127.0.0.1/x"]
-        with patch("wechat_dot_bridge.events.socket.getaddrinfo") as dns:
+        with patch("wechat_dot_bridge.net_transport.socket.getaddrinfo") as dns:
             for url in cases:
                 with self.assertRaises(BridgeError):
                     secure_post(url, b"{}", {}, {"callback.example.com"})
@@ -435,11 +443,11 @@ class NetworkTests(unittest.TestCase):
     def test_mixed_public_private_dns_and_rebinding_blocked_each_attempt(self):
         public = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
         private = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))
-        with patch("wechat_dot_bridge.events.socket.getaddrinfo", return_value=[public, private]):
+        with patch("wechat_dot_bridge.net_transport.socket.getaddrinfo", return_value=[public, private]):
             with self.assertRaisesRegex(BridgeError, "callback_dns_blocked"):
                 secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"})
         from wechat_dot_bridge.net_transport import NetworkResponse
-        with patch("wechat_dot_bridge.events.socket.getaddrinfo", side_effect=[[public], [private]]) as dns, patch("wechat_dot_bridge.events.request", return_value=NetworkResponse(204, b"", ())) as request:
+        with patch("wechat_dot_bridge.net_transport.socket.getaddrinfo", side_effect=[[public], [private]]) as dns, patch("wechat_dot_bridge.events.request", return_value=NetworkResponse(204, b"", ())) as request:
             self.assertEqual(secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"}), (204, b""))
             with self.assertRaisesRegex(BridgeError, "callback_dns_blocked"):
                 secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"})
@@ -450,7 +458,7 @@ class NetworkTests(unittest.TestCase):
     def test_redirect_never_followed(self):
         from wechat_dot_bridge.net_transport import NetworkResponse
         public = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
-        with patch("wechat_dot_bridge.events.socket.getaddrinfo", return_value=[public]), patch("wechat_dot_bridge.events.request", return_value=NetworkResponse(302, b"", ())) as request:
+        with patch("wechat_dot_bridge.net_transport.socket.getaddrinfo", return_value=[public]), patch("wechat_dot_bridge.events.request", return_value=NetworkResponse(302, b"", ())) as request:
             with self.assertRaisesRegex(BridgeError, "callback_redirect"):
                 secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"})
             request.assert_called_once()
