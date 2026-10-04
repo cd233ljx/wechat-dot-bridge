@@ -29,7 +29,7 @@
 ## 产品侧 discovery
 
 - [ ] 私人插件选择 Connection **Tunnel**，Tunnel / 插件实际仅本人可访问。
-- [ ] 产品工具扫描成功，实际发现 [README 中全部 11 个工具](../README.md#接到已有-dot-并验收)，没有多余工具。
+- [ ] 产品工具扫描成功，实际发现 [工具清单中的全部 11 个工具](DOT_SETUP.md#工具清单)，没有多余工具。
 - [ ] 事件扫描实际发现 `weixin.message`，delivery 为 webhook。
 - [ ] 插件加入原有 dot，并成功调用状态工具；首次部署仍为 paused。
 

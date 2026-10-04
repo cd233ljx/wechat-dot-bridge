@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "wechat-dot-bridge"
 version = "0.1.0"
-description = "Private WeChat MCP Events bridge for an existing dot"
+description = "Chat with your existing OpenAI dot from WeChat"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"

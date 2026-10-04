@@ -82,16 +82,18 @@ SDK 依赖约束固定在 2.3 系列，锁文件选定 2.3.0。由于公开 stdi
 ```bash
 uv sync --locked --all-extras
 uv run --locked --all-extras ruff check .
-uv run --locked --all-extras python scripts/check_release.py --old-revision 4d87a28
+uv run --locked --all-extras python scripts/check_release.py
 ```
 
-检查通过已安装的 setuptools PEP 517 backend 构建源码包和 wheel，不依赖 `build` 前端。依赖准备完成后的检查过程不联网。它汇总语法检查、完整回归、模拟升级、秘密扫描、差异检查、打包 / 许可资源检查与 checkout 外的 wheel 安装 smoke；无需重复运行已经包含的步骤。`--old-revision` 默认 `4d87a28`，指定版本必须存在于本地 Git 历史。
+检查通过已安装的 setuptools PEP 517 backend 构建源码包和 wheel，不依赖 `build` 前端。依赖准备完成后的检查过程不联网。它汇总语法检查、完整回归、模拟升级、秘密扫描、差异检查、打包 / 许可资源检查与 checkout 外的 wheel 安装 smoke；无需重复运行已经包含的步骤。
+
+默认升级检查使用固定旧数据库结构，无需原开发仓库的历史。要针对实际旧版演练，追加 `--old-revision` 和本地可用的 commit / tag；指定版本不可用时检查失败，不退回模拟旧结构。秘密扫描与完整发布检查仍要求 Git 仓库，源码压缩包需要先建立仓库，不能据此声称检查过未包含的历史。
 
 只需要单独验证某一步时，可以运行：
 
 ```bash
 uv run --locked --all-extras python3 -m unittest discover -s tests -v
-uv run --locked --all-extras python scripts/verify-upgrade.py --old-revision 4d87a28
+uv run --locked --all-extras python scripts/verify-upgrade.py
 uv run --locked --all-extras python scripts/scan_secrets.py
 ```
 
@@ -100,6 +102,8 @@ uv run --locked --all-extras python scripts/scan_secrets.py
 GitHub Actions 使用同一锁文件和本地发布入口，在 Python 3.11 / 3.14 上运行 Ruff、完整 unittest、模拟升级、隐私扫描、sdist / wheel 构建及 checkout 外安装检查。服务实际部署仍需本地检查和明确记录的真人验收；功能依赖微信 / dot 产品侧能力时，保留相应“待验证”的边界。
 
 ## 发布
+
+仓库名称、简介和首次发布说明见 [开源发布](docs/RELEASING.md)。
 
 1. 更新 CHANGELOG、版本与支持边界，确认文档列出当前 11 个工具。
 2. 运行本地发布检查，检查源码包与 wheel 只包含代码、必要文档和许可，没有运行数据、绑定、callback URL / secret、运行 key 或 node_modules。

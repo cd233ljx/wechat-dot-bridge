@@ -1,6 +1,7 @@
-include README.md CONTRIBUTING.md CHANGELOG.md SECURITY.md AGENTS.md NOTICE.txt LICENSE uv.lock
+include README.md CONTRIBUTING.md CHANGELOG.md SECURITY.md AGENTS.md NOTICE.txt LICENSE uv.lock .gitignore
 recursive-include docs *.md
 recursive-include scripts *.py *.sh
+recursive-include tests *.py
 recursive-include licenses *.txt
 recursive-include wechat_dot_bridge/codecs *.mjs *.ts *.json
 prune wechat_dot_bridge/codecs/node_modules

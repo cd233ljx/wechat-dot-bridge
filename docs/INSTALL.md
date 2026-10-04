@@ -1,59 +1,155 @@
-# 从干净环境部署（Linux / systemd 用户服务）
+# 安装（Linux / systemd 用户服务）
 
-当前 0.1.0 为实验性 / Early Access，支持 Linux / systemd 用户服务、本人单账号私聊。要求 Python 3.11+；微信收发不运行模型。可选 Node 24+ 用于腾讯 Markdown 解析器及 SILK 编解码。OpenAI 插件和私有 Tunnel 权限由本人账户提供，不保证 dot / Work 用量免费。
+当前版本面向本人单账号私聊，仍处于实验阶段。先确认已有 dot、私人插件和 Tunnel 权限，具体要求见 [官方 Tunnel 指南](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。Tunnel 使用权限与 ChatGPT 开发者插件权限分开；dot / Work 的用量与费用按对应产品规则计算。
 
-## 安装源码与可选音频
+## 1. 准备源码环境
 
-在自己选择的新目录检出仓库，准备 Python 3.11+ 和 uv，再用已提交锁文件创建独立环境。开发、CI 和源码部署沿用相同命令：
+在新目录检出源码，准备 Python 3.11+ 和 uv：
 
 ```bash
 uv sync --locked --all-extras
 uv run --locked --all-extras python3 -m unittest discover -s tests -v
 ```
 
-音频可选安装（要求现有 Node 24+、npm、uv）：
+开发、CI 和源码部署使用同一份 `uv.lock`。`--locked` 会拒绝过期锁文件，部署时不重新解析版本。需要指定最低 Python 版本时，给 `uv sync` 加 `--python 3.11`。
+
+可选的 Markdown 解析和音频转换需要 Node 24+、npm：
 
 ```bash
 bash scripts/install-codecs.sh
 ```
 
-未安装音频转换依赖时仍可传文件和已有 AMR/SILK，不能宣称已验证通用音频转码。Node 缺失时 Markdown 使用简化降级。应用 Python 依赖和开发工具使用 `uv.lock`，SILK 依赖使用 package-lock.json；可选转换脚本把 imageio-ffmpeg 0.6.0 装在独立编解码环境，不改变应用锁。
+没有 Node 时 Markdown 使用简化降级。没有音频转换依赖时，仍可接收原始音频和微信提供的转写、回传已有 AMR/SILK，不能转换其他音频。SILK 使用 package-lock.json；转换脚本把 imageio-ffmpeg 0.6.0 装进独立环境，FFmpeg 不包含在本项目发行包内。
 
-`--locked` 拒绝过期锁文件；部署时不执行 `uv lock`，不使用 `pip install` 独立解析另一组运行版本。需要选择最低版本时可加 `--python 3.11`。明确升级依赖后提交 pyproject 与锁文件差异并通过回归，再更新生产专用 `.venv`。官方 MCP SDK 2.3、AnyIO、jsonschema、HTTPCore 1 和 Standard Webhooks 是应用依赖，不需要安装 cc-connect 的 Agent Engine。
+## 2. 生成私人配置
 
-## 准备服务，不自动启动
+从 [官方发行包](https://github.com/openai/tunnel-client/releases/latest)下载适合系统的 tunnel-client，保留随附许可，并按官方指南核对校验和与 Tunnel identity。此服务的访问控制依赖私人 Tunnel；不要把插件分享给其他账号或组织。
 
-从 OpenAI 官方发布下载匹配系统的 tunnel-client，核对发布校验和；自行创建仅本人使用的 Tunnel。运行 key 通过隐藏输入脚本保存到本人私有目录，禁止写入仓库或聊天。
+以下变量在自己的终端设置；程序路径和 identity 需要替换成你实际取得的值：
+
+```bash
+WDB_SOURCE="$PWD"
+WDB_CONFIG="$HOME/.config/wechat-dot-bridge"
+WDB_STATE="$HOME/.local/share/wechat-dot-bridge"
+WDB_TUNNEL_BIN="/absolute/path/to/tunnel-client"
+WDB_TUNNEL_ID="YOUR_TUNNEL_ID"
+WDB_KEY_FILE="$WDB_CONFIG/tunnel-runtime-key"
+```
+
+已有运行密钥文件时，把 `WDB_KEY_FILE` 指向它。需要新建文件时，通过隐藏输入保存：
+
+```bash
+uv run --locked --all-extras python scripts/save_runtime_key.py --path "$WDB_KEY_FILE"
+```
+
+脚本只接受交互输入，不覆盖已有文件。不要把密钥放进参数、聊天、截图或 Git。
 
 ```bash
 uv run --locked --all-extras python scripts/install_local.py \
-  --config-dir /PRIVATE/bridge-config \
-  --state-dir /PRIVATE/bridge-data \
-  --tunnel-bin /ABSOLUTE/tunnel-client \
-  --tunnel-id TUNNEL_ID \
-  --key-file /PRIVATE/runtime.key
+  --source-dir "$WDB_SOURCE" \
+  --config-dir "$WDB_CONFIG" \
+  --state-dir "$WDB_STATE" \
+  --tunnel-bin "$WDB_TUNNEL_BIN" \
+  --tunnel-id "$WDB_TUNNEL_ID" \
+  --key-file "$WDB_KEY_FILE"
 ```
 
-该脚本生成包装器、配置和用户 unit，不启动或启用服务，不覆盖已有安装。用虚拟环境 Python 运行，确保生成包装器引用该环境。首次绑定默认暂停。已有绑定只导入本人指定文件；重新扫码须由本人决定。
+安装器生成 `~/.local/bin/wechat-dot-bridge`、私人配置和 systemd 用户 unit，包装器使用当前虚拟环境的 Python。它不覆盖已有安装，也不启用或启动服务。可用 `--bin-dir`、`--unit-dir` 指定其他位置。
 
-已有的共享程序 / systemd unit 目录允许保留安全的 `0755` 权限；安装器不修改其权限。专用配置、状态目录使用 `0700`，私人文件使用 `0600`，符号链接目标和他人可写目录会被拒绝。
+专用配置、状态目录为 `0700`，私人文件为 `0600`，拒绝符号链接目标。共享程序 / unit 目录可以保留安全的 `0755` 权限。`bridge.json` 初始的 `callback_hosts` 为空，回调主机在 dot 接入时核验。
 
-配置精确的实际平台 callback 主机；不要复制他人的带签名 URL 或关闭主机校验。代理如有需要仅配置本机回环地址。微信新扫码、已有绑定导入及私有插件连接步骤见 README、DOT_SETUP.md。
+## 3. 导入绑定或扫码
 
-确认同一绑定只有一个接收服务后，再显式启动 / 启用 systemd 用户服务。默认不开放公网端口。重启登录维持运行所需的 linger 应由部署者明确配置。
+同一个绑定只能有一个接收者。先停止旧 OpenClaw / cc-connect 接收服务，包括其他主机上的实例，再进行接收验证或切换；本机锁不能阻止其他程序消费相同绑定。
 
-## 发布验证
-
-本地和 CI 共享完整回归、源码包 / wheel 构建、安装产物检查及 Git 历史扫描入口，步骤见 [贡献指南](../CONTRIBUTING.md)。真人微信验收单独按 [当前清单](ACCEPTANCE.md)进行，自动化测试不能代替微信端确认。
-
-本地打包使用锁定开发环境中的 setuptools PEP 517 backend，源码包携带 `uv.lock`：
+已有可用凭据时，导入自己明确选择的 OpenClaw account JSON 或 cc-connect 微信配置：
 
 ```bash
-uv sync --locked --all-extras
-uv run --locked --all-extras ruff check .
+"$HOME/.local/bin/wechat-dot-bridge" --config "$WDB_CONFIG/bridge.json" \
+  import-binding /private/path/to/selected-account.json
+```
+
+cc-connect 配置有多个绑定时，用 `--account-id` 指定。导入只读取所选来源，不扫描认证目录、不修改来源，完成后保持暂停。已有 bridge 不能更换 account / owner；微信绑定、历史消息和 dot 会话不会一起迁移。
+
+没有可导入凭据时，在服务未运行的情况下扫码：
+
+```bash
+"$HOME/.local/bin/wechat-dot-bridge" --config "$WDB_CONFIG/bridge.json" login-start
+uv run --locked --all-extras python scripts/render_login_qr.py \
+  --state-dir "$WDB_STATE" \
+  --output "$WDB_STATE/weixin-login-qr.png"
+```
+
+二维码只保存在私人目录。通过可信的本机或 SSH 文件访问显示 PNG，用手机微信确认，再查询登录状态：
+
+```bash
+"$HOME/.local/bin/wechat-dot-bridge" --config "$WDB_CONFIG/bridge.json" login-poll
+```
+
+等待中可以再查询。返回 `requires_phone_verification: true` 时使用隐藏输入：
+
+```bash
+"$HOME/.local/bin/wechat-dot-bridge" --config "$WDB_CONFIG/bridge.json" \
+  login-poll --verification-code
+```
+
+`confirmed` 后凭据写入私有 SQLite，接收仍暂停。二维码过期可重新 `login-start`，再次渲染前删除旧 PNG；渲染工具拒绝覆盖。`already_bound` 不表示本机已有可用凭据。重新扫码也不能保证仍是原来的微信机器人或对话。
+
+## 4. 启动 Tunnel，连接 dot
+
+先检查密钥，再以暂停接收的状态启动服务：
+
+```bash
+uv run --locked --all-extras python scripts/check_runtime.py \
+  --key-file "$WDB_KEY_FILE" --state-dir "$WDB_STATE" \
+  --config "$WDB_CONFIG/bridge.json" --key-only
+systemctl --user daemon-reload
+systemctl --user start wechat-dot-bridge.service
+uv run --locked --all-extras python scripts/check_runtime.py \
+  --key-file "$WDB_KEY_FILE" --state-dir "$WDB_STATE" \
+  --config "$WDB_CONFIG/bridge.json"
+```
+
+预期 `key_ready`、`tunnel_healthy` 和 `tunnel_ready` 为 `true`。启动前完整检查返回非零属正常，届时只用 `--key-only`。包装器不在默认位置时，完整检查加 `--command /your/wrapper/path`。
+
+按 [dot 接入说明](DOT_SETUP.md)创建仅自己使用的插件、核验精确回调主机并订阅 `weixin.message`。原 dot 应发现 11 个工具和一个事件。配置完成、确认没有第二个接收者后，开启接收：
+
+```bash
+systemctl --user stop wechat-dot-bridge.service
+"$HOME/.local/bin/wechat-dot-bridge" --config "$WDB_CONFIG/bridge.json" \
+  resume --confirm-single-consumer
+systemctl --user start wechat-dot-bridge.service
+```
+
+发一条有唯一标记的短文字，确认原 dot 读取并回复，最后在同一个微信对话确认收到一次回复。API 的 `accepted` 不代表微信实际投递或已读。后续验收见 [验收清单](ACCEPTANCE.md)。
+
+需要开机持续运行时，自行执行 `systemctl --user enable wechat-dot-bridge.service`。退出登录后的运行策略取决于主机的 systemd 用户配置，安装器不修改 linger。
+
+## 可选网络配置
+
+默认使用本机 DNS 和直接 HTTPS。确有需要时，在私人配置里设置 `callback_proxy` / `callback_dns` 或 `media_proxy` / `media_dns`；代理仅接受现有的 `http://127.0.0.1:端口`，DNS 可选 `system` 或 `google`。Tunnel 控制面代理由安装器的 `--proxy` 独立设置，微信 API 仍直连。
+
+Google DoH 只收到主机名查询；本机代理可观察连接元数据。精确主机、公网 IP 和 TLS 校验仍保持启用，不继承环境代理。配置字段与适用边界见 [安全说明](SECURITY.md)；不要复制他人的 callback URL 或放宽 allowlist。
+
+## 停止与回滚
+
+修改绑定、登录或启停标志前停止运行中的服务：
+
+```bash
+systemctl --user stop wechat-dot-bridge.service
+"$HOME/.local/bin/wechat-dot-bridge" --config "$WDB_CONFIG/bridge.json" pause
+```
+
+撤销常驻可执行 `systemctl --user disable wechat-dot-bridge.service`。保留私人状态，以便备份和回滚；恢复旧接收者前确认本桥接已停止。完整步骤见 [维护指南](OPERATIONS.md)。
+
+## 发布检查
+
+在 Git checkout 中运行：
+
+```bash
 uv run --locked --all-extras python scripts/check_release.py
 ```
 
-依赖准备完成后，发布检查不联网。临时 wheel 安装 smoke 使用 `--no-index --no-deps`，复用已有运行依赖，仅验证产物在 checkout 外的导入、资源和新库初始化；不能把它当作新的干净环境依赖安装验证。首次部署仍需执行上面的干净环境安装步骤。
+检查包括完整回归、历史秘密扫描、升级恢复、源码包 / wheel 及许可资源。源码压缩包没有 Git 历史时，单独的 `scripts/verify-upgrade.py` 仍可运行；完整检查需要先建立 Git 仓库，只能检查实际存在的历史。
 
-发布产物应携带腾讯 / SILK 许可与编解码辅助源码，不携带 node_modules、凭据或运行数据库。外部 FFmpeg 二进制不包含在仓库内，重新分发须遵守对应构建许可。
+wheel 安装检查在源码目录外运行，复用已有依赖，只验证发行包内容与导入，不代替首次干净安装或微信端验收。更详细的发布流程见 [贡献指南](../CONTRIBUTING.md)。

@@ -42,8 +42,10 @@ def inspect_packages(directory):
             raise ValueError("package_readme_missing")
     with tarfile.open(sources[0]) as package:
         source_names = package.getnames()
-        for document in ("README.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md",
-                         "scripts/check_release.py", "scripts/scan_secrets.py", "docs/OPERATIONS.md", "uv.lock"):
+        for document in ("README.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md", ".gitignore",
+                         "scripts/check_release.py", "scripts/verify-upgrade.py", "scripts/scan_secrets.py",
+                         "tests/network_fixtures.py", "tests/test_upgrade_script.py",
+                         "docs/INSTALL.md", "docs/DOT_SETUP.md", "docs/RELEASING.md", "docs/OPERATIONS.md", "uv.lock"):
             if not any(name.endswith("/" + document) for name in source_names):
                 raise ValueError("source_document_missing")
     forbidden = re.compile(r"(?:^|/)(?:node_modules|\.git|runtime|state|secrets)(?:/|$)|\.(?:sqlite\w*|db|key|pem)$|(?:^|/)\.env(?:\.|$)")
@@ -54,7 +56,7 @@ def inspect_packages(directory):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--old-revision", default="4d87a28", help="Reachable previous revision used for synthetic upgrade exercise")
+    parser.add_argument("--old-revision", help="Optional local Git revision for the synthetic upgrade exercise")
     args = parser.parse_args(argv)
     root = Path(__file__).resolve().parent.parent
     checks = []
@@ -68,12 +70,15 @@ def main(argv=None):
         setuptools_version = importlib.metadata.version("setuptools")
         if int(setuptools_version.split(".")[0]) < 77:
             raise ValueError("build_dependency_missing")
+        upgrade = [sys.executable, "scripts/verify-upgrade.py"]
+        if args.old_revision is not None:
+            upgrade.extend(["--old-revision", args.old_revision])
         commands = (
             ("lock", ["uv", "lock", "--check"]),
             ("lint", [sys.executable, "-m", "ruff", "check", "wechat_dot_bridge", "scripts", "tests"]),
             ("syntax", [sys.executable, "-m", "compileall", "-q", "wechat_dot_bridge", "scripts", "tests"]),
             ("tests", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]),
-            ("upgrade", [sys.executable, "scripts/verify-upgrade.py", "--old-revision", args.old_revision]),
+            ("upgrade", upgrade),
             ("secrets", [sys.executable, "scripts/scan_secrets.py", "--repo", str(root)]),
             ("diff", ["git", "diff", "--check"]),
         )

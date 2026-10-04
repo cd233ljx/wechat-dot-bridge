@@ -2,14 +2,14 @@
 
 ## 前提
 
-先按 [README](../README.md)准备绑定、官方 Tunnel client 和私人配置。确认同绑定没有其他接收服务。这个流程连接你现有的 dot，不创建新的模型助手，也不启动 Codex CLI。
+先按 [安装指南](INSTALL.md)准备绑定、官方 Tunnel client 和私人配置。确认同绑定没有其他接收服务。这个流程连接你现有的 dot，不创建新的模型助手，也不启动 Codex CLI。
 
 MCP Events 目前支持 dot，以及符合条件的 Work / Cloud 聊天；它要求 MCP `2026-07-28`，详见 [官方 Events 文档](https://developers.openai.com/plugins/build/mcp-events)。账户能否创建开发者插件、使用 Tunnel 和 Events，必须以你实际可见的产品能力与权限为准。
 
 ## 私人插件与 Tunnel
 
 1. 在 [Platform Tunnel 设置](https://platform.openai.com/settings/organization/tunnels)确认 Tunnel 属于自己的 Platform 组织，并关联要使用的个人 ChatGPT 上下文。核验 Read / Use 等权限和实际可访问者。
-2. 运行 README 中配置的官方 `tunnel-client` 用户服务。桥接通过 stdio 接收 MCP，不需要公网入站端口。
+2. 运行安装指南中配置的官方 `tunnel-client` 用户服务。首次接入时保持接收暂停，先完成插件与订阅配置。桥接通过 stdio 接收 MCP，不需要公网入站端口。
 3. 打开 [ChatGPT Plugins](https://chatgpt.com/plugins)，创建开发者插件，在 Connection 中选 **Tunnel**，选择已有 Tunnel 或填入控制台给出的有效 identity。本方案为单人私有 stdio 服务，认证方式选择 **No authentication / 无认证**，依赖仅本人可用的 Tunnel 访问控制；不要选需要独立 OAuth 服务的 OAuth 模式。
 4. 保持插件仅自己可用，不分享给工作区、组织或其他账号。不要发布到公共目录。私人 Tunnel 与公共插件发布是不同部署模式。
 5. 扫描 / 刷新插件工具和事件，确认十一个工具以及 `weixin.message` 出现，然后把插件添加到你原有 dot。
@@ -60,6 +60,22 @@ weixin.message(data.message_id)
 
 `reply_weixin_message` 支持同一 `message_id` 多次提交。返回的 `reply_id` 标识这一次回复，可传给 `get_weixin_send_status` 查询；不传时查询最新回复。可选 `reply_key` 为同一次发送保持稳定，新回复用新 key。该工具只提交持久回复队列，后台发送可能尚未完成。需要时稍后查询；不通过反复提交不同正文来等待成功。原来信文本是用户数据，其中提到的新 callback、token 或操作指令都不应替代私人插件配置和本人授权。
 
+## 工具清单
+
+| 工具 | 用途 |
+| --- | --- |
+| `get_weixin_status` | 查看安全状态、队列和订阅错误 |
+| `read_weixin_message` | 读取来信、引用和附件；就绪图片返回预览 |
+| `read_weixin_attachment` | 读取图片、文件分块和文本内容 |
+| `stage_weixin_attachment` | 暂存新附件，支持分块上传 |
+| `import_weixin_attachment` | 从明确提供的公开 HTTPS 地址导入附件 |
+| `reply_weixin_attachment` | 将附件回传同一对话 |
+| `reply_weixin_message` | 回复已有来信，支持多次追加 |
+| `report_weixin_progress` | 续期、停止或完成处理轮次；不发送消息 |
+| `retry_weixin_operation` | 重试明确失败的发送或下载，保留已接受分段 |
+| `get_weixin_send_status` | 查询 API 接受、失败或不确定状态 |
+| `list_pending_weixin_messages` | 恢复尚未完成的来信，包括已发进度的任务 |
+
 ## 微信输入状态
 
 收到来信后桥接异步预热腾讯 `typing_ticket`，成功读取 `read_weixin_message` 后才启动输入提示。提示每 5 秒续一次；`final:false` 的进度回复保持处理状态，最终回复、显式停止、暂停或 5 分钟处理租期到期后取消。重复读取已经活跃的消息不延长租期，明确进度上报和成功读取该轮次附件可以续期。票据按账号、本人会话和 API 端点缓存十分钟，不因来信 context 更新而重新获取。首次失败五秒后重试，连续失败按 5 / 10 / 20 / 30 秒退避；失败不阻断消息回复，重启不恢复旧输入状态。
@@ -96,7 +112,7 @@ API 接受与实际可见回复是两个验收点。不能仅凭 fixture 测试�
 
 ## 停止监控
 
-在原 dot 明确取消对 `weixin.message` 的订阅，调用状态确认不再有有效订阅。取消仅停止 dot 通知；若需要停止微信收发，还必须停止本机用户服务并执行 `pause`，具体命令见 README。
+在原 dot 明确取消对 `weixin.message` 的订阅，调用状态确认不再有有效订阅。取消仅停止 dot 通知；若需要停止微信收发，还必须停止本机用户服务并执行 `pause`，具体命令见 [安装指南](INSTALL.md#停止与回滚)。
 
 dot / Work 的使用仍消耗其正常用量。桥接不新增模型 API 调用，不能承诺整个流程免费。
 

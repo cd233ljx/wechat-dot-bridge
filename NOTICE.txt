@@ -2,14 +2,23 @@ The original bridge implementation is MIT licensed; see LICENSE.
 Tencent/openclaw-weixin is the official protocol and binding-format reference,
 revision 24de5c9eb0dd5e595d7e2d090ed8a3f82870d42c. Its MIT notice is retained
 in licenses/Tencent-openclaw-weixin-MIT.txt. No OpenClaw runtime is required.
-cc-connect and dots-wechat-bridge were examined during feasibility research;
-neither is a runtime dependency and neither project's source is vendored here.
+cc-connect revision dfad19415a38b00b2c5c288610784d1a7eef337f was reviewed for
+the complete WeChat adapter and session lifecycle; adaptations are recorded in
+docs/UPSTREAM_AUDIT.md. dots-wechat-bridge was also examined during feasibility
+research. Neither project's source is vendored here or required at runtime.
 OpenAI tunnel-client is installed separately from its official release archive;
 the installed archive retains its own licenses and companion files.
 Media protocol and partial-quote handling are adapted from the Tencent reference
 above; the original MIT copyright notice is retained in licenses/.
-Runtime dependencies also include cryptography (Apache-2.0 OR BSD-3-Clause)
-and Pillow (MIT-CMU), installed separately with their distribution notices.
+Runtime libraries are installed separately with their distribution notices:
+MCP Python SDK, AnyIO, jsonschema and Standard Webhooks (MIT),
+HTTPCore (BSD-3-Clause), cryptography (Apache-2.0 OR BSD-3-Clause),
+and Pillow (MIT-CMU). Locked versions are recorded in uv.lock.
+https://github.com/modelcontextprotocol/python-sdk
+https://github.com/agronholm/anyio
+https://github.com/python-jsonschema/jsonschema
+https://github.com/encode/httpcore
+https://github.com/standard-webhooks/standard-webhooks
 https://github.com/pyca/cryptography
 https://github.com/python-pillow/Pillow
 This project is independent and is not endorsed by OpenAI or Tencent.
