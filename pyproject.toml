@@ -10,13 +10,31 @@ readme = "README.md"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE", "NOTICE.txt", "licenses/*.txt"]
-dependencies = ["cryptography>=46.0.5,<47", "Pillow>=12.1.1,<13"]
+dependencies = [
+    "cryptography>=46.0.5,<47",
+    "Pillow>=12.1.1,<13",
+    "mcp>=2.3.0,<2.4",
+    "anyio>=4.9,<5",
+    "jsonschema>=4.20,<5",
+    "httpcore>=1.0.9,<1.1",
+    "standardwebhooks>=1.0.0,<2",
+]
+
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.11",
 ]
+
+[dependency-groups]
+dev = ["ruff>=0.14,<0.15", "setuptools>=77", "build>=1.2,<2", "imageio-ffmpeg==0.6.0"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E9", "F63", "F7", "F82"]
 
 [project.optional-dependencies]
 setup = ["qrcode==8.2"]

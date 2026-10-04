@@ -158,7 +158,33 @@ def _retired_messages(db, clock):
         id TEXT PRIMARY KEY, retired_at REAL NOT NULL)""")
 
 
-MIGRATIONS = (_core, _inbound_quotes, _media, _outbound, _timing, _retired_messages)
+def _processing_lifecycle(db, clock):
+    db.execute("""CREATE TABLE IF NOT EXISTS message_work (
+        message_id TEXT PRIMARY KEY REFERENCES messages(id) ON DELETE CASCADE,
+        run_id TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 1,
+        state TEXT NOT NULL CHECK(state IN ('waiting','active','completed','failed','interrupted')),
+        lease_until REAL, updated_at REAL NOT NULL, read_at REAL)""")
+    db.execute("CREATE INDEX IF NOT EXISTS work_run ON message_work(run_id)")
+    db.execute("CREATE INDEX IF NOT EXISTS work_unfinished ON message_work(state,updated_at)")
+    if 'final' not in _columns(db, 'replies'):
+        db.execute("ALTER TABLE replies ADD COLUMN final INTEGER NOT NULL DEFAULT 1 CHECK(final IN (0,1))")
+    if 'work_scope' not in _columns(db, 'replies'):
+        db.execute("ALTER TABLE replies ADD COLUMN work_scope TEXT")
+    # Old replies lacked final semantics. A surviving explicit processing lease
+    # is evidence of interim work; otherwise preserve the historical completion.
+    db.execute("""UPDATE replies SET final=0 WHERE is_notice=0 AND message_id IN
+        (SELECT message_id FROM processing)""")
+    db.execute("""INSERT OR IGNORE INTO message_work(message_id,run_id,revision,state,lease_until,updated_at,read_at)
+        SELECT m.id,'work_' || substr(m.id,5),1,
+        CASE WHEN EXISTS(SELECT 1 FROM processing p WHERE p.message_id=m.id) THEN 'interrupted'
+             WHEN EXISTS(SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.is_notice=0) THEN 'completed'
+             ELSE 'waiting' END,NULL,?,
+        (SELECT max(t.created_at) FROM tool_calls t WHERE t.message_id=m.id
+            AND t.name='read_weixin_message' AND t.outcome='ok') FROM messages m""", (clock(),))
+    db.execute('DELETE FROM processing')
+
+
+MIGRATIONS = (_core, _inbound_quotes, _media, _outbound, _timing, _retired_messages, _processing_lifecycle)
 SCHEMA_VERSION = len(MIGRATIONS)
 
 

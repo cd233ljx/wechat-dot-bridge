@@ -13,7 +13,7 @@ from unittest.mock import patch
 
 from wechat_dot_bridge.errors import BridgeError
 from wechat_dot_bridge.events import (Events, MAX_ATTEMPTS, MAX_DNS_RESPONSE,
-                                      _PinnedHTTPSConnection, _google_addresses, _https_request,
+                                      _google_addresses, _https_request,
                                       secure_post, signed_headers)
 from wechat_dot_bridge.store import Store
 
@@ -75,6 +75,61 @@ class EventTests(unittest.TestCase):
         self.store.fail_attachment(aid, "media_decryption_failed")
         self.assertTrue(self.events.deliver_once())
         self.assertEqual(json.loads(self.callback.calls[-1][1])["data"]["message_id"], mid)
+
+    def test_first_attempts_preserve_ingest_order_for_equal_timestamps(self):
+        self.events.subscribe(self.params)
+        expected = [self.ingest(str(index)) for index in range(1, 11)]
+        for _ in expected:
+            self.assertTrue(self.events.deliver_once())
+        delivered = [json.loads(body)["data"]["message_id"] for _, body, _ in self.callback.calls
+                     if json.loads(body).get("name")]
+        self.assertEqual(delivered, expected)
+        self.assertFalse(self.events.deliver_once())
+
+    def test_backoff_does_not_block_new_messages_and_due_retry_cannot_starve(self):
+        self.events.subscribe(self.params)
+        first = self.ingest("retry-first")
+        self.callback.status = 503
+        self.assertTrue(self.events.deliver_once())
+        second = self.ingest("ready-second")
+        self.callback.status = 200
+        self.assertTrue(self.events.deliver_once())
+        self.assertEqual(json.loads(self.callback.calls[-1][1])["data"]["message_id"], second)
+        self.clock.now += 3
+        third = self.ingest("ready-third")
+        self.assertTrue(self.events.deliver_once())
+        self.assertEqual(json.loads(self.callback.calls[-1][1])["data"]["message_id"], first)
+        self.assertTrue(self.events.deliver_once())
+        self.assertEqual(json.loads(self.callback.calls[-1][1])["data"]["message_id"], third)
+
+    def test_pending_media_is_bypassed_then_returns_to_ingest_order_when_ready(self):
+        self.events.subscribe(self.params)
+        self.store.ingest("fixture-account", [{"source_id": "slow-media", "peer": "fixture-owner",
+            "text": "[微信附件]", "created_at": self.clock(), "context_token": "fixture-context",
+            "attachments": [{"kind": "file", "name": "fixture.txt", "url": "fixture"}]}], "media-cursor")
+        slow = self.store.list_pending()[0]["message_id"]
+        second = self.ingest("ready-second")
+        third = self.ingest("ready-third")
+        self.assertTrue(self.events.deliver_once())
+        self.assertEqual(json.loads(self.callback.calls[-1][1])["data"]["message_id"], second)
+        self.clock.now += 1
+        aid = self.store.attachment_metadata(slow)[0]["attachment_id"]
+        self.store.finish_attachment(aid, b"fixture")
+        self.assertTrue(self.events.deliver_once())
+        self.assertEqual(json.loads(self.callback.calls[-1][1])["data"]["message_id"], slow)
+        self.assertTrue(self.events.deliver_once())
+        self.assertEqual(json.loads(self.callback.calls[-1][1])["data"]["message_id"], third)
+
+    def test_interim_reply_keeps_notification_retry_eligible_until_final(self):
+        self.events.subscribe(self.params)
+        mid = self.ingest()
+        self.callback.status = 503
+        self.events.deliver_once()
+        self.store.queue_reply(mid, "processing", reply_key="progress", final=False)
+        self.clock.now += 3
+        self.callback.status = 200
+        self.assertTrue(self.events.deliver_once())
+        self.assertEqual(self.events.status()["deliveries"].get("acknowledged"), 1)
 
     def test_verification_signed_and_stable_refresh(self):
         first = self.events.subscribe(self.params)
@@ -288,89 +343,6 @@ class EventTests(unittest.TestCase):
 
 
 class NetworkTests(unittest.TestCase):
-    def test_explicit_proxy_connects_numeric_ip_then_tls_and_http_original_host(self):
-        addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, ("93.184.216.34", 443))]
-        with patch("wechat_dot_bridge.events.socket.socket") as socket_factory, patch("wechat_dot_bridge.events.ssl.create_default_context") as tls, patch("wechat_dot_bridge.events.socket.getaddrinfo") as dns:
-            raw = socket_factory.return_value
-            raw.makefile.return_value = io.BytesIO(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            connection = _PinnedHTTPSConnection("callback.example.com", addresses, proxy="http://127.0.0.1:9000")
-            connection.connect()
-            raw.connect.assert_called_once_with(("127.0.0.1", 9000))
-            connect_bytes = b"".join(call.args[0] for call in raw.sendall.call_args_list)
-            self.assertIn(b"CONNECT 93.184.216.34:443 HTTP/", connect_bytes)
-            self.assertNotIn(b"callback.example.com", connect_bytes)
-            tls.return_value.wrap_socket.assert_called_once_with(raw, server_hostname="callback.example.com", do_handshake_on_connect=False)
-            connection.request("POST", "/fixture", body=b"{}")
-            application = b"".join(call.args[0] for call in tls.return_value.wrap_socket.return_value.sendall.call_args_list)
-            self.assertIn(b"Host: callback.example.com\r\n", application)
-            self.assertNotIn(b"Host: 93.184.216.34", application)
-            dns.assert_not_called()
-
-    def test_default_direct_connection_ignores_ambient_proxies(self):
-        addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, ("93.184.216.34", 443))]
-        with patch.dict(os.environ, {"HTTP_PROXY": "http://127.0.0.1:9000", "HTTPS_PROXY": "http://127.0.0.1:9000"}), patch("wechat_dot_bridge.events.socket.socket") as socket_factory, patch("wechat_dot_bridge.events.ssl.create_default_context") as tls:
-            connection = _PinnedHTTPSConnection("callback.example.com", addresses)
-            connection.connect()
-            socket_factory.return_value.connect.assert_called_once_with(("93.184.216.34", 443))
-            socket_factory.return_value.sendall.assert_not_called()
-            tls.return_value.wrap_socket.assert_called_once_with(socket_factory.return_value, server_hostname="callback.example.com", do_handshake_on_connect=False)
-
-    def test_tls_socket_is_published_before_handshake(self):
-        addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, ("93.184.216.34", 443))]
-        with patch("wechat_dot_bridge.events.socket.socket"), patch("wechat_dot_bridge.events.ssl.create_default_context") as tls:
-            connection = _PinnedHTTPSConnection("callback.example.com", addresses)
-            tls_socket = tls.return_value.wrap_socket.return_value
-
-            def handshake():
-                self.assertIs(connection.sock, tls_socket)
-
-            tls_socket.do_handshake.side_effect = handshake
-            connection.connect()
-            tls_socket.do_handshake.assert_called_once()
-
-    def test_expiry_during_socket_wrap_prevents_handshake(self):
-        addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, ("93.184.216.34", 443))]
-        with patch("wechat_dot_bridge.events.socket.socket"), patch("wechat_dot_bridge.events.ssl.create_default_context") as tls:
-            connection = _PinnedHTTPSConnection("callback.example.com", addresses)
-            expired = threading.Event()
-            connection._request_expired = expired
-            tls_socket = tls.return_value.wrap_socket.return_value
-
-            def wrap(*args, **kwargs):
-                expired.set()
-                return tls_socket
-
-            tls.return_value.wrap_socket.side_effect = wrap
-            with self.assertRaises(TimeoutError):
-                connection.connect()
-            tls_socket.do_handshake.assert_not_called()
-            tls_socket.close.assert_called_once()
-
-    def test_expiry_during_connect_does_not_send_callback_body(self):
-        addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, ("93.184.216.34", 443))]
-        with patch("wechat_dot_bridge.events._PinnedHTTPSConnection") as factory, patch("wechat_dot_bridge.events.threading.Timer") as timer:
-            connection = factory.return_value
-            connection.connect.side_effect = lambda: timer.call_args.args[1]()
-            with self.assertRaisesRegex(BridgeError, "callback_timeout"):
-                _https_request("callback.example.com", addresses, "POST", "/fixture", b"private fixture", {})
-            connection.request.assert_not_called()
-            connection.sock.shutdown.assert_called_once_with(socket.SHUT_RDWR)
-            timer.return_value.cancel.assert_called_once()
-
-    def test_timer_interrupted_tls_reports_timeout_without_sending(self):
-        addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, ("93.184.216.34", 443))]
-        with patch("wechat_dot_bridge.events._PinnedHTTPSConnection") as factory, patch("wechat_dot_bridge.events.threading.Timer") as timer:
-            connection = factory.return_value
-
-            def interrupted_handshake():
-                timer.call_args.args[1]()
-                raise ssl.SSLError("fixture closed during handshake")
-
-            connection.connect.side_effect = interrupted_handshake
-            with self.assertRaisesRegex(BridgeError, "callback_timeout"):
-                _https_request("callback.example.com", addresses, "POST", "/fixture", b"private fixture", {})
-            connection.request.assert_not_called()
-
     def test_bad_proxy_and_dns_options_reject_before_network(self):
         invalid = ["http://localhost:9000", "http://127.0.0.1:0", "http://127.0.0.1:65536", "https://127.0.0.1:9000", "http://127.0.0.1:9000/", "http://127.0.0.1:9000?q=x", "http://127.0.0.1:9000#x", "http://user:pass@127.0.0.1:9000", "http://127.0.0.1:9000\n", "http://192.168.1.1:9000"]
         with patch("wechat_dot_bridge.events.socket.getaddrinfo") as dns, patch("wechat_dot_bridge.events._https_request") as request:
@@ -426,17 +398,16 @@ class NetworkTests(unittest.TestCase):
                 system_dns.assert_not_called()
 
     def test_google_redirect_and_size_bound_stop_before_callback(self):
-        for status, body, code in [(302, b"", "callback_redirect"), (200, b"x" * (MAX_DNS_RESPONSE + 1), "callback_response_too_large")]:
-            with patch("wechat_dot_bridge.events.socket.getaddrinfo") as dns, patch("wechat_dot_bridge.events._PinnedHTTPSConnection") as connection:
-                response = connection.return_value.getresponse.return_value
-                response.status = status
-                response.read.return_value = body
+        from wechat_dot_bridge.net_transport import NetworkFailure, NetworkResponse
+        for result, code in [(NetworkResponse(302, b"", ()), "callback_redirect"),
+                             (NetworkFailure("response_too_large"), "callback_response_too_large")]:
+            kwargs = {"side_effect": result} if isinstance(result, Exception) else {"return_value": result}
+            with patch("wechat_dot_bridge.events.socket.getaddrinfo") as dns, patch("wechat_dot_bridge.events.request", **kwargs) as request:
                 with self.assertRaisesRegex(BridgeError, code):
                     secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"}, proxy="http://127.0.0.1:9000", dns="google")
-                connection.assert_called_once()
-                response.read.assert_called_once_with(MAX_DNS_RESPONSE + 1)
-                self.assertEqual(connection.call_args.args[0], "dns.google")
-                self.assertEqual(connection.return_value.request.call_args.kwargs["headers"]["Host"], "dns.google")
+                request.assert_called_once()
+                self.assertEqual(request.call_args.args[0], "dns.google")
+                self.assertEqual(request.call_args.kwargs["max_response"], MAX_DNS_RESPONSE)
                 dns.assert_not_called()
 
     def test_dns_resolution_timeout_is_bounded(self):
@@ -453,15 +424,6 @@ class NetworkTests(unittest.TestCase):
         finally:
             release.set()
 
-    def test_pinned_socket_uses_validated_ip_and_original_tls_hostname(self):
-        addresses = [(socket.AF_INET, socket.SOCK_STREAM, 6, ("93.184.216.34", 443))]
-        with patch("wechat_dot_bridge.events.socket.socket") as socket_factory, patch("wechat_dot_bridge.events.ssl.create_default_context") as tls, patch("wechat_dot_bridge.events.socket.getaddrinfo") as dns:
-            connection = _PinnedHTTPSConnection("callback.example.com", addresses)
-            connection.connect()
-            socket_factory.return_value.connect.assert_called_once_with(("93.184.216.34", 443))
-            tls.return_value.wrap_socket.assert_called_once_with(socket_factory.return_value, server_hostname="callback.example.com", do_handshake_on_connect=False)
-            dns.assert_not_called()
-
     def test_url_rejections_make_no_dns_or_connection(self):
         cases = ["http://callback.example.com/x", "https://callback.example.com.evil.com/x", "https://user:pass@callback.example.com/x", "https://callback.example.com:8443/x", "https://callback.example.com/x#fragment", "https://127.0.0.1/x"]
         with patch("wechat_dot_bridge.events.socket.getaddrinfo") as dns:
@@ -476,24 +438,22 @@ class NetworkTests(unittest.TestCase):
         with patch("wechat_dot_bridge.events.socket.getaddrinfo", return_value=[public, private]):
             with self.assertRaisesRegex(BridgeError, "callback_dns_blocked"):
                 secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"})
-        with patch("wechat_dot_bridge.events.socket.getaddrinfo", side_effect=[[public], [private]]) as dns, patch("wechat_dot_bridge.events._PinnedHTTPSConnection") as connection:
-            connection.return_value.getresponse.return_value.status = 204
-            connection.return_value.getresponse.return_value.read.return_value = b""
+        from wechat_dot_bridge.net_transport import NetworkResponse
+        with patch("wechat_dot_bridge.events.socket.getaddrinfo", side_effect=[[public], [private]]) as dns, patch("wechat_dot_bridge.events.request", return_value=NetworkResponse(204, b"", ())) as request:
             self.assertEqual(secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"}), (204, b""))
             with self.assertRaisesRegex(BridgeError, "callback_dns_blocked"):
                 secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"})
             self.assertEqual(dns.call_count, 2)
-            self.assertEqual(connection.call_count, 1)
-            self.assertEqual(connection.call_args.args[0], "callback.example.com")
+            request.assert_called_once()
+            self.assertEqual(request.call_args.args[0], "callback.example.com")
 
     def test_redirect_never_followed(self):
+        from wechat_dot_bridge.net_transport import NetworkResponse
         public = (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 443))
-        with patch("wechat_dot_bridge.events.socket.getaddrinfo", return_value=[public]), patch("wechat_dot_bridge.events._PinnedHTTPSConnection") as connection:
-            connection.return_value.getresponse.return_value.status = 302
-            connection.return_value.getresponse.return_value.read.return_value = b""
+        with patch("wechat_dot_bridge.events.socket.getaddrinfo", return_value=[public]), patch("wechat_dot_bridge.events.request", return_value=NetworkResponse(302, b"", ())) as request:
             with self.assertRaisesRegex(BridgeError, "callback_redirect"):
                 secure_post("https://callback.example.com/x", b"{}", {}, {"callback.example.com"})
-            connection.return_value.request.assert_called_once()
+            request.assert_called_once()
 
 
 if __name__ == "__main__":

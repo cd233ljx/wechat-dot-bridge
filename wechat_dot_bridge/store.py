@@ -20,6 +20,7 @@ from urllib.parse import urlsplit
 
 from .errors import BridgeError
 from .migrations import migrate
+from .lifecycle import WorkStore
 
 
 MAX_PENDING = 128
@@ -128,7 +129,7 @@ from .attachment_store import AttachmentStore, MEDIA_ERRORS
 SAFE_ERRORS = SAFE_ERRORS | MEDIA_ERRORS
 
 
-class Store(AttachmentStore):
+class Store(AttachmentStore, WorkStore):
     def __init__(self, state_dir, clock=time.time):
         self.directory = _private_directory(state_dir)
         self.state_dir = self.directory
@@ -327,7 +328,7 @@ class Store(AttachmentStore):
                 raise BridgeError("account_disabled")
             previous_context = self._latest_context(binding)
             count = self.db.execute(
-                "SELECT count(*) FROM messages WHERE account=? AND peer=? AND state='pending'",
+                "SELECT count(*) FROM messages m JOIN message_work w ON w.message_id=m.id WHERE account=? AND peer=? AND w.state!='completed'",
                 (binding["id"], binding["owner"])).fetchone()[0]
             added = 0
             for source, peer, text, created_at, context, refs, quotes, aliases,received_at in normalized:
@@ -371,6 +372,7 @@ class Store(AttachmentStore):
                     "INSERT INTO messages(id,account,peer,source_id,text,created_at,context_token) "
                     "VALUES(?,?,?,?,?,?,?)",
                     (identifier, binding["id"], peer, source, text, created_at, context))
+                self._ensure_work(identifier)
                 if source.startswith("message:"):
                     original=source[len("message:item:"):] if source.startswith("message:item:") else source[len("message:"):]
                     if reference_id(original): aliases.append(reference_id(original))
@@ -424,20 +426,12 @@ class Store(AttachmentStore):
                             (binding["id"],binding["owner"],source_id,reply["text"],attachment["id"] if attachment else None))
 
     def read_message(self, message_id):
-        with self.lock:
+        with self._transaction():
             message = self._message(message_id, self._binding())
-            return {"message_id": message["id"], "text": message["text"], "created_at": message["created_at"],
+            work = self._start_work(message_id)
+            return {"processing": work, "message_id": message["id"], "text": message["text"], "created_at": message["created_at"],
                     "attachments": self.attachment_metadata(message_id),
                     "quotes":[dict(has_reference_id=bool(r["has_reference_id"]),status=r["status"],resolved_message_id=r["resolved_message_id"],shape=json.loads(r["shape"])) for r in self.db.execute("SELECT has_reference_id,status,resolved_message_id,shape FROM message_quotes WHERE message_id=? ORDER BY position",(message_id,))]}
-
-    def report_progress(self, message_id, active=True):
-        with self._transaction():
-            self._message(message_id, self._binding())
-            if active:
-                self.db.execute("INSERT INTO processing VALUES(?,?) ON CONFLICT(message_id) DO UPDATE SET expires=excluded.expires", (message_id,self.clock()+300))
-            else:
-                self.db.execute("DELETE FROM processing WHERE message_id=?", (message_id,))
-        return {"message_id":message_id,"processing":active}
 
     def typing_target(self, message_ids):
         """Internal route only for pending owner messages dot has actually read."""
@@ -449,9 +443,9 @@ class Store(AttachmentStore):
                 return None
             placeholders = ",".join("?" for _ in message_ids)
             rows = self.db.execute(
-                "SELECT m.id FROM messages m WHERE m.id IN (" + placeholders + ") "
-                "AND m.account=? AND m.peer=? AND ((m.state='pending' "
-                "AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.is_notice=0)) OR EXISTS(SELECT 1 FROM processing p WHERE p.message_id=m.id AND p.expires>?))",
+                "SELECT m.id FROM messages m JOIN message_work w ON w.message_id=m.id "
+                "WHERE m.id IN (" + placeholders + ") AND m.account=? AND m.peer=? "
+                "AND w.state='active' AND w.lease_until>?",
                 (*message_ids, binding["id"], binding["owner"],self.clock())).fetchall()
             context = self._latest_context(binding)
             if not rows or not context:
@@ -464,12 +458,14 @@ class Store(AttachmentStore):
         with self.lock:
             binding = self._binding()
             rows = self.db.execute(
-                "SELECT id,created_at FROM messages m WHERE account=? AND peer=? AND state='pending' "
-                "AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.is_notice=0) "
-                "ORDER BY created_at,rowid LIMIT ?", (binding["id"], binding["owner"], limit)).fetchall()
+                "SELECT m.id,m.created_at FROM messages m JOIN message_work w ON w.message_id=m.id "
+                "WHERE account=? AND peer=? AND w.state!='completed' "
+                "ORDER BY m.created_at,m.rowid LIMIT ?", (binding["id"], binding["owner"], limit)).fetchall()
             return [{"message_id": row["id"], "created_at": row["created_at"]} for row in rows]
 
-    def queue_reply(self, message_id, text, reply_key=None, attachment_id=None, final=True, notice=False):
+    def queue_reply(self, message_id, text, reply_key=None, attachment_id=None, final=True, notice=False, *, message_ids=None, processing_id=None, revision=None):
+        if type(final) is not bool:
+            raise BridgeError("invalid_processing_state")
         size = _text_bytes(text)
         if size is None or size > MAX_REPLY_BYTES or (not text.strip() and attachment_id is None):
             raise BridgeError("invalid_reply_text")
@@ -480,14 +476,19 @@ class Store(AttachmentStore):
                 raise BridgeError("invalid_reply_key")
             if attachment_id is not None:
                 self.read_attachment(attachment_id)
+            if message_ids is not None:
+                self._work_members(message_id, message_ids)
+            work_scope = json.dumps(sorted(message_ids)) if message_ids is not None else None
             identity = json.dumps([message_id, reply_key if reply_key is not None else text, reply_key is not None] + ([attachment_id] if attachment_id and reply_key is None else []), ensure_ascii=False)
             client_id = "dot_reply_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()
             if reply_key is None:
-                existing = self.db.execute("SELECT text,client_id,attachment_id FROM replies WHERE message_id=? AND text=? AND attachment_id IS ? ORDER BY rowid LIMIT 1", (message_id, text, attachment_id)).fetchone()
+                existing = self.db.execute("SELECT text,client_id,attachment_id,final,work_scope FROM replies WHERE message_id=? AND text=? AND attachment_id IS ? ORDER BY rowid LIMIT 1", (message_id, text, attachment_id)).fetchone()
             else:
-                existing = self.db.execute("SELECT text,client_id,attachment_id FROM replies WHERE message_id=? AND client_id=?", (message_id, client_id)).fetchone()
+                existing = self.db.execute("SELECT text,client_id,attachment_id,final,work_scope FROM replies WHERE message_id=? AND client_id=?", (message_id, client_id)).fetchone()
             if existing:
                 if existing["text"] != text or existing["attachment_id"] != attachment_id:
+                    raise BridgeError("reply_key_conflict")
+                if bool(existing["final"]) != final or existing['work_scope'] != work_scope:
                     raise BridgeError("reply_key_conflict")
                 client_id = existing["client_id"]
             else:
@@ -500,19 +501,18 @@ class Store(AttachmentStore):
                 if queued >= MAX_QUEUED_REPLIES:
                     raise BridgeError("send_queue_full")
                 self.db.execute(
-                    "INSERT INTO replies(message_id,text,client_id,status,created_at,attachment_id,is_notice) VALUES(?,?,?,'queued',?,?,?)",
-                    (message_id, text, client_id, self.clock(), attachment_id,int(notice)))
+                    "INSERT INTO replies(message_id,text,client_id,status,created_at,attachment_id,is_notice,final,work_scope) VALUES(?,?,?,'queued',?,?,?,?,?)",
+                    (message_id, text, client_id, self.clock(), attachment_id,int(notice),int(final),work_scope))
                 from .message_format import split_text
                 for part, chunk in enumerate(split_text(text) if text else []):
                     self.db.execute("INSERT INTO reply_parts(reply_id,part,text) VALUES(?,?,?)", (client_id, part, chunk))
                 if attachment_id:
                     self.db.execute("INSERT INTO reply_parts(reply_id,part,text,kind) VALUES(?,?,'','media')", (client_id,len(split_text(text)) if text else 0))
                 if not notice:
+                    self._transition_work(message_id, active=not final, completed=final, message_ids=message_ids, processing_id=processing_id, revision=revision, new_reply=True)
                     self.db.execute("UPDATE messages SET state='reply_committed' WHERE id=?", (message_id,))
                     from .timing import record as trace
                     trace(self,message_id,"reply_queued",reply_id=client_id)
-        if not notice:
-            self.report_progress(message_id, not final)
         return self.send_status(message_id, client_id)
 
     def send_status(self, message_id, reply_id=None):
@@ -525,6 +525,9 @@ class Store(AttachmentStore):
                 if reply is None:
                     raise BridgeError("unknown_reply")
             result = {"message_id": message_id, "status": reply["status"] if reply else "no_reply", "delivered": None}
+            work = self.db.execute('SELECT * FROM message_work WHERE message_id=?', (message_id,)).fetchone()
+            if work:
+                result['work'] = self._work_value(work)
             if reply:
                 result["reply_id"] = reply["client_id"]
             if reply:
@@ -671,7 +674,7 @@ class Store(AttachmentStore):
             pending, counts = 0, {}
             if binding:
                 pending = self.db.execute(
-                    "SELECT count(*) FROM messages WHERE account=? AND peer=? AND state='pending'",
+                    "SELECT count(*) FROM messages m JOIN message_work w ON w.message_id=m.id WHERE account=? AND peer=? AND w.state!='completed'",
                     (binding["id"], binding["owner"])).fetchone()[0]
                 rows = self.db.execute(
                     "SELECT r.status,count(*) AS n FROM replies r JOIN messages m ON m.id=r.message_id "
@@ -688,10 +691,20 @@ class Store(AttachmentStore):
             result = {"bound": bool(binding), "enabled": bool(binding and binding["enabled"]),
                       "account_status": binding["status"] if binding else "not_bound",
                       "pending": pending, "reply_status": counts, "active_subscriptions": active}
+            scope = (binding['id'], binding['owner']) if binding else ('', '')
+            result["processing_status"] = {r[0]: r[1] for r in self.db.execute("""SELECT
+                CASE WHEN w.state='active' AND COALESCE(w.lease_until,0)<=? THEN 'interrupted' ELSE w.state END AS effective_state,
+                count(*) FROM message_work w JOIN messages m ON m.id=w.message_id
+                WHERE m.account=? AND m.peer=? GROUP BY effective_state""", (self.clock(), *scope))}
             result["recent_tool_calls"] = [dict(r) for r in self.db.execute("SELECT name,outcome,created_at FROM tool_calls ORDER BY id DESC LIMIT 10")]
             pause = self.db.execute("SELECT resume_at FROM session_pause LIMIT 1").fetchone()
             result["session_retry_at"] = pause[0] if pause else None
-            result["pending_processing"] = [{"message_id": r["id"], "read_observed": bool(r["was_read"]), "age_seconds": max(0,int(self.clock()-r["created_at"]))} for r in self.db.execute("SELECT m.id,m.created_at,EXISTS(SELECT 1 FROM tool_calls t WHERE t.message_id=m.id AND t.name='read_weixin_message' AND t.outcome='ok') AS was_read FROM messages m WHERE m.state='pending' ORDER BY m.rowid LIMIT 20")]
+            result["pending_processing"] = [{"message_id": r["id"], "read_observed": bool(r["was_read"]),
+                "age_seconds": max(0,int(self.clock()-r["created_at"])), "work": self._work_value(r)}
+                for r in self.db.execute("""SELECT m.id,m.created_at,w.*,
+                (w.read_at IS NOT NULL OR EXISTS(SELECT 1 FROM tool_calls t WHERE t.message_id=m.id AND t.name='read_weixin_message' AND t.outcome='ok')) AS was_read
+                FROM messages m JOIN message_work w ON w.message_id=m.id
+                WHERE w.state!='completed' AND m.account=? AND m.peer=? ORDER BY m.rowid LIMIT 20""", scope)]
             from .operations import diagnostics
             result["diagnostics"] = diagnostics(self)
             result["attachments"] = {row[0]: row[1] for row in self.db.execute("SELECT status,count(*) FROM attachments GROUP BY status")}

@@ -11,9 +11,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 from wechat_dot_bridge.errors import BridgeError
+from wechat_dot_bridge.net_transport import NetworkFailure, NetworkResponse
 from wechat_dot_bridge.store import Store
 from wechat_dot_bridge.transport import (
-    IlinkClient, MAX_RESPONSE_BYTES, WeixinWorker, _PinnedHTTPSConnection,
+    IlinkClient, MAX_RESPONSE_BYTES, WeixinWorker,
     _endpoint, _normalize_message, _resolve_public, load_existing_binding,
 )
 
@@ -85,16 +86,6 @@ class NetworkSafetyTests(unittest.TestCase):
         with patch("wechat_dot_bridge.transport.socket.getaddrinfo", return_value=[answer("8.8.8.8")]):
             self.assertEqual(_resolve_public("ilinkai.weixin.qq.com"), "8.8.8.8")
 
-    def test_connection_pins_ip_and_verifies_original_hostname(self):
-        context, raw_socket = Mock(), Mock()
-        with patch("wechat_dot_bridge.transport.ssl.create_default_context", return_value=context), \
-             patch("wechat_dot_bridge.transport.socket.create_connection", return_value=raw_socket) as connect:
-            context.check_hostname = True
-            connection = _PinnedHTTPSConnection("ilinkai.weixin.qq.com", "8.8.8.8", 15)
-            connection.connect()
-            connect.assert_called_once_with(("8.8.8.8", 443), 15)
-            context.wrap_socket.assert_called_once_with(raw_socket, server_hostname="ilinkai.weixin.qq.com")
-
     def test_hanging_dns_has_deadline_and_at_most_four_resolvers(self):
         release = threading.Event()
         threads = []
@@ -140,47 +131,34 @@ class NetworkSafetyTests(unittest.TestCase):
                 _resolve_public("ilinkai.weixin.qq.com")
         self.assertEqual(str(caught.exception), "dns_rejected")
 
-    def test_tls_failure_closes_socket(self):
-        context, raw_socket = Mock(), Mock()
-        context.wrap_socket.side_effect = ssl.SSLError("fixture error")
-        with patch("wechat_dot_bridge.transport.ssl.create_default_context", return_value=context), \
-             patch("wechat_dot_bridge.transport.socket.create_connection", return_value=raw_socket):
-            with self.assertRaises(ssl.SSLError):
-                _PinnedHTTPSConnection("ilinkai.weixin.qq.com", "8.8.8.8", 15).connect()
-        raw_socket.close.assert_called_once()
-
-    def _request(self, status=200, raw=b'{"ret":0}', failure=None):
-        response = Mock(status=status)
-        response.read.return_value = raw
-        connection = Mock()
-        connection.getresponse.return_value = response
-        connection.request.side_effect = failure
-        return connection, response
-
     def test_no_redirect_following_and_bounded_response(self):
         for status, raw, expected in [(302, b"", "endpoint_rejected"), (401, b"", "auth_required"),
                                       (500, b"fixture sensitive body", "http_error"),
                                       (200, b"x" * (MAX_RESPONSE_BYTES + 1), "response_too_large"),
                                       (200, b'{"ret":0,"ret":1}', "response_invalid")]:
-            connection, response = self._request(status, raw)
+            connection = Mock()
+            if len(raw) > MAX_RESPONSE_BYTES:
+                connection.execute.side_effect = NetworkFailure("response_too_large")
+            else:
+                connection.execute.return_value = NetworkResponse(status, raw, ())
             with patch("wechat_dot_bridge.transport._resolve_public", return_value="8.8.8.8"), \
-                 patch("wechat_dot_bridge.transport._PinnedHTTPSConnection", return_value=connection):
+                 patch("wechat_dot_bridge.transport.PinnedRequest", return_value=connection):
                 with self.assertRaises(BridgeError) as caught:
                     IlinkClient().poll(FIXTURE)
                 self.assertEqual(str(caught.exception), expected)
-                self.assertEqual(connection.request.call_count, 1)
-                connection.close.assert_called_once()
-            if status == 200:
-                response.read.assert_called_once_with(MAX_RESPONSE_BYTES + 1)
+                connection.execute.assert_called_once()
+                self.assertEqual(connection.execute.call_args.args[4], MAX_RESPONSE_BYTES)
+                self.assertEqual(connection.execute.call_args.args[5], {200})
 
     def test_network_exception_is_safe_code(self):
-        connection, _response = self._request(failure=TimeoutError("fixture secret must stay private"))
+        connection = Mock()
+        connection.execute.side_effect = NetworkFailure("timeout")
         with patch("wechat_dot_bridge.transport._resolve_public", return_value="8.8.8.8"), \
-             patch("wechat_dot_bridge.transport._PinnedHTTPSConnection", return_value=connection):
+             patch("wechat_dot_bridge.transport.PinnedRequest", return_value=connection):
             with self.assertRaises(BridgeError) as caught:
                 IlinkClient().send(FIXTURE, FakeStore().reply)
         self.assertEqual(str(caught.exception), "network_timeout")
-        self.assertNotIn("fixture secret", str(caught.exception))
+        connection.execute.assert_called_once()
 
     def test_send_retains_fixed_id_and_only_owner_route(self):
         client = IlinkClient()

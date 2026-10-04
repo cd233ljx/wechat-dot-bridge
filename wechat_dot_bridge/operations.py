@@ -22,15 +22,20 @@ def diagnostics(store, threshold=300):
     now = store.clock()
     with store.lock:
         issues = []
+        binding = store.get_binding()
+        scope = (binding['id'], binding['owner']) if binding else ('', '')
         for row in store.db.execute("""SELECT m.id,m.created_at,
-            EXISTS(SELECT 1 FROM tool_calls t WHERE t.message_id=m.id AND t.name='read_weixin_message' AND t.outcome='ok') AS was_read
-            FROM messages m WHERE m.state='pending' AND m.created_at<?
-            AND NOT EXISTS(SELECT 1 FROM processing p WHERE p.message_id=m.id AND p.expires>?)
-            ORDER BY m.rowid DESC LIMIT 50""", (now-threshold,now)):
+            (w.read_at IS NOT NULL OR EXISTS(SELECT 1 FROM tool_calls t WHERE t.message_id=m.id AND t.name='read_weixin_message' AND t.outcome='ok')) AS was_read
+            FROM messages m JOIN message_work w ON w.message_id=m.id WHERE w.state!='completed' AND m.created_at<?
+            AND m.account=? AND m.peer=?
+            AND NOT (w.state='active' AND COALESCE(w.lease_until,0)>?)
+            ORDER BY m.rowid DESC LIMIT 50""", (now-threshold,*scope,now)):
             issues.append(dict(message_id=row['id'],code='processing_stalled' if row['was_read'] else 'message_unread',age_seconds=int(now-row['created_at'])))
-        for row in store.db.execute("SELECT message_id,status,error FROM replies WHERE is_notice=0 AND status IN ('failed','uncertain','context_required','auth_required') ORDER BY rowid DESC LIMIT 50"):
+        for row in store.db.execute("""SELECT r.message_id,r.status,r.error FROM replies r
+            JOIN messages m ON m.id=r.message_id WHERE r.is_notice=0
+            AND r.status IN ('failed','uncertain','context_required','auth_required')
+            AND m.account=? AND m.peer=? ORDER BY r.rowid DESC LIMIT 50""", scope):
             issues.append(dict(message_id=row['message_id'],code='reply_'+row['status'],error=row['error']))
-        binding=store.get_binding()
         if binding and binding['last_error']:
             issues.append(dict(code='channel_error',error=binding['last_error']))
         if binding and not any(s['status']=='active' and (s['refresh_before'] is None or s['refresh_before']>now) for s in subscriptions(store)):
@@ -89,9 +94,18 @@ class HealthMonitor:
             # Unlike cc-connect, this bridge does not own the agent event loop.
             if not mid or item['code'] not in {'reply_failed', 'reply_context_required', 'reply_auth_required'}:
                 continue
+            # Respect the channel's explicit flood-control response: another
+            # status message would only add pressure to the same rate limit.
+            # This failure remains visible in diagnostics and send status.
+            if item.get('error') == 'rate_limited':
+                continue
             with self.store.lock:
                 message=self.store.db.execute('SELECT created_at FROM messages WHERE id=?',(mid,)).fetchone()
                 if not message or now-message[0]>86400:
+                    continue
+                # A historical different failure for this message must not
+                # bypass the rate-limit guard on a more recent failed reply.
+                if self.store.db.execute("SELECT 1 FROM replies WHERE message_id=? AND is_notice=0 AND status='failed' AND error='rate_limited'", (mid,)).fetchone():
                     continue
                 # At most one notice per inbound message, persisted across restarts.
                 if self.store.db.execute('SELECT 1 FROM replies WHERE message_id=? AND is_notice=1',(mid,)).fetchone():

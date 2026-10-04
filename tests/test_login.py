@@ -217,34 +217,30 @@ class LoginProtocolTests(unittest.TestCase):
             self.assertEqual(parse_qs(urlsplit(path).query), {"qrcode": ["fixture&private=qr"], "verify_code": ["1234"]})
 
     def test_login_request_has_no_existing_authorization_token(self):
+        from wechat_dot_bridge.net_transport import NetworkResponse
         for method in ["POST", "GET"]:
-            connection = Mock()
-            connection.getresponse.return_value = Mock(status=200)
-            connection.getresponse.return_value.read.return_value = b'{"status":"wait"}'
             with patch("wechat_dot_bridge.login._resolve_public", return_value="8.8.8.8"), \
-                 patch("wechat_dot_bridge.login._PinnedHTTPSConnection", return_value=connection):
+                 patch("wechat_dot_bridge.login.request", return_value=NetworkResponse(200, b'{"status":"wait"}', ())) as request:
                 LoginClient()._request("https://ilinkai.weixin.qq.com", method, "/fixture", {"local_token_list": []})
-            headers = connection.request.call_args.kwargs["headers"]
+            headers = request.call_args.args[5]
             self.assertNotIn("Authorization", headers)
             if method == "GET":
                 self.assertNotIn("AuthorizationType", headers)
                 self.assertNotIn("X-WECHAT-UIN", headers)
-            connection.close.assert_called_once()
+            request.assert_called_once()
 
     def test_http_redirect_never_followed_and_errors_never_include_response(self):
+        from wechat_dot_bridge.net_transport import NetworkResponse
         for status, raw, expected in [(302, b"", "endpoint_rejected"),
                                       (500, b"fixture-private-token", "http_error"),
                                       (200, b"fixture-private-invalid-json", "invalid_login_response")]:
-            connection = Mock()
-            connection.getresponse.return_value = Mock(status=status)
-            connection.getresponse.return_value.read.return_value = raw
             with patch("wechat_dot_bridge.login._resolve_public", return_value="8.8.8.8"), \
-                 patch("wechat_dot_bridge.login._PinnedHTTPSConnection", return_value=connection):
+                 patch("wechat_dot_bridge.login.request", return_value=NetworkResponse(status, raw, ())) as request:
                 with self.assertRaises(BridgeError) as caught:
                     LoginClient().start_login()
             self.assertEqual(str(caught.exception), expected)
             self.assertNotIn("fixture-private", str(caught.exception))
-            self.assertEqual(connection.request.call_count, 1)
+            request.assert_called_once()
 
 
 if __name__ == "__main__":

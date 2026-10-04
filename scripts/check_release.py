@@ -29,6 +29,8 @@ def inspect_packages(directory):
     with zipfile.ZipFile(wheels[0]) as package:
         names = package.namelist()
         required = ("wechat_dot_bridge/migrations.py", "wechat_dot_bridge/maintenance.py",
+                    "wechat_dot_bridge/sdk_adapter.py", "wechat_dot_bridge/net_transport.py",
+                    "wechat_dot_bridge/lifecycle.py", "wechat_dot_bridge/webhook_signing.py",
                     "wechat_dot_bridge/codecs/markdown-filter.ts", "wechat_dot_bridge/codecs/audio.mjs")
         if any(name not in names for name in required):
             raise ValueError("package_resource_missing")
@@ -41,7 +43,7 @@ def inspect_packages(directory):
     with tarfile.open(sources[0]) as package:
         source_names = package.getnames()
         for document in ("README.md", "CONTRIBUTING.md", "SECURITY.md", "CHANGELOG.md",
-                         "scripts/check_release.py", "scripts/scan_secrets.py", "docs/OPERATIONS.md"):
+                         "scripts/check_release.py", "scripts/scan_secrets.py", "docs/OPERATIONS.md", "uv.lock"):
             if not any(name.endswith("/" + document) for name in source_names):
                 raise ValueError("source_document_missing")
     forbidden = re.compile(r"(?:^|/)(?:node_modules|\.git|runtime|state|secrets)(?:/|$)|\.(?:sqlite\w*|db|key|pem)$|(?:^|/)\.env(?:\.|$)")
@@ -67,6 +69,8 @@ def main(argv=None):
         if int(setuptools_version.split(".")[0]) < 77:
             raise ValueError("build_dependency_missing")
         commands = (
+            ("lock", ["uv", "lock", "--check"]),
+            ("lint", [sys.executable, "-m", "ruff", "check", "wechat_dot_bridge", "scripts", "tests"]),
             ("syntax", [sys.executable, "-m", "compileall", "-q", "wechat_dot_bridge", "scripts", "tests"]),
             ("tests", [sys.executable, "-m", "unittest", "discover", "-s", "tests", "-v"]),
             ("upgrade", [sys.executable, "scripts/verify-upgrade.py", "--old-revision", args.old_revision]),

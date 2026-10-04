@@ -12,65 +12,13 @@ import unittest
 from unittest.mock import Mock, patch
 
 from wechat_dot_bridge.errors import BridgeError
-from wechat_dot_bridge.events import Events, _PinnedHTTPSConnection, _https_request, secure_post
+from wechat_dot_bridge.events import Events, _https_request, secure_post
+from wechat_dot_bridge.net_transport import PinnedRequest
 from wechat_dot_bridge.mcp import MCPServer
 from wechat_dot_bridge.store import Store
 
 
-class FakeTimer:
-    instances = []
-
-    def __init__(self, interval, callback):
-        self.interval, self.callback = interval, callback
-        self.daemon = False
-        self.cancelled = False
-        self.instances.append(self)
-
-    def start(self):
-        pass
-
-    def cancel(self):
-        self.cancelled = True
-
-    def fire(self):
-        self.callback()
-
-
-class FakeSocket:
-    def __init__(self, response=b"HTTP/1.1 200 Connection established\r\n\r\n"):
-        self.response = response
-        self.connected = []
-        self.sent = []
-        self.timeouts = []
-        self.closed = False
-        self.shutdowns = []
-        self.on_handshake = None
-
-    def connect(self, address):
-        self.connected.append(address)
-
-    def settimeout(self, timeout):
-        self.timeouts.append(timeout)
-
-    def sendall(self, value):
-        if self.closed:
-            raise OSError("fixture closed socket")
-        self.sent.append(bytes(value))
-
-    def makefile(self, *args, **kwargs):
-        return io.BytesIO(self.response)
-
-    def do_handshake(self):
-        if self.on_handshake:
-            self.on_handshake()
-        if self.closed:
-            raise OSError("fixture expired handshake")
-
-    def shutdown(self, how):
-        self.shutdowns.append(how)
-
-    def close(self):
-        self.closed = True
+from network_fixtures import FakeSocket, FakeTimer
 
 
 class CallbackWireSecurityTests(unittest.TestCase):
@@ -91,17 +39,17 @@ class CallbackWireSecurityTests(unittest.TestCase):
 
     @contextlib.contextmanager
     def network(self):
-        with patch("wechat_dot_bridge.events.socket.socket", return_value=self.raw) as factory, \
-                patch("wechat_dot_bridge.events.socket.getaddrinfo", side_effect=AssertionError("unexpected real DNS")), \
-                patch("wechat_dot_bridge.events.ssl.create_default_context", return_value=self.context), \
-                patch("wechat_dot_bridge.events.threading.Timer", FakeTimer):
+        with patch("wechat_dot_bridge.net_transport.socket.socket", return_value=self.raw) as factory, \
+                patch("wechat_dot_bridge.net_transport.socket.getaddrinfo", side_effect=AssertionError("unexpected real DNS")), \
+                patch("wechat_dot_bridge.net_transport.ssl.create_default_context", return_value=self.context), \
+                patch("wechat_dot_bridge.net_transport.threading.Timer", FakeTimer):
             yield factory
 
     def request(self, proxy=PROXY):
         return _https_request(self.HOST, self.addresses, "POST", self.PRIVATE_ROUTE,
                               self.PRIVATE_BODY, self.headers, proxy=proxy)
 
-    def test_real_http_client_connect_and_application_bytes_use_separate_hosts(self):
+    def test_real_httpcore_connect_and_application_bytes_use_separate_hosts(self):
         with self.network() as factory:
             self.assertEqual(self.request(), (204, b""))
         factory.assert_called_once_with(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP)
@@ -129,12 +77,21 @@ class CallbackWireSecurityTests(unittest.TestCase):
         self.assertFalse(self.raw.sent)
 
     def test_default_tls_keeps_certificate_and_hostname_verification(self):
-        connection = _PinnedHTTPSConnection(self.HOST, self.addresses, proxy=self.PROXY)
-        try:
-            self.assertEqual(connection._context.verify_mode, ssl.CERT_REQUIRED)
-            self.assertTrue(connection._context.check_hostname)
-        finally:
-            connection.close()
+        captured = []
+        from wechat_dot_bridge.net_transport import ssl as network_ssl
+        actual = network_ssl.create_default_context
+
+        def context():
+            value = actual()
+            captured.append(value)
+            return value
+
+        with patch("wechat_dot_bridge.net_transport.ssl.create_default_context", side_effect=context), \
+                patch("wechat_dot_bridge.net_transport.socket.socket", side_effect=OSError("fixture")):
+            with self.assertRaises(BridgeError):
+                self.request()
+        self.assertEqual(captured[0].verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(captured[0].check_hostname)
 
     def test_timer_closes_published_tls_socket_during_handshake_before_post(self):
         self.tls.on_handshake = lambda: FakeTimer.instances[-1].fire()

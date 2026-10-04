@@ -113,6 +113,32 @@ class TypingTests(unittest.TestCase):
         self.assertEqual(self.client.send_typing.call_args.args[-1], 1)
         self.assertIsNone(self.indicator.status()['last_error'])
 
+    def test_prewarm_does_not_show_typing_and_read_uses_cached_ticket(self):
+        self.indicator.prewarm()
+        self.client.typing_ticket.assert_called_once()
+        self.client.send_typing.assert_not_called()
+        self.assertEqual(self.store.work_status(self.mid)['state'], 'waiting')
+        self.indicator.begin(self.mid)
+        self.indicator.prewarm()
+        self.indicator.tick()
+        self.client.typing_ticket.assert_called_once()
+        self.assertEqual(self.client.send_typing.call_args.args[-1], 1)
+
+    def test_prewarm_failure_backoff_survives_idle_ticks_and_active_work(self):
+        self.client.typing_ticket.side_effect = RuntimeError('PRIVATE')
+        for at, expected_calls in ((0, 1), (1, 1), (4, 1), (5, 2), (14, 2), (15, 3)):
+            self.now = at
+            self.indicator.prewarm()
+            self.indicator.tick()
+            self.assertEqual(self.client.typing_ticket.call_count, expected_calls)
+        self.indicator.begin(self.mid)
+        self.indicator.tick()
+        previous = self.client.typing_ticket.call_count
+        self.now += 1
+        self.indicator.prewarm()
+        self.indicator.tick()
+        self.assertEqual(self.client.typing_ticket.call_count, previous)
+
     def test_persistent_failures_back_off_and_new_work_starts_immediately_after_idle(self):
         self.client.typing_ticket.side_effect = RuntimeError('PRIVATE')
         self.indicator.begin(self.mid)

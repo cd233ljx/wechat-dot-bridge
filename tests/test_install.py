@@ -53,6 +53,7 @@ class InstallTests(unittest.TestCase):
                      self.units / "wechat-dot-bridge.service"):
             self.assertEqual(file.stat().st_mode & 0o777, 0o600)
         self.assertEqual((self.bin / "wechat-dot-bridge").stat().st_mode & 0o777, 0o755)
+        self.assertIn(str(ROOT / '.venv/bin/python'), (self.bin / 'wechat-dot-bridge').read_text())
         self.assertFalse(result["started"])
         self.assertFalse(result["enabled"])
 

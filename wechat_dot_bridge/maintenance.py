@@ -92,7 +92,7 @@ def _candidates(store, cutoff):
         event_filter = """AND NOT EXISTS (SELECT 1 FROM deliveries d
             WHERE d.message_id=m.id AND d.status IN ('pending','retry','sending'))"""
     rows = store.db.execute("""SELECT m.id FROM messages m
-        WHERE m.state IN ('replied','reply_committed') AND m.created_at<?
+        WHERE EXISTS (SELECT 1 FROM message_work w WHERE w.message_id=m.id AND w.state='completed') AND m.created_at<?
         AND m.rowid!=(SELECT max(rowid) FROM messages)
         AND m.id NOT IN (SELECT id FROM messages c WHERE c.context_token IS NOT NULL
             AND c.rowid=(SELECT rowid FROM messages c2 WHERE c2.account=c.account

@@ -164,7 +164,7 @@ class AttachmentStore:
             self.db.execute("DELETE FROM attachment_uploads WHERE updated<?", (self.clock()-upload_hours*3600,))
             changed = self.db.execute("""UPDATE attachments SET data=NULL,status='expired',error=NULL
                 WHERE status='ready' AND created_at<?
-                AND NOT EXISTS(SELECT 1 FROM messages m WHERE m.state='pending' AND
+                AND NOT EXISTS(SELECT 1 FROM messages m JOIN message_work w ON w.message_id=m.id WHERE w.state!='completed' AND
                     (m.id=attachments.message_id OR EXISTS(SELECT 1 FROM attachment_links l WHERE l.message_id=m.id AND l.attachment_id=attachments.id)))
                 AND NOT EXISTS(SELECT 1 FROM replies r WHERE r.attachment_id=attachments.id
                     AND r.status IN ('queued','sending','uncertain','context_required','auth_required'))""", (self.clock()-retention_days*86400,)).rowcount

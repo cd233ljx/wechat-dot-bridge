@@ -13,11 +13,14 @@ class TypingIndicator:
         self.clock = clock
         self.lock = threading.Lock()
         self.leases = {}
+        self.lease_versions = {}
         self.ticket = None
         self.ticket_key = None
         self.ticket_until = 0
         self.active = None
         self.next_send = 0
+        self.warm_after = 0
+        self.warm_failures = 0
         self.closed = False
         self.failures = 0
         self.outcomes = {}
@@ -47,18 +50,61 @@ class TypingIndicator:
             ids = [] if self.closed else list(self.leases)
         return self.store.typing_target(ids)
 
+    def sync(self, message_id):
+        # The durable run is the source of truth. Replaying a deduplicated
+        # progress reply cannot create a new in-memory lease.
+        for mid in self.store.work_members(message_id):
+            value = self.store.work_status(mid)
+            with self.lock:
+                if not self.closed and value and value['state'] == 'active':
+                    version = (value['processing_id'], value['revision'], value['expires_at'])
+                    if self.lease_versions.get(mid) != version:
+                        remaining = max(0, value['expires_at'] - self.store.clock())
+                        self.leases[mid] = self.clock() + remaining
+                        self.lease_versions[mid] = version
+                else:
+                    self.leases.pop(mid, None)
+                    self.lease_versions.pop(mid, None)
+
     def begin(self, message_id):
-        # No network on the MCP thread. Repeated reads cannot extend a lease.
-        with self.lock:
-            if not self.closed and len(self.leases) < 128:
-                self.leases.setdefault(message_id, self.clock() + 300)
+        from .errors import BridgeError
+        try:
+            self.store.begin_work(message_id)
+            self.sync(message_id)
+        except BridgeError:
+            return
 
     def progress(self, message_id, active=True):
-        with self.lock:
-            if active and not self.closed:
-                self.leases[message_id] = self.clock() + 300
-            else:
-                self.leases.pop(message_id, None)
+        self.store.report_progress(message_id, active)
+        self.sync(message_id)
+
+    def prewarm(self):
+        # Incoming context only warms a cached ticket. It never shows typing
+        # before dot has actually read a message and claimed processing.
+        if self.closed or self._target() is not None:
+            return
+        binding = self.store.get_binding()
+        if not binding or not binding['enabled'] or binding['status'] != 'ready':
+            return
+        with self.store.lock:
+            context = self.store._latest_context(binding)
+        if not context:
+            return
+        now = self.clock()
+        key = (binding['id'], binding['owner'], binding['base_url'])
+        if self.ticket_key == key and now < self.ticket_until:
+            return
+        if now < self.warm_after:
+            return
+        try:
+            self.ticket = self.client.typing_ticket(binding, context['context_token'])
+            self.ticket_key, self.ticket_until = key, self.clock() + 600
+            self.warm_failures = 0
+            self._observe('ticket_ok')
+        except Exception:
+            self._observe('ticket_failed')
+            self.warm_failures = min(self.warm_failures + 1, 4)
+            self.warm_after = self.clock() + min(30, 5 * 2 ** (self.warm_failures - 1))
 
     def _cancel(self):
         active, self.active = self.active, None
@@ -110,4 +156,5 @@ class TypingIndicator:
         with self.lock:
             self.closed = True
             self.leases.clear()
+            self.lease_versions.clear()
         self._cancel()

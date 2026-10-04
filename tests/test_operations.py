@@ -67,6 +67,31 @@ class OperationsTests(unittest.TestCase):
         self.assertIsNone(self.store.claim_send())
         self.assertEqual(self.store.send_status(self.mid)['status'],'uncertain')
 
+    def test_rate_limited_reply_remains_diagnostic_without_extra_notice(self):
+        self.store.queue_reply(self.mid, 'response')
+        reply = self.store.claim_send()
+        self.store.finish_send(self.mid, 'failed', 'rate_limited', reply_id=reply['reply_id'])
+        self.now += 601
+        for _ in range(3):
+            HealthMonitor(self.store).tick()
+            self.now += 31
+        self.assertIsNone(self.store.claim_send())
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM replies WHERE is_notice=1').fetchone()[0], 0)
+        self.assertIn({'message_id': self.mid, 'code': 'reply_failed', 'error': 'rate_limited'},
+                      diagnostics(self.store)['issues'])
+
+    def test_prior_other_failure_does_not_bypass_later_rate_limit(self):
+        self.store.queue_reply(self.mid, 'earlier response', reply_key='earlier')
+        first = self.store.claim_send()
+        self.store.finish_send(self.mid, 'failed', 'send_rejected', reply_id=first['reply_id'])
+        self.store.queue_reply(self.mid, 'later response', reply_key='later')
+        second = self.store.claim_send()
+        self.store.finish_send(self.mid, 'failed', 'rate_limited', reply_id=second['reply_id'])
+        self.now += 601
+        HealthMonitor(self.store).tick()
+        self.assertIsNone(self.store.claim_send())
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM replies WHERE is_notice=1').fetchone()[0], 0)
+
     def test_active_progress_suppresses_stall_notice(self):
         self.now+=301;self.store.report_progress(self.mid)
         HealthMonitor(self.store).tick()
@@ -104,17 +129,16 @@ class OperationsTests(unittest.TestCase):
             with self.assertRaisesRegex(BridgeError,'artifact_endpoint_rejected'):download('https://example.com/file?PRIVATE_SECRET')
 
     def test_https_import_revalidates_redirect_and_omits_auth(self):
-        first,second=Mock(),Mock()
-        first.getresponse.return_value.status=302
-        first.getresponse.return_value.getheader.return_value='https://cdn.example.com/file?PRIVATE_SECRET'
-        second.getresponse.return_value.status=200
-        second.getresponse.return_value.getheader.return_value='5'
-        second.getresponse.return_value.read.return_value=b'hello'
-        with patch('wechat_dot_bridge.events._public_addresses',return_value=['93.184.216.34']) as dns, patch('wechat_dot_bridge.events._PinnedHTTPSConnection',side_effect=[first,second]):
-            self.assertEqual(download('https://example.com/file'),b'hello')
-        self.assertEqual(dns.call_count,2)
-        self.assertEqual(second.request.call_args.kwargs['headers'],{'Host':'cdn.example.com'})
-        first.close.assert_called_once();second.close.assert_called_once()
+        from wechat_dot_bridge.net_transport import NetworkResponse
+        first = NetworkResponse(302, b'', ((b'location', b'https://cdn.example.com/file?PRIVATE_SECRET'),))
+        second = NetworkResponse(200, b'hello', ((b'content-length', b'5'),))
+        with patch('wechat_dot_bridge.events._public_addresses', return_value=[(2, 1, 6, ('93.184.216.34', 443))]) as dns, patch('wechat_dot_bridge.artifacts.request', side_effect=[first, second]) as request:
+            self.assertEqual(download('https://example.com/file'), b'hello')
+        self.assertEqual(dns.call_count, 2)
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(request.call_args.args[0], 'cdn.example.com')
+        self.assertEqual(request.call_args.args[5], {})
+        self.assertEqual(request.call_args.kwargs['body_statuses'], {200})
 
     def test_admin_cancel_does_not_modify_owner_messages(self):
         params={'name':'weixin.message','arguments':{},'delivery':{'mode':'webhook','url':'https://callback.example.com/private'}}

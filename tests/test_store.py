@@ -180,7 +180,10 @@ class StoreTests(unittest.TestCase):
         first = self.store.queue_reply(identifier, "已完成", "part1")
         second = self.store.queue_reply(identifier, "已完成", "part2")
         self.assertNotEqual(first["reply_id"], second["reply_id"])
-        self.assertEqual(self.store.queue_reply(identifier, "已完成", "part1"), first)
+        replay = self.store.queue_reply(identifier, "已完成", "part1")
+        self.assertEqual({k: v for k, v in replay.items() if k != 'work'},
+                         {k: v for k, v in first.items() if k != 'work'})
+        self.assertEqual(replay['work'], self.store.work_status(identifier))
 
     def test_migration_preserves_legacy_accepted_reply_and_allows_append(self):
         identifier = self.add()

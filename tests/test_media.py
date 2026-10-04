@@ -178,20 +178,16 @@ class MediaTests(unittest.TestCase):
 
     def test_cdn_proxy_keeps_pinned_host_and_never_sends_weixin_auth(self):
         from wechat_dot_bridge.media import configure_network
+        from wechat_dot_bridge.net_transport import NetworkResponse
         configure_network('http://127.0.0.1:7890', 'google')
-        connection = Mock()
-        response = connection.getresponse.return_value
-        response.status = 200
-        response.read.return_value = b'fixture'
-        response.getheader.return_value = None
+        addresses = [(2, 1, 6, ('93.184.216.34', 443))]
         try:
-            with patch('wechat_dot_bridge.events._google_addresses', return_value=['fixture-ip']) as resolve, patch('wechat_dot_bridge.events._PinnedHTTPSConnection', return_value=connection) as factory:
+            with patch('wechat_dot_bridge.events._google_addresses', return_value=addresses) as resolve, patch('wechat_dot_bridge.media.request', return_value=NetworkResponse(200, b'fixture', ())) as request:
                 self.assertEqual(cdn_request(CDN_BASE + '/download?encrypted_query_param=fixture')[0], b'fixture')
                 resolve.assert_called_once_with('novac2c.cdn.weixin.qq.com', 'http://127.0.0.1:7890')
-                factory.assert_called_once_with('novac2c.cdn.weixin.qq.com', ['fixture-ip'], 'http://127.0.0.1:7890')
-                headers = connection.request.call_args.kwargs['headers']
-                self.assertNotIn('Authorization', headers)
-                self.assertEqual(headers['Host'], 'novac2c.cdn.weixin.qq.com')
+                self.assertEqual(request.call_args.args[:3], ('novac2c.cdn.weixin.qq.com', addresses, 'GET'))
+                self.assertEqual(request.call_args.kwargs['proxy'], 'http://127.0.0.1:7890')
+                self.assertNotIn('Authorization', request.call_args.args[5])
         finally:
             configure_network()
 
@@ -199,7 +195,7 @@ class MediaTests(unittest.TestCase):
         client = Mock()
         client._post.return_value = {"upload_param": "fixture"}
         attachment = {"data": self.data, "kind": "image", "name": "fixture.png"}
-        with patch("wechat_dot_bridge.media.cdn_request", side_effect=[BridgeError("media_http_error"), (b"", "fixture")]) as upload, patch("wechat_dot_bridge.media.time.sleep"):
+        with patch("wechat_dot_bridge.media.cdn_request", side_effect=[BridgeError("media_http_error"), (b"", "fixture")]) as upload, patch("wechat_dot_bridge.media.wait_for_retry"):
             self.assertEqual(upload_item(client, self.binding, attachment)["type"], 2)
             self.assertEqual(upload.call_count, 2)
         with patch("wechat_dot_bridge.media.cdn_request", side_effect=BridgeError("media_http_rejected")) as upload:

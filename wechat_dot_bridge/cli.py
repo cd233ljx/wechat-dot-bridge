@@ -10,7 +10,7 @@ import re
 import signal
 import stat
 import sys
-import threading
+import anyio
 
 from .errors import BridgeError
 from .store import Store
@@ -110,15 +110,67 @@ def load_config(args):
     return Path(state).absolute(), hosts, Path(locks).absolute(), proxy, dns, media_proxy, media_dns
 
 
-def rpc_error(code, message):
-    return {"jsonrpc": "2.0", "id": None, "error": {"code": code, "message": message}}
+async def _run_runtime(store, server, weixin, events, media, monitor, typing):
+    from .net_transport import cancel_all, reset_cancellation
+    from .sdk_adapter import run_stdio
+    from .maintenance import maintain
+
+    reset_cancellation()
+
+    async def worker(name, function, interval=0.5):
+        delay = interval
+        while True:
+            await anyio.sleep(delay)
+            try:
+                # AnyIO waits for bounded calls to finish on cancellation. The
+                # store and process locks stay open until all writers finish.
+                result = await anyio.to_thread.run_sync(function)
+                delay = min(30, max(1, delay * 2)) if name == "poll" and not result else interval
+            except Exception:
+                if name not in ("typing", "cache"):
+                    try:
+                        if store.get_binding():
+                            store.record_error(name + "_failed")
+                    except Exception:
+                        pass
+
+    def presence():
+        typing.prewarm()
+        typing.tick()
+
+    try:
+        async with anyio.create_task_group() as tasks:
+            async def signals():
+                with anyio.open_signal_receiver(signal.SIGTERM, signal.SIGINT) as receiver:
+                    async for _ in receiver:
+                        cancel_all()
+                        weixin.client.cancel()
+                        tasks.cancel_scope.cancel()
+                        break
+
+            tasks.start_soon(signals)
+            for name, function in (("poll", weixin.poll_once), ("send", weixin.send_once),
+                                   ("event", events.deliver_once), ("media", media.tick),
+                                   ("monitor", monitor.tick), ("typing", presence)):
+                tasks.start_soon(worker, name, function)
+            tasks.start_soon(worker, "cache", lambda: maintain(store), 3600)
+            try:
+                await run_stdio(server)
+            finally:
+                # EOF and signals share the same shutdown path. A claimed send
+                # finishes before the store closes; interruption stays uncertain.
+                cancel_all()
+                weixin.client.cancel()
+                tasks.cancel_scope.cancel()
+    finally:
+        # Protocol failures also release presence after every writer has exited.
+        # Shield this cleanup from cancellation inherited from the caller.
+        with anyio.CancelScope(shield=True):
+            await anyio.to_thread.run_sync(typing.close)
 
 
 def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="system", media_proxy=None, media_dns="system"):
     locks = []
-    stop = threading.Event()
-    threads = []
-    old_handlers = {}
     try:
         locks.append(acquire_lock(state_dir / "worker.lock"))
         binding = store.get_binding()
@@ -126,6 +178,7 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
             identity = hashlib.sha256(binding["id"].encode()).hexdigest()
             locks.append(acquire_lock(lock_dir / ("account-" + identity + ".lock")))
         store.recover_inflight()
+        store.recover_work()
         events = Events(store, allowed_hosts=hosts, proxy=callback_proxy, dns=callback_dns)
         typing = TypingIndicator(store)
         server = MCPServer(store, events, typing=typing)
@@ -135,90 +188,9 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
         media = MediaWorker(store)
         from .operations import HealthMonitor
         monitor = HealthMonitor(store)
-
-        def run_worker(name, function):
-            delay = 0.5
-            while not stop.wait(delay):
-                try:
-                    result = function()
-                    delay = min(30, max(1, delay * 2)) if name == "poll" and not result else 0.5
-                except Exception:
-                    # Never print network exceptions, request bodies or credentials.
-                    try:
-                        if store.get_binding():
-                            store.record_error(name + "_failed")
-                    except Exception:
-                        pass
-
-        for name, function in (("poll", weixin.poll_once), ("send", weixin.send_once), ("event", events.deliver_once), ("media", media.tick), ("monitor", monitor.tick)):
-            thread = threading.Thread(target=run_worker, args=(name, function), daemon=True, name=name)
-            thread.start()
-            threads.append(thread)
-
-        def maintain_cache():
-            while not stop.wait(3600):
-                try:
-                    from .maintenance import maintain
-                    maintain(store)
-                except Exception:
-                    pass
-
-        thread = threading.Thread(target=maintain_cache, daemon=True, name="cache")
-        thread.start()
-        threads.append(thread)
-
-        def run_typing():
-            try:
-                while not stop.wait(0.5):
-                    try:
-                        typing.tick()
-                    except Exception:
-                        pass
-            finally:
-                typing.close()
-
-        thread = threading.Thread(target=run_typing, daemon=True, name="typing")
-        thread.start()
-        threads.append(thread)
-
-        def terminate(signum, frame):
-            stop.set()
-            raise SystemExit(0)
-
-        for signum in (signal.SIGTERM, signal.SIGINT):
-            old_handlers[signum] = signal.signal(signum, terminate)
-
-        while True:
-            line = sys.stdin.buffer.readline(MAX_RPC_BYTES + 1)
-            if not line:
-                break
-            if len(line) > MAX_RPC_BYTES:
-                while line and not line.endswith(b"\n"):
-                    line = sys.stdin.buffer.readline(MAX_RPC_BYTES + 1)
-                response = rpc_error(-32600, "request_too_large")
-            else:
-                try:
-                    request = json.loads(line)
-                    response = server.handle(request)
-                except (ValueError, UnicodeError):
-                    response = rpc_error(-32700, "parse_error")
-                except Exception:
-                    response = rpc_error(-32603, "internal_error")
-            if response is not None:
-                sys.stdout.write(canonical(response) + "\n")
-                sys.stdout.flush()
+        anyio.run(_run_runtime, store, server, weixin, events, media, monitor, typing)
     finally:
-        stop.set()
-        if "weixin" in locals():
-            weixin.client.cancel()
-        for thread in threads:
-            thread.join(timeout=1)
-        for signum, handler in old_handlers.items():
-            signal.signal(signum, handler)
-        # A still-running bounded network thread is terminated with the process;
-        # do not close its SQLite connection while it might finish a transaction.
-        if not any(thread.is_alive() for thread in threads):
-            store.close()
+        store.close()
         for lock in reversed(locks):
             lock.close()
 

@@ -4,17 +4,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
-import http.client
-import ipaddress
 import json
 import math
 import os
 from pathlib import Path
-import queue
 import re
 import secrets
 import socket
-import ssl
 import stat
 import threading
 import time
@@ -22,6 +18,7 @@ import tomllib
 from urllib.parse import urlsplit
 
 from .errors import BridgeError
+from .net_transport import DNS_SLOTS, NetworkFailure, PinnedRequest, resolve_public_addresses
 
 
 DEFAULT_BASE_URL = "https://ilinkai.weixin.qq.com"
@@ -31,7 +28,7 @@ MAX_TEXT_BYTES = 8192
 MAX_CONTEXT_BYTES = 16384
 MAX_CURSOR_BYTES = 65536
 DNS_TIMEOUT_SECONDS = 10.0
-_DNS_SLOTS = threading.BoundedSemaphore(4)
+_DNS_SLOTS = DNS_SLOTS
 _ID = re.compile(r"[A-Za-z0-9@._-]{1,128}\Z")
 _OWNER = re.compile(r"[A-Za-z0-9@._+-]{1,256}\Z")
 
@@ -85,71 +82,17 @@ def _endpoint(base_url: str) -> tuple[str, str]:
 
 
 def _resolve_public(host: str) -> str:
-    """Resolve once per connection and reject a DNS answer with any private IP."""
-    # libc getaddrinfo has no per-call Python timeout. Keep no more than four
-    # outstanding daemon resolvers; timed-out callers never join a stuck DNS
-    # thread or create an unbounded number of replacements.
-    slots = _DNS_SLOTS
-    if not slots.acquire(blocking=False):
-        raise BridgeError("dns_rejected")
-    resolved = queue.Queue(maxsize=1)
-
-    def resolve():
-        try:
-            answers = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM, proto=socket.IPPROTO_TCP)
-            resolved.put((True, answers))
-        except Exception:
-            resolved.put((False, None))
-        finally:
-            slots.release()
-
+    """Shared bounded DNS validates every answer before selecting an address."""
     try:
-        threading.Thread(target=resolve, name="weixin-dns", daemon=True).start()
-    except (RuntimeError, OSError):
-        slots.release()
-        raise BridgeError("dns_rejected") from None
-    try:
-        succeeded, answers = resolved.get(timeout=DNS_TIMEOUT_SECONDS)
-    except queue.Empty:
-        raise BridgeError("network_timeout") from None
-    if not succeeded:
-        raise BridgeError("dns_rejected")
-    try:
-        if not isinstance(answers, (list, tuple)) or not 0 < len(answers) <= 16:
-            raise ValueError("invalid answer count")
-        addresses = []
-        for family, _kind, _protocol, _name, address in answers:
-            if family not in (socket.AF_INET, socket.AF_INET6):
-                raise ValueError("unsupported address")
-            parsed = ipaddress.ip_address(address[0])
-            if not parsed.is_global or parsed.is_multicast or parsed.is_reserved or parsed.is_unspecified:
-                raise ValueError("nonpublic address")
-            if parsed.version == 6 and (parsed.ipv4_mapped is not None or parsed.is_site_local
-                                       or parsed.sixtofour is not None or parsed.teredo is not None):
-                raise ValueError("mapped address")
-            if str(parsed) not in addresses:
-                addresses.append(str(parsed))
-        if not addresses:
-            raise ValueError("no addresses")
-        return addresses[0]
-    except (OSError, ValueError, TypeError, IndexError, OverflowError):
-        raise BridgeError("dns_rejected") from None
+        return resolve_public_addresses(host, DNS_TIMEOUT_SECONDS, _DNS_SLOTS)[0][3][0]
+    except NetworkFailure as error:
+        category = {"timeout": "network_timeout", "cancelled": "network_cancelled"}.get(error.category, "dns_rejected")
+        raise BridgeError(category) from None
 
 
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    def __init__(self, host: str, address: str, timeout: float):
-        super().__init__(host, port=443, timeout=timeout, context=ssl.create_default_context())
-        self._pinned_address = address
-
-    def connect(self):
-        # Connect to the validated IP without resolving the hostname again. The
-        # original hostname remains the TLS identity, SNI and HTTP Host header.
-        raw_socket = socket.create_connection((self._pinned_address, 443), self.timeout)
-        try:
-            self.sock = self._context.wrap_socket(raw_socket, server_hostname=self.host)
-        except BaseException:
-            raw_socket.close()
-            raise
+def _pinned_address(address):
+    family = socket.AF_INET6 if ":" in address else socket.AF_INET
+    return [(family, socket.SOCK_STREAM, socket.IPPROTO_TCP, (address, 443))]
 
 
 def _checked_string(value, maximum, error="binding_invalid") -> str:
@@ -190,12 +133,7 @@ class IlinkClient:
         with self.connection_lock:
             connections = list(self.connections)
         for connection in connections:
-            try:
-                if connection.sock:
-                    connection.sock.shutdown(socket.SHUT_RDWR)
-                connection.close()
-            except OSError:
-                pass
+            connection.cancel()
 
     def _post(self, binding: dict, path: str, body: dict, timeout: float, allow_empty=False) -> dict:
         binding = _binding(binding)
@@ -212,11 +150,10 @@ class IlinkClient:
                 "iLink-App-Id": "bot",
                 "iLink-App-ClientVersion": "256",
             }
-            connection = _PinnedHTTPSConnection(host, address, timeout)
+            connection = PinnedRequest(host, _pinned_address(address), timeout)
             with self.connection_lock:
                 self.connections.add(connection)
-            connection.request("POST", path, body=encoded, headers=headers)
-            response = connection.getresponse()
+            response = connection.execute("POST", path, encoded, headers, MAX_RESPONSE_BYTES, {200})
             if response.status in (401, 403):
                 raise BridgeError("auth_required")
             if 300 <= response.status < 400:
@@ -225,24 +162,19 @@ class IlinkClient:
                 raise BridgeError("rate_limited")
             if response.status != 200:
                 raise BridgeError("http_error")
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
-            if len(raw) > MAX_RESPONSE_BYTES:
-                raise BridgeError("response_too_large")
+            raw = response.body
             return {} if allow_empty and not raw.strip() else _json_object(raw)
         except BridgeError:
             raise
-        except (TimeoutError, socket.timeout):
-            raise BridgeError("network_timeout") from None
-        except (OSError, http.client.HTTPException, ValueError, UnicodeError, RecursionError):
+        except NetworkFailure as error:
+            category = {"timeout": "network_timeout", "response_too_large": "response_too_large", "cancelled": "network_cancelled"}.get(error.category, "network_error")
+            raise BridgeError(category) from None
+        except (ValueError, UnicodeError, RecursionError):
             raise BridgeError("network_error") from None
         finally:
             if connection is not None:
                 with self.connection_lock:
                     self.connections.discard(connection)
-                try:
-                    connection.close()
-                except OSError:
-                    pass
 
     @staticmethod
     def _base_info() -> dict:

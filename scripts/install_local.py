@@ -116,6 +116,9 @@ def prepare(config_dir, state_dir, bin_dir, unit_dir, source_dir, tunnel_bin, tu
             raise ValueError("target_exists")
     if not (source_dir / "wechat_dot_bridge/__main__.py").is_file() or not tunnel_bin.is_file():
         raise ValueError("missing_program")
+    runtime_python = source_dir / '.venv/bin/python'
+    if not (source_dir / 'uv.lock').is_file() or not runtime_python.is_file():
+        raise ValueError('locked_runtime_missing')
     if proxy is not None:
         if (not re.fullmatch(r"http://127\.0\.0\.1:[0-9]{1,5}", proxy)
                 or not 1 <= int(proxy.rsplit(":", 1)[1]) <= 65535):
@@ -124,7 +127,7 @@ def prepare(config_dir, state_dir, bin_dir, unit_dir, source_dir, tunnel_bin, tu
     for path, private in directories.items():
         validate_directory(path, private)
     wrapper_text = ("#!/bin/sh\ncd " + shlex.quote(str(source_dir)) + " || exit 1\nexec " +
-                    shlex.quote(sys.executable) + " -m wechat_dot_bridge \"$@\"\n")
+                    shlex.quote(str(runtime_python)) + " -m wechat_dot_bridge \"$@\"\n")
     config_text = json.dumps({"state_dir": str(state_dir), "callback_hosts": []}, indent=2) + "\n"
     command = shlex.join([str(wrapper), "--config", str(bridge_config), "serve"])
     yaml = ("config_version: 1\ncontrol_plane:\n  base_url: \"https://api.openai.com\"\n  tunnel_id: " +

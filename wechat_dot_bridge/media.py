@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from PIL import Image
 
 from .errors import BridgeError
+from .net_transport import NetworkFailure, request, cancellation_token, wait_for_retry
 
 CDN_HOST = "novac2c.cdn.weixin.qq.com"
 CDN_BASE = "https://" + CDN_HOST + "/c2c"
@@ -89,59 +90,28 @@ def cdn_parts(url):
 
 
 def cdn_request(url, data=None):
-    # No WeChat bearer token, callback secret, environment proxy, or redirects.
-    from .events import _public_addresses
+    # Caller authorizes the exact CDN before shared DNS or connection I/O.
+    from .events import _public_addresses, _google_addresses
     p = cdn_parts(url)
     if data is not None and len(data) > MAX_MEDIA + 16:
         raise BridgeError("media_too_large")
-    # Upload needs a header returned by the CDN. Keep the same validated-IP,
-    # original TLS hostname and deadline policy as the callback transport.
-    from .events import _PinnedHTTPSConnection
-    from .events import _google_addresses
     try:
         addresses = _google_addresses(CDN_HOST, NETWORK_PROXY) if NETWORK_DNS == "google" else _public_addresses(CDN_HOST)
-        connection = _PinnedHTTPSConnection(CDN_HOST, addresses, NETWORK_PROXY)
-    except BridgeError:
-        raise BridgeError("media_network_failed") from None
-    expired = threading.Event()
-    connection._request_expired = expired
-
-    def abort():
-        import socket
-        expired.set()
-        if connection.sock:
-            try:
-                connection.sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            connection.sock.close()
-
-    timer = threading.Timer(30, abort)
-    timer.daemon = True
-    timer.start()
-    try:
-        connection.connect()
-        if expired.is_set():
-            raise BridgeError("media_timeout")
-        connection.request("POST" if data is not None else "GET", p.path + "?" + p.query,
-                           body=data, headers={"Host": CDN_HOST, "Content-Type": "application/octet-stream"})
-        response = connection.getresponse()
+        limit = MAX_MEDIA + 16 if data is None else 65536
+        response = request(CDN_HOST, addresses, "POST" if data is not None else "GET",
+                           p.path + ("?" + p.query if p.query else ""), data,
+                           {"Content-Type": "application/octet-stream"}, timeout=30,
+                           max_response=limit, proxy=NETWORK_PROXY, body_statuses={200})
         if response.status != 200:
             raise BridgeError("media_http_rejected" if 400 <= response.status < 500 else "media_http_error")
-        limit = MAX_MEDIA + 16 if data is None else 65536
-        body = response.read(limit + 1)
-        if len(body) > limit:
-            raise BridgeError("media_too_large")
-        if expired.is_set():
-            raise BridgeError("media_timeout")
-        return body, response.getheader("x-encrypted-param")
-    except BridgeError:
+        return response.body, response.header("x-encrypted-param")
+    except NetworkFailure as error:
+        category = {"timeout": "media_timeout", "response_too_large": "media_too_large", "cancelled": "media_cancelled"}.get(error.category, "media_network_failed")
+        raise BridgeError(category) from None
+    except BridgeError as error:
+        if error.code.startswith("callback_"):
+            raise BridgeError("media_network_failed") from None
         raise
-    except Exception:
-        raise BridgeError("media_network_failed") from None
-    finally:
-        timer.cancel()
-        connection.close()
 
 
 def descriptor(item):
@@ -233,7 +203,10 @@ def upload_item(client, binding, attachment):
         if not isinstance(param, str) or not param:
             raise BridgeError("media_upload_failed")
         url = CDN_BASE + "/upload?" + urlencode({"encrypted_query_param": param, "filekey": filekey})
+    retry_token = cancellation_token()
     for attempt in range(3):
+        if retry_token.is_set():
+            raise BridgeError("media_cancelled")
         try:
             _, download = cdn_request(url, encrypted)
             if not isinstance(download, str) or not 0 < len(download) <= 8192:
@@ -242,7 +215,10 @@ def upload_item(client, binding, attachment):
         except BridgeError as error:
             if error.code not in {"media_http_error", "media_timeout", "media_network_failed", "media_upload_failed"} or attempt == 2:
                 raise
-            time.sleep(2 ** attempt)
+            try:
+                wait_for_retry(2 ** attempt, retry_token)
+            except NetworkFailure:
+                raise BridgeError("media_cancelled") from None
     body = {"media": {"encrypt_query_param": download,
                       "aes_key": base64.b64encode(key.hex().encode()).decode(), "encrypt_type": 1}}
     if kind == "image":

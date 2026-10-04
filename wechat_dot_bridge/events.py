@@ -7,20 +7,19 @@ No user text or Weixin routing credential is placed in event payloads.
 import base64
 import hashlib
 import hmac
-import http.client
 import ipaddress
 import json
-import queue
 import re
 import secrets
 import socket
-import ssl
 import threading
 import time
 from datetime import datetime, timezone
 from urllib.parse import urlencode, urlsplit
 
 from .errors import BridgeError
+from .net_transport import DNS_SLOTS, NetworkFailure, proxy_port, public_ip, request, resolve_public_addresses
+from .webhook_signing import signed_headers
 
 EVENT_NAME = "weixin.message"
 MAX_BODY = 262144
@@ -36,30 +35,21 @@ NO_EXPIRATION = 0
 MAX_TTL_SECONDS = 86400
 NETWORK_TIMEOUT = 10
 DNS_TIMEOUT = 10
-_DNS_SLOTS = threading.BoundedSemaphore(4)
+_DNS_SLOTS = DNS_SLOTS
 
 
 def _proxy_port(proxy):
-    """Only an explicitly configured, literal IPv4 loopback HTTP proxy is valid."""
-    if proxy is None:
-        return None
-    if not isinstance(proxy, str):
-        raise BridgeError("invalid_callback_proxy")
-    matched = re.fullmatch(r"http://127\.0\.0\.1:([0-9]{1,5})", proxy)
-    if not matched or not 1 <= int(matched[1]) <= 65535:
-        raise BridgeError("invalid_callback_proxy")
-    return int(matched[1])
+    try:
+        return proxy_port(proxy)
+    except NetworkFailure:
+        raise BridgeError("invalid_callback_proxy") from None
 
 
 def _public_ip(value):
     try:
-        ip = ipaddress.ip_address(value)
-    except (ValueError, TypeError):
+        return public_ip(value)
+    except NetworkFailure:
         raise BridgeError("callback_dns_blocked") from None
-    embedded = isinstance(ip, ipaddress.IPv6Address) and (ip.ipv4_mapped or ip.sixtofour or ip.teredo)
-    if not ip.is_global or ip.is_multicast or ip.is_unspecified or ip.is_reserved or embedded:
-        raise BridgeError("callback_dns_blocked")
-    return ip
 
 
 def _json_bytes(value):
@@ -80,20 +70,6 @@ def _signing_key(secret):
     if not 24 <= len(decoded) <= 64:
         raise BridgeError("invalid_signing_secret")
     return decoded
-
-
-def signed_headers(event_id, body, secret, signed_at, subscription_id, old_secret=None):
-    """Standard Webhooks signs the exact bytes, with dual signatures on rotation."""
-    timestamp = str(int(signed_at))
-    signed = event_id.encode("ascii") + b"." + timestamp.encode("ascii") + b"." + body
-    signatures = []
-    for key in (secret, old_secret):
-        if key:
-            signature = hmac.new(_signing_key(key), signed, hashlib.sha256).digest()
-            signatures.append("v1," + base64.b64encode(signature).decode("ascii"))
-    return {"Content-Type": "application/json", "webhook-id": event_id,
-            "webhook-timestamp": timestamp, "webhook-signature": " ".join(signatures),
-            "X-MCP-Subscription-Id": subscription_id}
 
 
 def _callback_parts(url, allowed_hosts):
@@ -122,153 +98,27 @@ def _callback_parts(url, allowed_hosts):
 
 
 def _public_addresses(host):
-    # libc resolution has no Python timeout. A small bounded pool of daemon
-    # resolvers keeps the delivery worker responsive even if the resolver hangs.
-    if not _DNS_SLOTS.acquire(blocking=False):
-        raise BridgeError("callback_dns_failed")
-    resolved = queue.Queue(maxsize=1)
-
-    def resolve():
-        try:
-            resolved.put((True, socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)))
-        except Exception:
-            resolved.put((False, None))
-        finally:
-            _DNS_SLOTS.release()
-
-    threading.Thread(target=resolve, name="callback-dns", daemon=True).start()
     try:
-        ok, entries = resolved.get(timeout=DNS_TIMEOUT)
-    except queue.Empty:
-        raise BridgeError("callback_timeout") from None
-    if not ok:
-        raise BridgeError("callback_dns_failed") from None
-    addresses = []
-    for family, socktype, protocol, _, address in entries:
-        _public_ip(address[0])
-        entry = (family, socktype, protocol, address)
-        if entry not in addresses:
-            addresses.append(entry)
-    if not addresses or len(addresses) > 16:
-        raise BridgeError("callback_dns_failed")
-    return addresses
-
-
-class _PinnedHTTPSConnection(http.client.HTTPSConnection):
-    """Connect to a previously checked IP while verifying TLS against the hostname."""
-
-    def __init__(self, host, addresses, proxy=None):
-        super().__init__(host, 443, timeout=NETWORK_TIMEOUT, context=ssl.create_default_context())
-        self.addresses = addresses
-        self.proxy_port = _proxy_port(proxy)
-        self._request_expired = None
-
-    def connect(self):
-        deadline = time.monotonic() + NETWORK_TIMEOUT
-        for family, socktype, protocol, address in self.addresses:
-            ip = _public_ip(address[0])
-            raw = socket.socket(socket.AF_INET if self.proxy_port else family, socktype, protocol)
-            try:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError()
-                raw.settimeout(remaining)
-                if self.proxy_port is None:
-                    raw.connect(address)
-                else:
-                    # The proxy receives a numeric CONNECT target and therefore
-                    # cannot re-resolve the approved callback host. TLS remains
-                    # end-to-end and is verified against the original hostname.
-                    numeric = str(ip)
-                    target = "[" + numeric + "]" if ip.version == 6 else numeric
-                    self.set_tunnel(target, 443, headers={"Host": target + ":443"})
-                    raw.connect(("127.0.0.1", self.proxy_port))
-                    self.sock = raw
-                    try:
-                        self._tunnel()
-                    finally:
-                        # http.client otherwise emits the numeric tunnel target
-                        # as HTTP Host on the subsequent application request.
-                        self._tunnel_host = None
-                        self._tunnel_port = None
-                        self._tunnel_headers = {}
-                # Publish the TLS socket before the blocking handshake: wrapping
-                # detaches raw's descriptor, which would hide it from the timer.
-                self.sock = self._context.wrap_socket(raw, server_hostname=self.host,
-                                                     do_handshake_on_connect=False)
-                remaining = deadline - time.monotonic()
-                if remaining <= 0 or (self._request_expired is not None and self._request_expired.is_set()):
-                    raise TimeoutError()
-                self.sock.settimeout(remaining)
-                self.sock.do_handshake()
-                if (time.monotonic() >= deadline or
-                        (self._request_expired is not None and self._request_expired.is_set())):
-                    raise TimeoutError()
-                return
-            except ssl.SSLError:
-                self.close()
-                raw.close()
-                raise
-            except TimeoutError:
-                self.close()
-                raw.close()
-                raise
-            except OSError:
-                self.close()
-                raw.close()
-        raise OSError("callback connection failed")
+        return resolve_public_addresses(host, DNS_TIMEOUT, _DNS_SLOTS)
+    except NetworkFailure as error:
+        category = {"timeout": "callback_timeout", "dns_blocked": "callback_dns_blocked", "cancelled": "callback_cancelled"}.get(error.category, "callback_dns_failed")
+        raise BridgeError(category) from None
 
 
 def _https_request(host, addresses, method, target, body, headers, proxy=None, max_response=MAX_RESPONSE):
-    """One bounded TLS exchange, without redirects or ambient proxy variables."""
-    connection = _PinnedHTTPSConnection(host, addresses, proxy=proxy)
-    request_headers = dict(headers)
-    request_headers["Host"] = host
-    # A socket read timeout alone permits a peer to trickle bytes forever.
-    # Shutdown establishes an overall HTTPS exchange deadline as well.
-    timed_out = threading.Event()
-    connection._request_expired = timed_out
-
-    def abort():
-        timed_out.set()
-        sock = connection.sock
-        if sock is not None:
-            try:
-                sock.shutdown(socket.SHUT_RDWR)
-            except OSError:
-                pass
-            sock.close()
-
-    deadline = threading.Timer(NETWORK_TIMEOUT, abort)
-    deadline.daemon = True
-    deadline.start()
+    """Shared HTTPCore exchange retains callback-specific fixed error categories."""
+    _proxy_port(proxy)
     try:
-        connection.connect()
-        if timed_out.is_set():
-            raise BridgeError("callback_timeout")
-        connection.request(method, target, body=body, headers=request_headers)
-        response = connection.getresponse()
-        data = response.read(max_response + 1)
-        if timed_out.is_set():
-            raise BridgeError("callback_timeout")
-        if len(data) > max_response:
-            raise BridgeError("callback_response_too_large")
+        response = request(host, addresses, method, target, body, headers,
+                           timeout=NETWORK_TIMEOUT, max_response=max_response, proxy=proxy)
         if 300 <= response.status < 400:
             raise BridgeError("callback_redirect")
-        return response.status, data
-    except (TimeoutError, socket.timeout):
-        raise BridgeError("callback_timeout") from None
-    except ssl.SSLError:
-        if timed_out.is_set():
-            raise BridgeError("callback_timeout") from None
-        raise BridgeError("callback_tls_failed") from None
-    except (OSError, ValueError, http.client.HTTPException):
-        if timed_out.is_set():
-            raise BridgeError("callback_timeout") from None
-        raise BridgeError("callback_network_failed") from None
-    finally:
-        deadline.cancel()
-        connection.close()
+        return response.status, response.body
+    except NetworkFailure as error:
+        category = {"timeout": "callback_timeout", "tls": "callback_tls_failed", "cancelled": "callback_cancelled",
+                    "response_too_large": "callback_response_too_large",
+                    "dns_blocked": "callback_dns_blocked", "dns_failed": "callback_dns_failed"}.get(error.category, "callback_network_failed")
+        raise BridgeError(category) from None
 
 
 def _google_addresses(host, proxy=None):
@@ -494,7 +344,7 @@ class Events:
                     continuous = bool(current and current[3] == "active")
                     # An explicit refresh resumes the same application's outstanding
                     # inbox. This is not a protocol replay cursor and never resumes
-                    # a message that has an immutable reply committed to it.
+                    # a message whose current processing run has completed.
                     boundary = current[4] if current else self.store.db.execute("SELECT COALESCE(MAX(rowid),0) FROM messages").fetchone()[0]
                     old_secret = current[0] if continuous and current[0] != secret else (current[1] if continuous else None)
                     rotation = self.clock() + ROTATION_SECONDS if continuous and current[0] != secret else (current[2] if continuous else None)
@@ -502,8 +352,8 @@ class Events:
                         self.store.db.execute("""UPDATE deliveries SET status='pending',attempts=0,next_attempt=?,error=NULL
                             WHERE subscription_id=? AND (status IN ('failed','cancelled','retry') OR
                             (status='acknowledged' AND ?)) AND message_id IN
-                            (SELECT m.id FROM messages m WHERE m.state='pending' AND NOT EXISTS
-                            (SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.is_notice=0))""", (self.clock(), subscription_id, int(not continuous)))
+                            (SELECT m.id FROM messages m WHERE NOT EXISTS
+                            (SELECT 1 FROM message_work w WHERE w.message_id=m.id AND w.state='completed'))""", (self.clock(), subscription_id, int(not continuous)))
                     self.store.db.execute("""INSERT INTO subscriptions VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                         ON CONFLICT(id) DO UPDATE SET secret=excluded.secret,old_secret=excluded.old_secret,
                         rotate_until=excluded.rotate_until,expires_at=excluded.expires_at,verified_until=excluded.verified_until,
@@ -560,9 +410,10 @@ class Events:
                         self._end()
                         return False
                     self.store.db.execute("""UPDATE deliveries SET status='cancelled',error='reply_committed'
-                        WHERE status IN ('pending','retry') AND message_id IN (SELECT message_id FROM replies WHERE is_notice=0)""")
+                        WHERE status IN ('pending','retry') AND message_id IN
+                        (SELECT message_id FROM message_work WHERE state='completed')""")
                     rows = self.store.db.execute("""SELECT id,created_at FROM messages m WHERE rowid>? AND account=? AND peer=?
-                        AND state='pending' AND NOT EXISTS (SELECT 1 FROM replies r WHERE r.message_id=m.id AND r.is_notice=0)
+                        AND NOT EXISTS (SELECT 1 FROM message_work w WHERE w.message_id=m.id AND w.state='completed')
                         AND NOT EXISTS (SELECT 1 FROM attachments a WHERE (a.message_id=m.id OR EXISTS(SELECT 1 FROM attachment_links l WHERE l.message_id=m.id AND l.attachment_id=a.id)) AND a.status IN ('pending','downloading'))
                         AND NOT EXISTS (SELECT 1 FROM deliveries d WHERE d.subscription_id=? AND d.message_id=m.id)
                         ORDER BY rowid LIMIT 100""", (subscription[5], binding["id"], binding["owner"], subscription[0])).fetchall()
@@ -573,9 +424,19 @@ class Events:
                         self.store.db.execute("INSERT OR IGNORE INTO deliveries(event_id,subscription_id,message_id,body,status,next_attempt) VALUES(?,?,?,?,'pending',?)", (event_id, subscription[0], message_id, body, now))
                         from .timing import record as trace
                         trace(self.store,message_id,"event_enqueued")
-                    delivery = self.store.db.execute("""SELECT event_id,body,attempts FROM deliveries
-                        WHERE subscription_id=? AND status IN ('pending','retry') AND next_attempt<=?
-                        ORDER BY next_attempt,event_id LIMIT 1""", (subscription[0], now)).fetchone()
+                    # First attempts retain durable inbound order, even if an
+                    # earlier attachment only just became ready. An unready
+                    # attachment or a retry in backoff never blocks later ready
+                    # messages. Due retries take bounded priority by deadline,
+                    # so continuous new arrivals cannot starve recovery. ACK
+                    # remains notification receipt,
+                    # not a promise about the platform's execution order.
+                    delivery = self.store.db.execute("""SELECT d.event_id,d.body,d.attempts FROM deliveries d
+                        JOIN messages m ON m.id=d.message_id
+                        WHERE d.subscription_id=? AND d.status IN ('pending','retry') AND d.next_attempt<=?
+                        ORDER BY CASE WHEN d.attempts>0 THEN 0 ELSE 1 END,
+                            CASE WHEN d.attempts>0 THEN d.next_attempt ELSE 0 END,
+                            m.rowid,d.rowid LIMIT 1""", (subscription[0], now)).fetchone()
                     if not delivery:
                         self._end()
                         return False

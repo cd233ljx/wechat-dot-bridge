@@ -46,8 +46,10 @@ class RecoveryTests(unittest.TestCase):
         self.assertIsNotNone(self.store.typing_target([self.mid]))
         self.store.queue_reply(self.mid,'complete')
         self.assertIsNone(self.store.typing_target([self.mid]))
-        self.store.report_progress(self.mid)
-        self.assertIsNotNone(self.store.typing_target([self.mid]))
+        with self.assertRaisesRegex(BridgeError, 'processing_already_completed'):
+            self.store.report_progress(self.mid)
+        self.assertEqual(self.store.work_status(self.mid)['state'], 'completed')
+        self.assertIsNone(self.store.typing_target([self.mid]))
         self.now += 301
         self.assertIsNone(self.store.typing_target([self.mid]))
 
@@ -58,8 +60,7 @@ class RecoveryTests(unittest.TestCase):
         client.poll(self.store.get_binding())
         self.assertEqual(client._post.call_args.args[-1],40)
         connection=Mock();client.connections.add(connection);client.cancel()
-        connection.sock.shutdown.assert_called_once()
-        connection.close.assert_called_once()
+        connection.cancel.assert_called_once()
 
     def test_tool_diagnostics_omit_message_and_credentials(self):
         self.store.record_tool_call('read_weixin_message',self.mid,'ok')

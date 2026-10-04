@@ -15,17 +15,16 @@ import os
 from pathlib import Path
 import re
 import secrets
-import socket
 import stat
 import time
 from urllib.parse import urlencode
 import uuid
-import http.client
 
 from .errors import BridgeError
+from .net_transport import NetworkFailure, request
 from .store import Store
 from .transport import (
-    DEFAULT_BASE_URL, MAX_RESPONSE_BYTES, _PinnedHTTPSConnection, _binding,
+    DEFAULT_BASE_URL, MAX_RESPONSE_BYTES, _pinned_address, _binding,
     _endpoint, _json_object, _resolve_public,
 )
 
@@ -183,43 +182,32 @@ class LoginClient:
     def _request(self, base_url, method, path, body=None):
         host, _origin = _endpoint(base_url)
         address = _resolve_public(host)
-        connection = None
         try:
             headers = {"iLink-App-Id": "bot", "iLink-App-ClientVersion": "256"}
             encoded = None
             if method == "POST":
                 encoded = json.dumps(body, separators=(",", ":")).encode("ascii")
-                # The official QR POST sets AuthorizationType but has no Bearer
-                # credential. No existing bot-token list is scanned or sent.
+                # Official QR POST has no bearer or existing bot-token list.
                 headers.update({"Content-Type": "application/json", "AuthorizationType": "ilink_bot_token"})
                 headers["X-WECHAT-UIN"] = base64.b64encode(str(secrets.randbits(32)).encode("ascii")).decode("ascii")
-            connection = _PinnedHTTPSConnection(host, address, 40.0)
-            connection.request(method, path, body=encoded, headers=headers)
-            response = connection.getresponse()
+            response = request(host, _pinned_address(address), method, path, encoded, headers,
+                               timeout=40.0, max_response=MAX_RESPONSE_BYTES, body_statuses={200})
             if 300 <= response.status < 400:
                 raise BridgeError("endpoint_rejected")
             if response.status != 200:
                 raise BridgeError("http_error")
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
-            if len(raw) > MAX_RESPONSE_BYTES:
-                raise BridgeError("response_too_large")
-            result = _json_object(raw, "invalid_login_response")
+            result = _json_object(response.body, "invalid_login_response")
             for name in ("ret", "errcode"):
                 if name in result and result[name] is not None and (type(result[name]) is not int or result[name] != 0):
                     raise BridgeError("login_rejected")
             return result
         except BridgeError:
             raise
-        except (TimeoutError, socket.timeout):
-            raise BridgeError("network_timeout") from None
-        except (OSError, http.client.HTTPException, UnicodeError, ValueError, TypeError):
+        except NetworkFailure as error:
+            category = {"timeout": "network_timeout", "response_too_large": "response_too_large", "cancelled": "network_cancelled"}.get(error.category, "network_error")
+            raise BridgeError(category) from None
+        except (UnicodeError, ValueError, TypeError):
             raise BridgeError("network_error") from None
-        finally:
-            if connection is not None:
-                try:
-                    connection.close()
-                except OSError:
-                    pass
 
     def start_login(self):
         # Current official client uses POST, not the older GET QR endpoint.

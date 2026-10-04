@@ -1,10 +1,9 @@
 """Import caller-supplied public HTTPS artifacts without forwarding credentials."""
 import base64
 import hashlib
-import socket
-import threading
 from urllib.parse import urlsplit,urljoin
 from .errors import BridgeError
+from .net_transport import NetworkFailure, request
 from .media import MAX_MEDIA, MAX_STAGE, safe_name
 
 
@@ -35,49 +34,38 @@ def url_parts(url):
 
 def download(url):
     from . import media
-    from .events import _public_addresses,_google_addresses,_PinnedHTTPSConnection
+    from .events import _public_addresses, _google_addresses
     for hop in range(4):
-        p=url_parts(url)
-        connection=None
-        timer=None
-        expired=threading.Event()
+        p = url_parts(url)
         try:
-            addresses=_google_addresses(p.hostname,media.NETWORK_PROXY) if media.NETWORK_DNS=='google' else _public_addresses(p.hostname)
-            connection=_PinnedHTTPSConnection(p.hostname,addresses,media.NETWORK_PROXY)
-            connection._request_expired=expired
-            def abort():
-                expired.set()
-                if connection.sock:
-                    try: connection.sock.shutdown(socket.SHUT_RDWR)
-                    except OSError: pass
-                    connection.sock.close()
-            timer=threading.Timer(20,abort);timer.daemon=True;timer.start()
-            connection.connect()
-            if expired.is_set(): raise BridgeError('artifact_timeout')
-            request_path=(p.path or '/')+('?' + p.query if p.query else '')
-            connection.request('GET',request_path,headers={'Host':p.hostname})
-            response=connection.getresponse()
-            if response.status in (301,302,303,307,308):
-                target=response.getheader('Location')
-                if not target: raise BridgeError('artifact_download_failed')
-                url=urljoin(url,target)
-                continue  # Validate and pin public addresses again; never forward authorization.
-            if response.status!=200: raise BridgeError('artifact_http_rejected')
-            length=response.getheader('Content-Length')
-            if length and (not length.isdigit() or int(length)>MAX_MEDIA):
+            addresses = _google_addresses(p.hostname, media.NETWORK_PROXY) if media.NETWORK_DNS == 'google' else _public_addresses(p.hostname)
+            response = request(p.hostname, addresses, 'GET', (p.path or '/') + ('?' + p.query if p.query else ''),
+                               None, {}, timeout=20, max_response=MAX_MEDIA,
+                               proxy=media.NETWORK_PROXY, body_statuses={200})
+            # Artifact imports explicitly retain bounded redirects. Each hop
+            # is reauthorized and resolved; the shared library never follows.
+            if response.status in (301, 302, 303, 307, 308):
+                target = response.header('location')
+                if not target:
+                    raise BridgeError('artifact_download_failed')
+                url = urljoin(url, target)
+                continue
+            if response.status != 200:
+                raise BridgeError('artifact_http_rejected')
+            length = response.header('content-length')
+            if length and (not length.isdigit() or int(length) > MAX_MEDIA):
                 raise BridgeError('media_too_large')
-            data=response.read(MAX_MEDIA+1)
-            if not data or len(data)>MAX_MEDIA: raise BridgeError('media_too_large')
-            if expired.is_set(): raise BridgeError('artifact_timeout')
-            return data
+            if not response.body:
+                raise BridgeError('media_too_large')
+            return response.body
+        except NetworkFailure as error:
+            category = {'timeout': 'artifact_timeout', 'response_too_large': 'media_too_large', 'cancelled': 'artifact_cancelled',
+                        'dns_blocked': 'artifact_endpoint_rejected', 'dns_failed': 'artifact_endpoint_rejected'}.get(error.category, 'artifact_download_failed')
+            raise BridgeError(category) from None
         except BridgeError as error:
-            if error.code.startswith(('artifact_','media_')): raise
+            if error.code.startswith(('artifact_', 'media_')):
+                raise
             raise BridgeError('artifact_endpoint_rejected') from None
-        except Exception:
-            raise BridgeError('artifact_download_failed') from None
-        finally:
-            if timer: timer.cancel()
-            if connection: connection.close()
     raise BridgeError('artifact_redirect_limit')
 
 
