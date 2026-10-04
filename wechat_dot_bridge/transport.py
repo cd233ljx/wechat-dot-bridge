@@ -489,6 +489,7 @@ class WeixinWorker:
             return False
         try:
             response = self.client.poll(binding)
+            received_at=getattr(self.client,"clock",time.time)()
             error = _application_error(response)
             if error:
                 self._record_error(error, stale=response.get("ret") == -14 or response.get("errcode") == -14)
@@ -501,6 +502,8 @@ class WeixinWorker:
                 raise BridgeError("response_invalid")
             clock = getattr(self.client, "clock", time.time)
             normalized = [item for message in messages if (item := _normalize_message(message, binding, clock())) is not None]
+            for item in normalized:
+                item["received_at"]=received_at
             # Store commits messages, owner context and cursor as one transaction.
             self.store.ingest(binding["id"], normalized, cursor or binding.get("cursor", ""))
             self.store.record_error(None)

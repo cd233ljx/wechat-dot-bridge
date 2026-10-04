@@ -571,6 +571,8 @@ class Events:
                         body = _json_bytes({"eventId": event_id, "name": EVENT_NAME, "timestamp": _iso(created_at),
                                             "data": {"message_id": message_id}, "cursor": None})
                         self.store.db.execute("INSERT OR IGNORE INTO deliveries(event_id,subscription_id,message_id,body,status,next_attempt) VALUES(?,?,?,?,'pending',?)", (event_id, subscription[0], message_id, body, now))
+                        from .timing import record as trace
+                        trace(self.store,message_id,"event_enqueued")
                     delivery = self.store.db.execute("""SELECT event_id,body,attempts FROM deliveries
                         WHERE subscription_id=? AND status IN ('pending','retry') AND next_attempt<=?
                         ORDER BY next_attempt,event_id LIMIT 1""", (subscription[0], now)).fetchone()
@@ -590,6 +592,10 @@ class Events:
                     raise
             old = subscription[3] if subscription[4] and subscription[4] > now else None
             headers = signed_headers(delivery[0], delivery[1], subscription[2], self.clock(), subscription[0], old)
+            from .timing import record as trace
+            mid=json.loads(delivery[1])["data"]["message_id"]
+            trace(self.store,mid,"event_start")
+            callback_start=time.perf_counter()
             try:
                 status, _ = self.post(subscription[1], delivery[1], headers)
                 if 200 <= status < 300:
@@ -607,6 +613,7 @@ class Events:
                 state = "retry" if error in {"callback_timeout", "callback_dns_failed", "callback_network_failed"} else "failed"
             except Exception:
                 state, error = "failed", "callback_failed"
+            trace(self.store,mid,"event_result",outcome=state,elapsed_ms=round((time.perf_counter()-callback_start)*1000,3))
             if state == "retry" and attempts >= MAX_ATTEMPTS:
                 state, error = "failed", "retry_exhausted"
             with self.store.lock:

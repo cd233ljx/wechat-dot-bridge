@@ -207,6 +207,8 @@ class Store(AttachmentStore):
             self.db.execute("""CREATE TABLE IF NOT EXISTS tool_calls (
                 id INTEGER PRIMARY KEY, name TEXT NOT NULL, message_id TEXT,
                 outcome TEXT NOT NULL, created_at REAL NOT NULL)""")
+            from .timing import init as init_timing
+            init_timing(self)
             if self.db.execute("SELECT count(*) FROM binding").fetchone()[0] > 1:
                 raise BridgeError("invalid_binding_state")
         except (sqlite3.Error, BridgeError) as error:
@@ -403,7 +405,9 @@ class Store(AttachmentStore):
             if not isinstance(aliases,list) or len(aliases)>33:
                 raise BridgeError("invalid_inbound_message")
             aliases=[rid for value in aliases if (rid:=reference_id(value))]
-            normalized.append((source, peer, text, float(created_at), context, refs, quotes, aliases))
+            received_at=message.get("received_at",self.clock())
+            if not _timestamp(received_at):raise BridgeError("invalid_inbound_message")
+            normalized.append((source, peer, text, float(created_at), context, refs, quotes, aliases,received_at))
         with self._transaction():
             binding = self._binding()
             if account_id != binding["id"]:
@@ -415,7 +419,7 @@ class Store(AttachmentStore):
                 "SELECT count(*) FROM messages WHERE account=? AND peer=? AND state='pending'",
                 (binding["id"], binding["owner"])).fetchone()[0]
             added = 0
-            for source, peer, text, created_at, context, refs, quotes, aliases in normalized:
+            for source, peer, text, created_at, context, refs, quotes, aliases,received_at in normalized:
                 if peer != binding["owner"]:
                     raise BridgeError("owner_identity_mismatch")
                 identifier = _opaque_id(binding["id"], peer, source)
@@ -461,6 +465,8 @@ class Store(AttachmentStore):
                     self.db.execute("INSERT OR IGNORE INTO message_aliases VALUES(?,?,?,?)", (binding["id"],peer,alias,identifier))
                 for position,has_id,status,resolved,shape in quote_states:
                     self.db.execute("INSERT INTO message_quotes VALUES(?,?,?,?,?,?)", (identifier,position,has_id,status,resolved,shape))
+                from .timing import record as trace
+                trace(self,identifier,"received",at=received_at)
                 self._ingest_attachments(binding, identifier, refs)
                 for aid in cached_aids:
                     self.db.execute("INSERT OR IGNORE INTO attachment_links VALUES(?,?)", (identifier,aid))
@@ -570,6 +576,8 @@ class Store(AttachmentStore):
                     self.db.execute("INSERT INTO reply_parts(reply_id,part,text,kind) VALUES(?,?,'','media')", (client_id,len(split_text(text)) if text else 0))
                 if not notice:
                     self.db.execute("UPDATE messages SET state='reply_committed' WHERE id=?", (message_id,))
+                    from .timing import record as trace
+                    trace(self,message_id,"reply_queued",reply_id=client_id)
         if not notice:
             self.report_progress(message_id, not final)
         return self.send_status(message_id, client_id)
@@ -619,6 +627,9 @@ class Store(AttachmentStore):
                 (context["id"], row["client_id"]))
             part = self.db.execute("SELECT part,text,kind FROM reply_parts WHERE reply_id=? AND accepted=0 ORDER BY part LIMIT 1", (row["client_id"],)).fetchone()
             remaining = self.db.execute("SELECT count(*) FROM reply_parts WHERE reply_id=? AND accepted=0", (row["client_id"],)).fetchone()[0]
+            if not row["is_notice"]:
+                from .timing import record as trace
+                trace(self,row["message_id"],"send_start",reply_id=row["client_id"])
             return {"message_id": row["message_id"], "reply_id": row["client_id"], "text": part["text"] if part else row["text"],
                     "client_id": row["client_id"] + ("_part_" + str(part["part"]) if part and part["part"] else ""), "peer": row["peer"],
                     "context_token": context["context_token"],
@@ -641,6 +652,9 @@ class Store(AttachmentStore):
                 if reply["status"] == status and reply["error"] == diagnostic:
                     return
                 raise BridgeError("reply_not_sending")
+            if not self.db.execute("SELECT is_notice FROM replies WHERE client_id=?",(reply["client_id"],)).fetchone()[0]:
+                from .timing import record as trace
+                trace(self,message_id,"weixin_accepted" if status=="accepted" else "send_result",outcome=status,reply_id=reply["client_id"])
             # A fresh inbound context may arrive during the POST that rejected
             # the previous context. Resume only that safely rejected request.
             if status == "context_required":
@@ -704,11 +718,18 @@ class Store(AttachmentStore):
             mid = row["message_id"]
         return self.send_status(mid,reply_id)
 
-    def record_tool_call(self, name, message_id, outcome):
+    def record_tool_call(self, name, message_id, outcome, started_at=None, elapsed_ms=None):
         with self._transaction():
             if message_id and not self.db.execute("SELECT 1 FROM messages WHERE id=?", (message_id,)).fetchone():
                 message_id = None
-            self.db.execute("INSERT INTO tool_calls(name,message_id,outcome,created_at) VALUES(?,?,?,?)", (name,message_id,outcome,self.clock()))
+            self.db.execute("INSERT INTO tool_calls(name,message_id,outcome,created_at,started_at,elapsed_ms) VALUES(?,?,?,?,?,?)", (name,message_id,outcome,self.clock(),started_at,elapsed_ms))
+            if message_id and started_at is not None:
+                from .timing import record as trace
+                if name == "read_weixin_message":
+                    trace(self,message_id,"read_start",at=started_at,outcome=outcome)
+                    trace(self,message_id,"read_result",outcome=outcome,elapsed_ms=elapsed_ms)
+                elif name in ("reply_weixin_message","reply_weixin_attachment"):
+                    trace(self,message_id,"reply_tool_result",outcome=outcome,elapsed_ms=elapsed_ms)
             self.db.execute("DELETE FROM tool_calls WHERE id <= (SELECT COALESCE(MAX(id),0)-1000 FROM tool_calls)")
 
     def get_status(self):

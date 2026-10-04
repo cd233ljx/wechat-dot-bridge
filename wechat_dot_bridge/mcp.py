@@ -94,6 +94,9 @@ class MCPServer:
         mid = args.get("message_id") if isinstance(args,dict) else None
         if not isinstance(mid,str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}",mid):
             mid = None
+        import time
+        started_at=self.store.clock()
+        start=time.perf_counter()
         outcome = "internal_error"
         try:
             result = self._dispatch_call(params)
@@ -104,7 +107,7 @@ class MCPServer:
             raise
         finally:
             try:
-                self.store.record_tool_call(name,mid,outcome)
+                self.store.record_tool_call(name,mid,outcome,started_at=started_at,elapsed_ms=round((time.perf_counter()-start)*1000,3))
             except Exception:
                 pass
 

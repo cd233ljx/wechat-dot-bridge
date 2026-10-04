@@ -233,7 +233,7 @@ class MessageAndWorkerTests(unittest.TestCase):
         self.assertEqual(account, FIXTURE["id"])
         self.assertEqual(len(messages), 1)
         self.assertEqual(cursor, "next-fixture-cursor")
-        self.assertEqual(set(messages[0]), {"source_id", "peer", "text", "created_at", "context_token", "attachments", "quotes", "aliases"})
+        self.assertEqual(set(messages[0]), {"source_id", "peer", "text", "created_at", "context_token", "attachments", "quotes", "aliases", "received_at"})
         self.assertEqual(store.errors[-1], None)
 
     def test_bad_poll_never_advances_cursor_and_stale_auth_disables(self):

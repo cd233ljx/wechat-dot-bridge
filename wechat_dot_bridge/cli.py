@@ -232,6 +232,9 @@ def parser():
     commands.add_parser("diagnose", help="Show redacted health and stuck work")
     commands.add_parser("subscriptions", help="List subscription IDs and lifetime, without callback credentials")
     commands.add_parser("queue", help="List unresolved reply IDs and fixed error categories")
+    latency = commands.add_parser("latency", help="Show redacted per-message timing stages and tool server durations")
+    latency.add_argument("--limit",type=int,default=10)
+    latency.add_argument("--message-id")
     cancel = commands.add_parser("cancel-subscription", help="Cancel one subscription; stop service first")
     cancel.add_argument("subscription_id")
     retry = commands.add_parser("retry-send", help="Retry an explicitly failed reply; stop service first")
@@ -317,7 +320,8 @@ def main(argv=None):
                 serve(runtime_store, hosts, lock_dir, state, proxy, dns, media_proxy, media_dns)
             else:
                 from .operations import diagnostics, subscriptions, queue
-                result = diagnostics(store) if args.command == "diagnose" else subscriptions(store) if args.command == "subscriptions" else queue(store) if args.command == "queue" else store.get_status()
+                from .timing import report
+                result = report(store,args.limit,args.message_id) if args.command=="latency" else diagnostics(store) if args.command == "diagnose" else subscriptions(store) if args.command == "subscriptions" else queue(store) if args.command == "queue" else store.get_status()
                 print(canonical(result))
         return 0
     except BlockingIOError:
