@@ -22,8 +22,11 @@ import httpcore
 class NetworkFailure(Exception):
     """Only fixed categories cross this transport boundary."""
 
-    def __init__(self, category):
+    def __init__(self, category, *, phase=None):
         self.category = category
+        # Private fixed stages let a caller distinguish an idle poll deadline
+        # from DNS, connection or TLS failure without exposing network detail.
+        self.phase = phase
         super().__init__(category)
 
 
@@ -181,10 +184,12 @@ class _DeadlineStream(httpcore.NetworkStream):
         self.sock, self.backend = sock, backend
 
     def read(self, max_bytes, timeout=None):
+        self.backend.phase = "response_read" if self.backend.request_written else "request_write"
         self.sock.settimeout(self.backend.remaining(timeout))
         return self.sock.recv(max_bytes)
 
     def write(self, buffer, timeout=None):
+        self.backend.phase = "request_write"
         self.sock.settimeout(self.backend.remaining(timeout))
         self.sock.sendall(buffer)
 
@@ -192,6 +197,9 @@ class _DeadlineStream(httpcore.NetworkStream):
         self.backend.release(self.sock)
 
     def start_tls(self, ssl_context, server_hostname=None, timeout=None):
+        self.backend.phase = "tls"
+        # CONNECT bytes, if any, do not count as the application request.
+        self.backend.request_written = False
         numeric = self.backend.addresses[0][3][0]
         if server_hostname not in (self.backend.hostname, numeric, "[" + numeric + "]"):
             raise NetworkFailure("tls")
@@ -235,6 +243,8 @@ class _PinnedBackend(httpcore.NetworkBackend):
         self.cancelled = threading.Event()
         self.lock = threading.Lock()
         self.sockets = set()
+        self.phase = "connect"
+        self.request_written = False
 
     def remaining(self, timeout=None):
         if self.cancelled.is_set():
@@ -281,6 +291,7 @@ class _PinnedBackend(httpcore.NetworkBackend):
             self.release(sock)
 
     def connect_tcp(self, host, port, timeout=None, local_address=None, socket_options=None):
+        self.phase = "connect"
         if self.proxy_port is not None:
             if host != "127.0.0.1" or port != self.proxy_port:
                 raise NetworkFailure("network")
@@ -334,6 +345,12 @@ class PinnedRequest:
         self.backend.abort(cancelled=True)
 
     def execute(self, method, target, body, headers, max_response, body_statuses=None):
+        def trace(event, _info):
+            # HTTPCore can read a response after suppressing a partial write
+            # error. Only its complete-body event proves the request was sent.
+            if event == "http11.send_request_body.complete":
+                self.backend.request_written = True
+
         timer = threading.Timer(self.timeout, self.backend.abort)
         timer.daemon = True
         timer.start()
@@ -358,7 +375,11 @@ class PinnedRequest:
             pool = httpcore.HTTPProxy(self.proxy, **kwargs) if self.proxy else httpcore.ConnectionPool(**kwargs)
             with pool, pool.stream(method, url, headers=request_headers, content=body,
                                    extensions={"sni_hostname": self.hostname,
+                                               "trace": trace,
                                                "timeout": {key: self.timeout for key in ("connect", "read", "write", "pool")}}) as response:
+                if response.status != 200:
+                    # A known rejection is not an idle getupdates deadline.
+                    self.backend.phase = "response_error"
                 data = bytearray()
                 if body_statuses is None or response.status in body_statuses:
                     for key, value in response.headers:
@@ -371,21 +392,30 @@ class PinnedRequest:
                         data.extend(chunk)
                 self.backend.remaining()
                 return NetworkResponse(response.status, bytes(data), tuple(response.headers))
-        except NetworkFailure:
+        except NetworkFailure as error:
+            if self.backend.cancelled.is_set() or self.cancellation.is_set():
+                raise NetworkAbort() from None
+            if error.category == "timeout" and error.phase is None:
+                error.phase = self.backend.phase
             raise
         except (TimeoutError, httpcore.TimeoutException):
-            if self.backend.cancelled.is_set():
+            if self.backend.cancelled.is_set() or self.cancellation.is_set():
                 raise NetworkAbort() from None
-            raise NetworkFailure("timeout") from None
+            raise NetworkFailure("timeout", phase=self.backend.phase) from None
         except ssl.SSLError:
-            if self.backend.cancelled.is_set():
+            if self.backend.cancelled.is_set() or self.cancellation.is_set():
                 raise NetworkAbort() from None
-            raise NetworkFailure("timeout" if self.backend.expired.is_set() else "tls") from None
-        except (OSError, httpcore.NetworkError, httpcore.ProtocolError, httpcore.ProxyError,
-                ValueError, TypeError, UnicodeError):
-            if self.backend.cancelled.is_set():
+            raise NetworkFailure("timeout" if self.backend.expired.is_set() else "tls",
+                                 phase=self.backend.phase) from None
+        except (httpcore.ProtocolError, httpcore.ProxyError, ValueError, TypeError, UnicodeError):
+            if self.backend.cancelled.is_set() or self.cancellation.is_set():
                 raise NetworkAbort() from None
-            raise NetworkFailure("timeout" if self.backend.expired.is_set() else "network") from None
+            raise NetworkFailure("network", phase=self.backend.phase) from None
+        except (OSError, httpcore.NetworkError):
+            if self.backend.cancelled.is_set() or self.cancellation.is_set():
+                raise NetworkAbort() from None
+            raise NetworkFailure("timeout" if self.backend.expired.is_set() else "network",
+                                 phase=self.backend.phase) from None
         finally:
             _private_request.active = previous
             with _active_lock:

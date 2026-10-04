@@ -10,6 +10,7 @@ from contextlib import contextmanager
 import logging
 import sys
 import threading
+import time
 
 import anyio
 from jsonschema import Draft202012Validator
@@ -281,8 +282,31 @@ class SDKAdapter:
             raise BridgeError("invalid_params")
         # These calls persist atomically under Store's lock. Running in a worker
         # thread lets protocol cancellation/stdio stay responsive to media work.
-        result = await anyio.to_thread.run_sync(self.bridge._call, raw)
+        if params.name == "read_weixin_message":
+            dispatched_at, queued_at = self.bridge.store.clock(), time.perf_counter()
+            result = await anyio.to_thread.run_sync(self._read_tool, raw, dispatched_at, queued_at)
+        else:
+            result = await anyio.to_thread.run_sync(self.bridge._call, raw)
         return types.CallToolResult.model_validate(result)
+
+    def _read_tool(self, raw, dispatched_at, queued_at):
+        # Capture thread entry before acquiring the Store lock. Persist both
+        # timestamps here, never on the event loop or in another worker thread.
+        thread_started = time.perf_counter()
+        try:
+            from .timing import record
+            store, mid = self.bridge.store, raw["arguments"]["message_id"]
+            thread_started_at = store.clock()
+            # Commit the pair together so concurrent reads and status queries
+            # cannot combine one request's dispatch with another thread entry.
+            with store._transaction():
+                record(store, mid, "read_dispatch", at=dispatched_at)
+                record(store, mid, "read_thread_start", at=thread_started_at,
+                       elapsed_ms=round((thread_started - queued_at) * 1000, 3))
+        except Exception:
+            # Diagnostics cannot fail a read or change its returned content.
+            pass
+        return self.bridge._call(raw)
 
     async def _events(self, ctx, params):
         raw = dict(ctx.params or {})

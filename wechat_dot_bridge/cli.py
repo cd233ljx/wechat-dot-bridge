@@ -116,17 +116,76 @@ async def _run_runtime(store, server, weixin, events, media, monitor, typing):
     from .maintenance import maintain
 
     reset_cancellation()
+    wakes = {name: anyio.Event() for name in ("send", "event", "media", "typing")}
+
+    def notify(*names):
+        for name in names:
+            wakes[name].set()
+
+    def notify_from_thread(*names):
+        # AnyIO events belong to this loop. MCP handlers run in AnyIO worker
+        # threads and must marshal their notification back to the loop.
+        anyio.from_thread.run_sync(notify, *names)
+
+    previous_wake = getattr(server, "wake_workers", None)
+    server.wake_workers = notify_from_thread
+    previous_received = getattr(weixin, "on_received", None)
+
+    def received(message_ids):
+        # Store invokes this only after atomically committing genuinely new
+        # messages. Registration is memory-only; the poll worker wakes I/O.
+        typing.received(message_ids)
+        if previous_received is not None:
+            previous_received(message_ids)
+
+    weixin.on_received = received
+
+    async def wait_for_work(name, delay):
+        if name not in wakes:
+            await anyio.sleep(delay)
+        elif delay > 0:
+            event = wakes[name]
+            with anyio.move_on_after(delay):
+                await event.wait()
+            # Replace atomically on the loop; a notification during the next
+            # blocking call remains set for its subsequent wait.
+            wakes[name] = anyio.Event()
 
     async def worker(name, function, interval=0.5):
-        delay = interval
+        delay = interval if name == "cache" else 0
+        next_send = 0
         while True:
-            await anyio.sleep(delay)
+            await wait_for_work(name, delay)
+            if name == "send":
+                # A wake requests a durable queue check; it cannot bypass the
+                # minimum inter-send pace or WeixinWorker's rate-limit guard.
+                await anyio.sleep(max(0, next_send - anyio.current_time()))
+            started = anyio.current_time()
             try:
                 # AnyIO waits for bounded calls to finish on cancellation. The
                 # store and process locks stay open until all writers finish.
                 result = await anyio.to_thread.run_sync(function)
-                delay = min(30, max(1, delay * 2)) if name == "poll" and not result else interval
+                if name == "poll":
+                    if result:
+                        # Long-poll completion needs no extra gap. Immediately
+                        # empty responses still get a 100 ms minimum cycle.
+                        delay = max(0, 0.1 - (anyio.current_time() - started))
+                        if weixin.poll_added:
+                            notify("media", "event", "typing")
+                    else:
+                        delay = min(30, max(1, delay * 2))
+                elif name == "send" and result:
+                    next_send = anyio.current_time() + 0.1
+                    delay = 0
+                elif name == "event" and result:
+                    delay = 0
+                elif name == "media" and result:
+                    notify("event")
+                    delay = 0
+                else:
+                    delay = interval
             except Exception:
+                delay = min(30, max(1, delay * 2)) if name == "poll" else interval
                 if name not in ("typing", "cache"):
                     try:
                         if store.get_binding():
@@ -163,6 +222,8 @@ async def _run_runtime(store, server, weixin, events, media, monitor, typing):
                 weixin.client.cancel()
                 tasks.cancel_scope.cancel()
     finally:
+        server.wake_workers = previous_wake
+        weixin.on_received = previous_received
         # Protocol failures also release presence after every writer has exited.
         # Shield this cleanup from cancellation inherited from the caller.
         with anyio.CancelScope(shield=True):

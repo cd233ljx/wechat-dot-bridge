@@ -245,10 +245,11 @@ class MediaWorker:
     def tick(self):
         row = self.store.next_attachment()
         if row is None:
-            return
+            return False
         try:
             self.store.finish_attachment(row["id"], fetch(json.loads(row["descriptor"])))
         except BridgeError as error:
             self.store.fail_attachment(row["id"], error.code)
         except Exception:
             self.store.fail_attachment(row["id"], "media_failed")
+        return True

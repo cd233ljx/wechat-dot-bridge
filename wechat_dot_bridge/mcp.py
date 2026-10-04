@@ -54,6 +54,16 @@ class MCPServer:
     def __init__(self, store, events, typing=None):
         self.store, self.events = store, events
         self.typing = typing
+        self.wake_workers = None
+
+    def _wake(self, *names):
+        if self.wake_workers is not None:
+            try:
+                self.wake_workers(*names)
+            except Exception:
+                # Scheduling is best effort; periodic workers remain the
+                # recovery path and cannot change a committed tool result.
+                pass
 
     @staticmethod
     def _error(request_id, code, message, reason=None):
@@ -141,14 +151,17 @@ class MCPServer:
                         **{k:arguments[k] for k in (*WORK_ARGUMENTS, 'completed') if k in arguments})
                     if self.typing is not None:
                         self.typing.sync(arguments["message_id"])
+                    self._wake("typing")
                 elif name == "retry_weixin_operation":
                     if bool(arguments.get("attachment_id")) == bool(arguments.get("reply_id")):
                         raise BridgeError("choose_one_operation")
                     value = self.store.retry_attachment(arguments["attachment_id"]) if arguments.get("attachment_id") else self.store.retry_reply(arguments["reply_id"])
+                    self._wake("media" if arguments.get("attachment_id") else "send")
                 elif name == "read_weixin_message":
                     value = self.store.read_message(arguments["message_id"])
                     if self.typing is not None:
                         self.typing.sync(arguments["message_id"])
+                    self._wake("typing")
                     for attachment in value["attachments"]:
                         if attachment["kind"] == "image" and attachment["status"] == "ready":
                             from .media import image_preview
@@ -161,6 +174,7 @@ class MCPServer:
                     for mid in self.store.touch_attachment_work(arguments["attachment_id"]):
                         if self.typing is not None:
                             self.typing.sync(mid)
+                    self._wake("typing")
                 elif name == "stage_weixin_attachment":
                     if ("data_base64" in arguments) == ("text_content" in arguments):
                         raise BridgeError("choose_one_content")
@@ -176,10 +190,12 @@ class MCPServer:
                     value = self.store.queue_reply(arguments["message_id"], arguments.get("text", ""), arguments.get("reply_key"), arguments["attachment_id"], final=arguments.get("final",True), **{k:arguments[k] for k in WORK_ARGUMENTS if k in arguments})
                     if self.typing is not None:
                         self.typing.sync(arguments["message_id"])
+                    self._wake("send", "typing")
                 elif name == "reply_weixin_message":
                     value = self.store.queue_reply(arguments["message_id"], arguments["text"], arguments.get("reply_key"), final=arguments.get("final",True), **{k:arguments[k] for k in WORK_ARGUMENTS if k in arguments})
                     if self.typing is not None:
                         self.typing.sync(arguments["message_id"])
+                    self._wake("send", "typing")
                 elif name == "get_weixin_send_status":
                     value = self.store.send_status(arguments["message_id"], arguments.get("reply_id"))
                 else:

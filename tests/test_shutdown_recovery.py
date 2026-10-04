@@ -231,17 +231,20 @@ class ShutdownRecoveryTests(unittest.TestCase):
     def test_cancelled_presence_refresh_keeps_target_for_final_cleanup(self):
         client = IlinkClient()
         typing = TypingIndicator(self.store, client)
+        mid = self.ingest()
+        self.store.read_message(mid)
+        typing.sync(mid)
+        binding = self.store.get_binding()
         typing.ticket = "fixture-ticket"
-        typing.ticket_key = (self.binding['id'], self.binding['owner'], self.binding['base_url'])
+        typing.ticket_key = (binding['id'], binding['owner'], binding['base_url'])
         typing.ticket_until = typing.clock() + 600
-        typing.active = (self.binding, typing.ticket)
+        typing.active = (binding, typing.ticket)
         net.cancel_all()
-        with self.network() as (tls, factory, _), \
-                patch.object(typing, '_target', return_value=(self.binding, 'fixture-context', 1)):
+        with self.network() as (tls, factory, _):
             # A refresh racing shutdown fails both start and ordinary stop.
             typing.tick()
             factory.assert_not_called()
-            self.assertEqual(typing.active, (self.binding, typing.ticket))
+            self.assertEqual(typing.active, (binding, typing.ticket))
             typing.close()
         self.assertIsNone(typing.active)
         wire = b''.join(tls.sent)

@@ -37,11 +37,26 @@ class TimingTests(unittest.TestCase):
         phase=result['messages'][0]['phase_ms']
         self.assertEqual(phase['receive_to_event'],200)
         self.assertEqual(phase['callback_to_read'],89000)
+        self.assertIsNone(phase['callback_to_dispatch'])
+        self.assertIsNone(phase['dispatch_to_read_thread'])
         self.assertEqual(phase['read_server'],2)
         self.assertEqual(phase['reply_tool_server'],3)
         self.assertEqual(phase['queue_to_send'],100)
         self.assertEqual(phase['send_to_first_accept'],300)
         self.assertNotIn('PRIVATE',json.dumps(result))
+
+    def test_dispatch_phase_uses_observed_timestamps_and_monotonic_queue_time(self):
+        record(self.store,self.mid,'event_result',at=self.now+.5,outcome='acknowledged')
+        record(self.store,self.mid,'read_dispatch',at=self.now+80)
+        # A wall-clock adjustment must not become worker queue time.
+        record(self.store,self.mid,'read_thread_start',at=self.now+380,elapsed_ms=125)
+        self.now+=380.002
+        self.store.record_tool_call('read_weixin_message',self.mid,'ok',started_at=self.now-.002,elapsed_ms=2)
+        result=report(self.store)['messages'][0]
+        self.assertEqual(result['phase_ms']['callback_to_dispatch'],79500)
+        self.assertEqual(result['phase_ms']['dispatch_to_read_thread'],125)
+        self.assertEqual(result['phase_ms']['read_server'],2)
+        self.assertEqual(result['timestamps_unix']['read_thread_started'],1000380)
 
     def test_old_rows_are_not_fabricated_and_notices_do_not_count(self):
         self.store.db.execute('DELETE FROM message_timeline')
@@ -52,3 +67,5 @@ class TimingTests(unittest.TestCase):
         self.assertIsNone(result['timestamps_unix']['bridge_received'])
         self.assertIsNone(result['timestamps_unix']['weixin_first_accepted'])
         self.assertIsNone(result['phase_ms']['receive_to_first_accept'])
+        self.assertIsNone(result['phase_ms']['callback_to_dispatch'])
+        self.assertIsNone(result['phase_ms']['dispatch_to_read_thread'])

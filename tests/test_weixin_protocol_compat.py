@@ -168,10 +168,11 @@ class WeixinProtocolCompatTests(unittest.TestCase):
         with self.network({'ret': -2}):
             self.assertFalse(self.worker.poll_once())
         self.assertEqual(self.store.get_binding()['last_error'], 'gateway_error')
-        for action in (lambda: self.client.typing_ticket(self.binding, 'fixture-context'),
-                       lambda: self.client.send_typing(self.binding, 'fixture-ticket', 1)):
-            with self.network({'ret': -2}), self.assertRaisesRegex(BridgeError, '^gateway_error$'):
-                action()
+        with self.network({'ret': -2}), self.assertRaisesRegex(BridgeError, '^gateway_error$'):
+            self.client.typing_ticket(self.binding, 'fixture-context')
+        # sendtyping has an opaque HTTP ACK, unlike these parsed endpoints.
+        with self.network({'ret': -2}):
+            self.client.send_typing(self.binding, 'fixture-ticket', 1)
         attachment = {'kind': 'file', 'name': 'fixture.json', 'data': b'{}'}
         with self.network({'ret': -2}) as (tls, factory), self.assertRaisesRegex(BridgeError, '^gateway_error$'):
             upload_item(self.client, self.binding, attachment)

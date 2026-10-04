@@ -147,7 +147,7 @@ class IlinkClient:
         }
 
     @staticmethod
-    def _response(response, allow_empty=False):
+    def _response(response, allow_empty=False, *, void_ack=False):
         if response.status in (401, 403):
             raise BridgeError("auth_required")
         if 300 <= response.status < 400:
@@ -156,6 +156,10 @@ class IlinkClient:
             raise BridgeError("rate_limited")
         if response.status != 200:
             raise BridgeError("http_error")
+        if void_ack:
+            # CC Connect client.go sendTyping and Tencent's wrapper use only
+            # HTTP success; the bounded response body is an opaque ACK.
+            return {}
         return {} if allow_empty and not response.body.strip() else _json_object(response.body)
 
     def _post(self, binding: dict, path: str, body: dict, timeout: float, allow_empty=False) -> dict:
@@ -170,12 +174,14 @@ class IlinkClient:
             with self.connection_lock:
                 self.connections.add(connection)
             response = connection.execute("POST", path, encoded, headers, MAX_RESPONSE_BYTES, {200})
-            return self._response(response, allow_empty)
+            return self._response(response, allow_empty, void_ack=path == "/ilink/bot/sendtyping")
         except BridgeError:
             raise
         except NetworkFailure as error:
             category = {"timeout": "network_timeout", "response_too_large": "response_too_large", "cancelled": "network_cancelled"}.get(error.category, "network_error")
-            raise BridgeError(category) from None
+            failure = BridgeError(category)
+            failure._network_phase = error.phase
+            raise failure from None
         except (ValueError, UnicodeError, RecursionError):
             raise BridgeError("network_error") from None
         finally:
@@ -189,9 +195,16 @@ class IlinkClient:
 
     def poll(self, binding: dict) -> dict:
         checked = _binding(binding)
-        response = self._post(checked, "/ilink/bot/getupdates", {
-            "get_updates_buf": checked["cursor"], "base_info": self._base_info(),
-        }, self.poll_timeout)
+        try:
+            response = self._post(checked, "/ilink/bot/getupdates", {
+                "get_updates_buf": checked["cursor"], "base_info": self._base_info(),
+            }, self.poll_timeout)
+        except BridgeError as error:
+            # Only a deadline while reading the response to a written poll is
+            # an empty round. Other failures retain diagnostics and backoff.
+            if error.code != "network_timeout" or getattr(error, "_network_phase", None) != "response_read":
+                raise
+            return {"msgs": [], "get_updates_buf": checked["cursor"]}
         timeout = response.get("longpolling_timeout_ms")
         if type(timeout) is int and 0 < timeout <= 120000:
             self.poll_timeout = timeout / 1000 + 5
@@ -231,7 +244,7 @@ class IlinkClient:
                           ensure_ascii=False, separators=(',', ':')).encode('utf-8')
         try:
             response = presence_stop(host, body, self._headers(checked))
-            error = _application_error(self._response(response, allow_empty=True))
+            error = _application_error(self._response(response, void_ack=True))
             if error:
                 raise BridgeError(error)
         except NetworkFailure as error:
@@ -428,7 +441,9 @@ def _normalize_message(message: dict, binding: dict, now: float) -> dict | None:
         identity = json.dumps([binding["id"], binding["owner"], client_id, seq, timestamp], separators=(",", ":"), ensure_ascii=True)
         source_id = "fallback:" + hashlib.sha256(identity.encode("ascii")).hexdigest()
     created = message.get("create_time_ms")
-    if type(created) not in (int, float) or not math.isfinite(created) or created < 0:
+    # CC treats a zero/missing create_time_ms as unknown. Known protocol times
+    # are milliseconds; the private Store value is always seconds.
+    if type(created) not in (int, float) or not math.isfinite(created) or created <= 0:
         created_at = now
     else:
         created_at = created / 1000.0
@@ -445,10 +460,12 @@ def _normalize_message(message: dict, binding: dict, now: float) -> dict | None:
 
 
 class WeixinWorker:
-    def __init__(self, store, client=None):
+    def __init__(self, store, client=None, *, on_received=None):
         self.store = store
         self.client = client if client is not None else IlinkClient()
         self.send_after = 0
+        self.on_received = on_received
+        self.poll_added = 0
 
     def _record_error(self, code: str, stale=False):
         self.store.record_error(code)
@@ -460,6 +477,7 @@ class WeixinWorker:
             self.send_after = time.monotonic() + 30
 
     def poll_once(self) -> bool:
+        self.poll_added = 0
         if hasattr(self.store,"resume_session"):
             self.store.resume_session()
         binding = self.store.get_binding()
@@ -483,7 +501,8 @@ class WeixinWorker:
             for item in normalized:
                 item["received_at"]=received_at
             # Store commits messages, owner context and cursor as one transaction.
-            self.store.ingest(binding["id"], normalized, cursor or binding.get("cursor", ""))
+            options = {"after_commit": self.on_received} if self.on_received is not None else {}
+            self.poll_added = self.store.ingest(binding["id"], normalized, cursor or binding.get("cursor", ""), **options)
             self.store.record_error(None)
             return True
         except BridgeError as error:

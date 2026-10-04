@@ -288,7 +288,7 @@ class Store(AttachmentStore, WorkStore):
             self.db.execute("UPDATE binding SET last_error=?,status=? WHERE id=?",
                             (diagnostic, status, binding["id"]))
 
-    def ingest(self, account_id, messages, cursor):
+    def ingest(self, account_id, messages, cursor, *, after_commit=None):
         if (not isinstance(messages, list) or len(messages) > 1000
                 or not isinstance(cursor, str) or _text_bytes(cursor) is None
                 or _text_bytes(cursor) > 65536):
@@ -320,6 +320,7 @@ class Store(AttachmentStore, WorkStore):
             received_at=message.get("received_at",self.clock())
             if not _timestamp(received_at):raise BridgeError("invalid_inbound_message")
             normalized.append((source, peer, text, float(created_at), context, refs, quotes, aliases,received_at))
+        new_ids = []
         with self._transaction():
             binding = self._binding()
             if account_id != binding["id"]:
@@ -402,6 +403,7 @@ class Store(AttachmentStore, WorkStore):
                 for aid in cached_aids:
                     self.db.execute("INSERT OR IGNORE INTO attachment_links VALUES(?,?)", (identifier,aid))
                 added += 1
+                new_ids.append(identifier)
             latest_context = self._latest_context(binding)
             if latest_context and (previous_context is None or latest_context["id"] != previous_context["id"]):
                 self.db.execute(
@@ -410,6 +412,14 @@ class Store(AttachmentStore, WorkStore):
                     "AND message_id IN (SELECT id FROM messages WHERE account=? AND peer=?)",
                     (latest_context["id"], binding["id"], binding["owner"]))
             self.db.execute("UPDATE binding SET cursor=?,last_error=NULL WHERE id=?", (cursor, binding["id"]))
+        # A best-effort presence hook receives identifiers only after the whole
+        # batch and cursor commit. Failure cannot turn a committed poll into a
+        # failed receive, and duplicates/tombstones never reach the hook.
+        if new_ids and after_commit is not None:
+            try:
+                after_commit(tuple(new_ids))
+            except Exception:
+                pass
         return added
 
     def remember_sent_quote(self, source_id, reply):
@@ -433,24 +443,45 @@ class Store(AttachmentStore, WorkStore):
                     "attachments": self.attachment_metadata(message_id),
                     "quotes":[dict(has_reference_id=bool(r["has_reference_id"]),status=r["status"],resolved_message_id=r["resolved_message_id"],shape=json.loads(r["shape"])) for r in self.db.execute("SELECT has_reference_id,status,resolved_message_id,shape FROM message_quotes WHERE message_id=? ORDER BY position",(message_id,))]}
 
-    def typing_target(self, message_ids):
-        """Internal route only for pending owner messages dot has actually read."""
+    def _waiting_typing_ids(self, message_ids, *, created_since=None):
+        """Validate bounded in-memory waiting candidates without reading text."""
         if not message_ids or len(message_ids) > 128:
+            return set()
+        with self.lock:
+            binding = self.get_binding()
+            if not binding or not binding['enabled'] or binding['status'] != 'ready':
+                return set()
+            placeholders = ','.join('?' for _ in message_ids)
+            query = ("SELECT m.id FROM messages m JOIN message_work w ON w.message_id=m.id "
+                     "WHERE m.id IN (" + placeholders + ") AND m.account=? AND m.peer=? "
+                     "AND w.state='waiting' AND w.read_at IS NULL")
+            parameters = (*message_ids, binding['id'], binding['owner'])
+            if created_since is not None:
+                query += ' AND m.created_at>=?'
+                parameters += (created_since,)
+            return {row['id'] for row in self.db.execute(query, parameters)}
+
+    def typing_target(self, message_ids, *, waiting_ids=()):
+        """Private presence route; durable active work takes priority over waiting."""
+        if not message_ids and not waiting_ids or len(message_ids) + len(waiting_ids) > 128:
             return None
         with self.lock:
             binding = self.get_binding()
             if not binding or not binding["enabled"] or binding["status"] != "ready":
                 return None
-            placeholders = ",".join("?" for _ in message_ids)
-            rows = self.db.execute(
-                "SELECT m.id FROM messages m JOIN message_work w ON w.message_id=m.id "
-                "WHERE m.id IN (" + placeholders + ") AND m.account=? AND m.peer=? "
-                "AND w.state='active' AND w.lease_until>?",
-                (*message_ids, binding["id"], binding["owner"],self.clock())).fetchall()
+            active_ids = set()
+            if message_ids:
+                placeholders = ",".join("?" for _ in message_ids)
+                active_ids = {row['id'] for row in self.db.execute(
+                    "SELECT m.id FROM messages m JOIN message_work w ON w.message_id=m.id "
+                    "WHERE m.id IN (" + placeholders + ") AND m.account=? AND m.peer=? "
+                    "AND w.state='active' AND w.lease_until>?",
+                    (*message_ids, binding["id"], binding["owner"],self.clock()))}
+            selected = active_ids or self._waiting_typing_ids(waiting_ids)
             context = self._latest_context(binding)
-            if not rows or not context:
+            if not selected or not context:
                 return None
-            return binding, context["context_token"], {row["id"] for row in rows}
+            return binding, context["context_token"], selected
 
     def list_pending(self, limit=20):
         if type(limit) is not int or not 1 <= limit <= 100:

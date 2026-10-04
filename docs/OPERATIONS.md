@@ -130,7 +130,24 @@ wechat-dot-bridge --config CONFIG backup-managed /PRIVATE/bridge-backups --keep 
 旧消息缺失阶段为 null，不反推或伪造时间。读工具关键时间另存 timeline，
 不受最近 1000 条工具诊断记录轮换影响。
 
+读取请求新增两个派发阶段，用于把读前等待拆开：`callback_to_dispatch` 表示通知 ACK
+到 SDK 收到并验证读请求的时间，包含平台调度、Tunnel 和 SDK 入站处理；
+`dispatch_to_read_thread` 用单调时钟记录该请求等待 AnyIO 工作线程的时间。
+旧记录没有派发观测时保持 null，不能由 `callback_to_read` 直接断言所有时间都属于模型。
+
+新来信成功入库后即尝试显示输入提示，等待 dot 时也显示，等待期限为五分钟。
+这是进程内的等候提示，不把消息标成已读取或处理中；dot 实际读取后接续持久处理租期。
+重复来信不续期，服务重启不为历史消息恢复等候提示。完成、停止、暂停或到期后取消；
+同一会话还有有效等待或处理时继续显示。刷新网络失败仍可能造成间断，状态中的
+ticket / start / stop 固定结果计数用于定位接口失败；成功调用不保证手机端显示。
+`waiting_leases` 记录等候候选数；`waiting_history_skipped` 计数表示创建时间早于启动前
+两秒的历史候选被排除，不输出消息 ID 或时间原值。创建时间判断依赖主机校时。
+
+正常 getupdates 响应读取截止保持 cursor 并继续轮询；DNS、连接、TLS、协议和认证错误
+仍按故障处理。入站提交、附件就绪、读取及回复入队会唤醒对应 worker，周期检查继续兜底；
+发送仍只有一个 worker，唤醒不绕过限流或分段节奏，也不重试 `uncertain`。
+
 先连续测三条纯文字，每条收到回复再发下一条；比较 receive_to_event、
 callback_to_read、read_server、reply_tool_server、queue_to_send 等阶段。
-计时只增加观测，不调整轮询/批处理/重试策略。回滚遵循上面的兼容副本流程，
+派发计时本身只增加观测，唤醒和轮询调整见上文。回滚遵循上面的兼容副本流程，
 保留原库和升级后消息，不用旧快照覆盖生产数据。

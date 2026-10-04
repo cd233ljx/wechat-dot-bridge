@@ -319,3 +319,39 @@ Store 的 outbox / parts / work 原子事务必须保留，不能拆成各自提
 这两处属于微信协议适配边界；会话 / pending / 终结与取消的再次独立核验仍支持保留主体架构。
 
 补充后的 Python 3.11 / 3.14 完整回归各 321 项通过、零跳过；完整发布检查通过。
+
+### 开源前复核：输入提示与响应等待
+
+继续使用上述固定 CC Connect 版本，核对 `StartTyping → getTypingTicket → sendTyping`、
+`getUpdates → receiveLoop` 及 Engine 的启动 / 结束调用链。主体架构仍可保留，本轮补齐：
+
+- `sendTyping` 的响应体没有约定 JSON ACK。CC Connect 和腾讯适配均按 HTTP 成功处理；
+  桥接也仅在该端点忽略有界响应体，认证、HTTP 状态、TLS、响应大小和取消检查保留。
+  参考 [sendTyping](https://github.com/chenhg5/cc-connect/blob/dfad19415a38b00b2c5c288610784d1a7eef337f/platform/weixin/client.go#L238)。
+- 一次刷新失败不再丢弃仍有效的十分钟票据；新的等待或处理轮次不继承旧轮次的失败退避。
+  同一有效会话的成功刷新仍保持五秒节奏。桥接保留有界恢复，上游则在刷新失败后停止该轮提示。
+- 响应读取阶段的正常长轮询截止视为空轮并保留原 cursor，不额外进入故障退避。
+  桥接比上游更窄，只接受请求已写出后的响应读取超时；DNS、连接、TLS、写入及取消仍失败。
+  参考 [getUpdates](https://github.com/chenhg5/cc-connect/blob/dfad19415a38b00b2c5c288610784d1a7eef337f/platform/weixin/client.go#L143)。
+- 入站提交、媒体就绪和工具提交通过现有 AnyIO 唤醒 worker，周期检查继续兜底。
+  使用 [AnyIO 线程通知](https://anyio.readthedocs.io/en/stable/threads.html#calling-synchronous-code-from-a-worker-thread)
+  和 [Event](https://anyio.readthedocs.io/en/stable/synchronization.html#events)，不增加调度框架。
+  发送仍串行并保留最小间隔、限流冷却及 `uncertain`；数据库提交结果不依赖唤醒成功。
+
+本人明确选择“收到来信就显示，等待 dot 时也显示”。这是与 CC Connect 在实际 Agent turn
+开始时显示的适配差异：桥接只为本进程原子入库的新增本人来信登记五分钟内存等待，
+不提前读取消息，不把工作标为 active。读取后接续持久处理租期；完成 / 停止 / 到期取消，
+同一会话还有其他有效工作时继续。候选最多 128 个，活跃处理优先；重复和去重墓碑不续期，
+重启不从历史重建。来信有有效创建时间时，按上游启动前两秒规则过滤旧历史；
+缺失或零创建时间用本地接收时刻，无法据此识别服务器历史。创建时间筛选依赖主机校时。
+参考 [启动历史过滤](https://github.com/chenhg5/cc-connect/blob/dfad19415a38b00b2c5c288610784d1a7eef337f/core/dedup.go#L76)。
+
+本地脱敏延迟记录显示，较长等待主要在通知 ACK 到 dot 读取之间，桥接读工具本身通常
+低于十毫秒。新增 SDK 派发 / 工作线程观测用于进一步拆分，不能把整段等待直接归因于模型。
+这里修复桥接自身的间隙并提前显示等候状态，仍不承诺手机端必然显示或 dot 的固定首答时间。
+
+最终 Python 3.11 / 3.14 完整回归各 365 项通过、零跳过；锁文件、Ruff、升级演练、
+完整本地历史秘密扫描、源码包 / wheel 与 checkout 外安装检查均通过。新增回归覆盖
+真正新入站与重复 / 回滚 / 重启、媒体未就绪、等候转读取、并发登记、工作线程排队、
+正常轮询截止与部分写入失败、限流与 `uncertain` 不重发。独立审查发现的等候候选
+并发丢失已复现并修复。生产更新结果另记于 [历史验证记录](REAL_VALIDATION.md)。
