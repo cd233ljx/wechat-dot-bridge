@@ -12,7 +12,7 @@ MCP Events 目前支持 dot，以及符合条件的 Work / Cloud 聊天；它要
 2. 运行 README 中配置的官方 `tunnel-client` 用户服务。桥接通过 stdio 接收 MCP，不需要公网入站端口。
 3. 打开 [ChatGPT Plugins](https://chatgpt.com/plugins)，创建开发者插件，在 Connection 中选 **Tunnel**，选择已有 Tunnel 或填入控制台给出的有效 identity。本方案为单人私有 stdio 服务，认证方式选择 **No authentication / 无认证**，依赖仅本人可用的 Tunnel 访问控制；不要选需要独立 OAuth 服务的 OAuth 模式。
 4. 保持插件仅自己可用，不分享给工作区、组织或其他账号。不要发布到公共目录。私人 Tunnel 与公共插件发布是不同部署模式。
-5. 扫描 / 刷新插件工具和事件，确认八个工具以及 `weixin.message` 出现，然后把插件添加到你原有 dot。
+5. 扫描 / 刷新插件工具和事件，确认十一个工具以及 `weixin.message` 出现，然后把插件添加到你原有 dot。
 
 这些连接方式与访问要求依据 [官方 Secure MCP Tunnel 指南](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels)。**不要自行构造 `server_url`、伪造 Tunnel URL 或把本机 stdio 当公共服务地址。** 未出现在插件页面时先核验关联和权限；不要因此开放公网 MCP 端口。
 
