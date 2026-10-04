@@ -184,6 +184,7 @@ class StoreTests(unittest.TestCase):
 
     def test_migration_preserves_legacy_accepted_reply_and_allows_append(self):
         identifier = self.add()
+        self.store.db.execute("PRAGMA user_version=0")
         self.store.db.execute("DROP TABLE replies")
         self.store.db.execute("""CREATE TABLE replies(message_id TEXT PRIMARY KEY REFERENCES messages(id),
             text TEXT NOT NULL,client_id TEXT UNIQUE NOT NULL,status TEXT NOT NULL,error TEXT,

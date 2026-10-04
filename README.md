@@ -4,7 +4,7 @@
 
 桥接使用 Python 3.11+、SQLite、cryptography 和 Pillow。它不运行模型、不调用模型 API、不启动 Codex CLI，也不创建替代 dot 的助手。dot / Work 和相关 OpenAI 产品仍受各自用量与费用规则约束。
 
-**当前状态：文字、输入提示、图片描述与原图回传、文件回传、语音接收与转写、旧图引用回复、视频回传、进度加长文及生成 TXT 文件已由本人确认。** 接入能力、账号权限和微信实际行为需要在你自己的环境验证。
+**当前版本：0.1.0，实验性 / Early Access，支持 Linux 和 systemd 用户服务、本人单账号私聊。** 文字、输入提示、图片描述与原图回传、文件回传、语音接收与转写、旧图引用回复、视频回传、进度加长文及生成 TXT 文件已由本人确认。接入能力、账号权限和微信实际行为需要在你自己的环境验证；历史结果不代表其他部署已通过。
 
 ```mermaid
 flowchart LR
@@ -75,7 +75,7 @@ python3 scripts/install_local.py \
   --key-file "$WDB_KEY_FILE"
 ```
 
-默认包装器安装到 `~/.local/bin/wechat-dot-bridge`，用户服务到 `~/.config/systemd/user/wechat-dot-bridge.service`。可用 `--bin-dir`、`--unit-dir` 指定其他专用位置。脚本不覆盖现有目标，**不会 enable 或 start 服务**。选项 `--proxy http://127.0.0.1:PORT` 仅用于已存在的本机 Tunnel 控制面代理；Events 回调的代理通过下面的独立配置设置，微信收发仍直连经过目标校验的腾讯 HTTPS。
+默认包装器安装到 `~/.local/bin/wechat-dot-bridge`，用户服务到 `~/.config/systemd/user/wechat-dot-bridge.service`。可用 `--bin-dir`、`--unit-dir` 指定其他位置。已有共享程序 / unit 目录可以保留安全的 `0755` 权限，安装器不修改共享目录权限；专用配置与状态目录仍必须为 `0700`，私人文件为 `0600`。脚本不覆盖现有目标，**不会 enable 或 start 服务**。选项 `--proxy http://127.0.0.1:PORT` 仅用于已存在的本机 Tunnel 控制面代理；Events 回调的代理通过下面的独立配置设置，微信收发仍直连经过目标校验的腾讯 HTTPS。
 
 `bridge.json` 中的 `callback_hosts` 初始为空，因此不会向未经批准的回调发送数据。回调的精确域名配置见 [dot 接入说明](docs/DOT_SETUP.md)。配置文件、Tunnel profile 和状态目录都不应加入版本库。
 
@@ -174,14 +174,17 @@ python3 scripts/check_runtime.py \
 | `read_weixin_message` | 读取本人来信、引用和附件；就绪图片直接返回可视预览 |
 | `read_weixin_attachment` | 读取图片预览、文件分块与文本文件内容 |
 | `stage_weixin_attachment` | 私有暂存新附件，支持分块上传 |
+| `import_weixin_attachment` | 从明确提供的公开 HTTPS 地址导入附件 |
 | `reply_weixin_attachment` | 将收到或暂存的附件回传同一对话 |
 | `reply_weixin_message` | 为已有来信提交回复，支持多次追加 |
+| `report_weixin_progress` | 续期或结束处理进度与输入提示，不发送消息 |
+| `retry_weixin_operation` | 重试明确失败的发送或附件下载，保留已接受部分 |
 | `get_weixin_send_status` | 查询 API 接受、失败或不确定状态 |
 | `list_pending_weixin_messages` | 显式恢复尚未提交回复的来信 |
 
 验收只发一条有唯一标记的文字。确认现有 dot 收到事件、读取同一消息 ID、提交回复，并由你在同一个微信对话看见一次回复。记录状态和时间即可，不要共享消息原文、callback URL、token 或密钥。
 
-可用 [真人验收记录模板](docs/REAL_VALIDATION.md)逐项记录部署结果；该模板初始全部待验证。
+当前应发现表中的 **11 个工具**及 `weixin.message` 事件。按 [当前部署验收清单](docs/ACCEPTANCE.md)逐项记录自己的结果；[历史真人验收记录](docs/REAL_VALIDATION.md)保留此前部署证据，其中旧版五 / 八工具是当时的数量。
 
 `accepted` 仅代表微信 API 接受请求，**不等于已经投递或已读**。POST 后失联会保留 `uncertain`，系统不盲目重发。同一来信可以追加多条不同回复；相同正文默认幂等，独立 `reply_key` 可区分有意重复的回复。长文分段状态会持久保存，可查询 `parts_total` 和 `parts_accepted`。详细失败与恢复边界见 [安全说明](docs/SECURITY.md) 和 [dot 设置说明](docs/DOT_SETUP.md)。
 
@@ -212,5 +215,8 @@ systemctl --user stop wechat-dot-bridge.service
 - [干净环境安装与发布检查](docs/INSTALL.md)
 - [故障诊断、管理命令、升级与备份恢复](docs/OPERATIONS.md)
 - [真人验收步骤及待确认边界](docs/ACCEPTANCE.md)
+- [贡献指南与本地发布检查](CONTRIBUTING.md)
+- [版本与升级记录](CHANGELOG.md)
+- [私密漏洞报告](SECURITY.md)
 
 已支持 public HTTPS 文件导入和自动媒体类型识别。服务器不会把 dot 的 sandbox 文件路径当成本机路径。故障提示明确标为“桥接状态”，不运行额外模型，不会将原消息标记为处理完成。

@@ -32,6 +32,7 @@
 - 文件 / 视频原样传输与 dot 能否理解其内容是不同能力；图片提供原生 MCP 图像，文本文件另提供可读文本，其他文件以 MIME 资源分块提供。
 - 引用缓存只包含桥接见过的消息；它不是 OpenClaw 或 dot 主聊天历史迁移。
 - 单附件 20 MiB、总缓存 256 MiB；超过七天的已完成附件缓存定期回收，待处理和待发送内容保留；预算可配置。长回复单次 256 KiB。预算均为本版实现值，不是微信上限。
+- 消息与回复历史默认长期保留；可显式配置完成历史清理和容量告警。保留待处理 / 未确认发送及去重墓碑，附件预算与告警不构成数据库硬上限，详见 [OPERATIONS](OPERATIONS.md)。
 - 延迟优化、dot 主聊天消息列表同步按用户要求暂缓。
 
 ## 一次性真人验收
@@ -43,4 +44,4 @@
 
 ## 运维与文件导入补齐
 
-新增 `import_weixin_attachment`（公开 HTTPS → 附件，20 MiB），stage 的 `kind:auto`，待处理超时及失败提示，管理 CLI、备份恢复与 CI。详细操作见 [OPERATIONS](OPERATIONS.md)，干净安装见 [INSTALL](INSTALL.md)，手机验收见 [ACCEPTANCE](ACCEPTANCE.md)。本地公共 HTTPS 下载已验证，不代表原 dot 已能提供其生成文件的外部链接。
+新增 `import_weixin_attachment`（公开 HTTPS → 附件，20 MiB），stage 的 `kind:auto`，待处理超时及失败提示，管理 CLI、备份恢复及本地发布检查。详细操作见 [OPERATIONS](OPERATIONS.md)，干净安装见 [INSTALL](INSTALL.md)，手机验收见 [ACCEPTANCE](ACCEPTANCE.md)。本地公共 HTTPS 下载已验证，不代表原 dot 已能提供其生成文件的外部链接。

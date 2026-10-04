@@ -1,4 +1,4 @@
-include README.md NOTICE.txt LICENSE
+include README.md CONTRIBUTING.md CHANGELOG.md SECURITY.md AGENTS.md NOTICE.txt LICENSE
 recursive-include docs *.md
 recursive-include scripts *.py *.sh
 recursive-include licenses *.txt

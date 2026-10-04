@@ -211,6 +211,7 @@ class ChannelFeatures(unittest.TestCase):
 
     def test_legacy_quote_migration_preserves_unambiguous_cache(self):
         self.store.db.execute("INSERT INTO sent_quotes VALUES('600','legacy reply',NULL)")
+        self.store.db.execute("PRAGMA user_version=0")
         self.store.db.execute("DROP TABLE sent_quote_cache")
         self.restart()
         self.assertEqual(self.store.db.execute("SELECT text FROM sent_quote_cache WHERE source_id='600'").fetchone()[0],'legacy reply')

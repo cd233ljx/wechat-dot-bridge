@@ -19,6 +19,7 @@ import time
 from urllib.parse import urlsplit
 
 from .errors import BridgeError
+from .migrations import migrate
 
 
 MAX_PENDING = 128
@@ -142,113 +143,12 @@ class Store(AttachmentStore):
             self.db.execute("PRAGMA foreign_keys=ON")
             self.db.execute("PRAGMA busy_timeout=5000")
             self.db.execute("PRAGMA journal_mode=WAL")
-            self.db.executescript("""
-                CREATE TABLE IF NOT EXISTS binding (
-                    id TEXT PRIMARY KEY,
-                    owner TEXT NOT NULL,
-                    token TEXT NOT NULL,
-                    base_url TEXT NOT NULL,
-                    cursor TEXT NOT NULL DEFAULT '',
-                    enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1)),
-                    status TEXT NOT NULL DEFAULT 'ready',
-                    last_error TEXT
-                );
-                CREATE TABLE IF NOT EXISTS messages (
-                    id TEXT PRIMARY KEY,
-                    account TEXT NOT NULL,
-                    peer TEXT NOT NULL,
-                    source_id TEXT NOT NULL,
-                    text TEXT NOT NULL,
-                    created_at REAL NOT NULL,
-                    context_token TEXT,
-                    state TEXT NOT NULL DEFAULT 'pending',
-                    UNIQUE(account, peer, source_id)
-                );
-                CREATE TABLE IF NOT EXISTS replies (
-                    message_id TEXT PRIMARY KEY REFERENCES messages(id),
-                    text TEXT NOT NULL,
-                    client_id TEXT NOT NULL UNIQUE,
-                    status TEXT NOT NULL,
-                    error TEXT,
-                    created_at REAL NOT NULL,
-                    context_id TEXT,
-                    attempts INTEGER NOT NULL DEFAULT 0
-                );
-                CREATE INDEX IF NOT EXISTS message_pending_scope
-                    ON messages(account,peer,state,created_at);
-                CREATE INDEX IF NOT EXISTS reply_dispatch
-                    ON replies(status,created_at);
-            """)
-            self._migrate_reply_identity()
-            self.db.execute("CREATE TABLE IF NOT EXISTS message_aliases (account TEXT NOT NULL,peer TEXT NOT NULL,reference_id TEXT NOT NULL,message_id TEXT NOT NULL REFERENCES messages(id),PRIMARY KEY(account,peer,reference_id))")
-            self.db.execute("CREATE TABLE IF NOT EXISTS message_quotes (message_id TEXT NOT NULL REFERENCES messages(id),position INTEGER NOT NULL,has_reference_id INTEGER NOT NULL,status TEXT NOT NULL,resolved_message_id TEXT,PRIMARY KEY(message_id,position))")
-            if "shape" not in {r["name"] for r in self.db.execute("PRAGMA table_info(message_quotes)")}:
-                self.db.execute("ALTER TABLE message_quotes ADD COLUMN shape TEXT NOT NULL DEFAULT '{}'")
-            self.db.execute("INSERT OR IGNORE INTO message_aliases SELECT account,peer,CASE WHEN source_id LIKE 'message:item:%' THEN substr(source_id,14) ELSE substr(source_id,9) END,id FROM messages WHERE source_id LIKE 'message:%'")
-            self._init_media()
-            if "is_notice" not in {r["name"] for r in self.db.execute("PRAGMA table_info(replies)")}:
-                self.db.execute("ALTER TABLE replies ADD COLUMN is_notice INTEGER NOT NULL DEFAULT 0")
-            self.db.execute("""CREATE TABLE IF NOT EXISTS sent_quotes (
-                source_id TEXT PRIMARY KEY, text TEXT NOT NULL, attachment_id TEXT)""")
-            # Older outbound caches had no account/conversation key. Only migrate
-            # when the retained message history proves a single binding scope.
-            fresh_quotes = not self.db.execute("SELECT 1 FROM sqlite_master WHERE name='sent_quote_cache'").fetchone()
-            self.db.execute("""CREATE TABLE IF NOT EXISTS sent_quote_cache (
-                account TEXT NOT NULL,peer TEXT NOT NULL,source_id TEXT NOT NULL,
-                text TEXT NOT NULL,attachment_id TEXT,PRIMARY KEY(account,peer,source_id))""")
-            if fresh_quotes:
-                scopes=self.db.execute("SELECT DISTINCT account,peer FROM messages").fetchall()
-                current=self.db.execute("SELECT id,owner FROM binding").fetchall()
-                if len(scopes)==1 and len(current)==1 and tuple(scopes[0])==tuple(current[0]):
-                    self.db.execute("INSERT OR IGNORE INTO sent_quote_cache SELECT ?,?,source_id,text,attachment_id FROM sent_quotes",tuple(scopes[0]))
-            self.db.execute("""CREATE TABLE IF NOT EXISTS reply_parts (
-                reply_id TEXT NOT NULL, part INTEGER NOT NULL, text TEXT NOT NULL,
-                accepted INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(reply_id,part))""")
-            part_columns = {r["name"] for r in self.db.execute("PRAGMA table_info(reply_parts)")}
-            if "kind" not in part_columns:
-                self.db.execute("ALTER TABLE reply_parts ADD COLUMN kind TEXT NOT NULL DEFAULT 'text'")
-                for row in self.db.execute("SELECT client_id FROM replies WHERE attachment_id IS NOT NULL AND status IN ('queued','failed','context_required','auth_required')").fetchall():
-                    last = self.db.execute("SELECT part,text FROM reply_parts WHERE reply_id=? ORDER BY part DESC LIMIT 1", (row["client_id"],)).fetchone()
-                    if last and not last["text"]:
-                        self.db.execute("UPDATE reply_parts SET kind='media' WHERE reply_id=? AND part=?", (row["client_id"],last["part"]))
-                    else:
-                        self.db.execute("INSERT INTO reply_parts(reply_id,part,text,kind) VALUES(?,?,'','media')", (row["client_id"],last["part"]+1 if last else 0))
-            self.db.execute("CREATE TABLE IF NOT EXISTS session_pause (account TEXT PRIMARY KEY, resume_at REAL NOT NULL)")
-            self.db.execute("CREATE TABLE IF NOT EXISTS processing (message_id TEXT PRIMARY KEY REFERENCES messages(id), expires REAL NOT NULL)")
-            self.db.execute("""CREATE TABLE IF NOT EXISTS tool_calls (
-                id INTEGER PRIMARY KEY, name TEXT NOT NULL, message_id TEXT,
-                outcome TEXT NOT NULL, created_at REAL NOT NULL)""")
-            from .timing import init as init_timing
-            init_timing(self)
-            if self.db.execute("SELECT count(*) FROM binding").fetchone()[0] > 1:
-                raise BridgeError("invalid_binding_state")
-        except (sqlite3.Error, BridgeError) as error:
+            migrate(self.db, clock=self.clock)
+        except BaseException as error:
             if hasattr(self, "db"):
                 self.db.close()
-            if isinstance(error, BridgeError):
-                raise
-            raise BridgeError("database_unavailable") from None
-
-    def _migrate_reply_identity(self):
-        columns = {r["name"]: r for r in self.db.execute("PRAGMA table_info(replies)")}
-        if not columns["message_id"]["pk"]:
-            return
-        # Preserve every existing client id and send outcome. A reply, not an
-        # inbound message, is now the unit of idempotency and uncertainty.
-        self.db.execute("BEGIN IMMEDIATE")
-        try:
-            self.db.execute("""CREATE TABLE replies_v2 (
-                message_id TEXT NOT NULL REFERENCES messages(id), text TEXT NOT NULL,
-                client_id TEXT PRIMARY KEY, status TEXT NOT NULL, error TEXT,
-                created_at REAL NOT NULL, context_id TEXT, attempts INTEGER NOT NULL DEFAULT 0)""")
-            self.db.execute("INSERT INTO replies_v2 SELECT message_id,text,client_id,status,error,created_at,context_id,attempts FROM replies")
-            self.db.execute("DROP TABLE replies")
-            self.db.execute("ALTER TABLE replies_v2 RENAME TO replies")
-            self.db.execute("CREATE INDEX reply_dispatch ON replies(status,created_at)")
-            self.db.execute("CREATE INDEX reply_message ON replies(message_id)")
-            self.db.execute("COMMIT")
-        except Exception:
-            self.db.execute("ROLLBACK")
+            if isinstance(error, sqlite3.Error):
+                raise BridgeError("database_unavailable") from None
             raise
 
     @contextmanager
@@ -434,7 +334,9 @@ class Store(AttachmentStore):
                 if peer != binding["owner"]:
                     raise BridgeError("owner_identity_mismatch")
                 identifier = _opaque_id(binding["id"], peer, source)
-                if self.db.execute("SELECT 1 FROM messages WHERE id=?", (identifier,)).fetchone():
+                if self.db.execute("SELECT 1 FROM messages WHERE id=? UNION ALL "
+                                   "SELECT 1 FROM retired_messages WHERE id=? LIMIT 1",
+                                   (identifier, identifier)).fetchone():
                     continue
                 if count + added >= MAX_PENDING:
                     raise BridgeError("inbox_full")

@@ -1,4 +1,5 @@
 """Owner diagnostics, offline administration, and bounded reply-linked notices."""
+from contextlib import closing
 import os
 import sqlite3
 from pathlib import Path
@@ -34,20 +35,37 @@ def diagnostics(store, threshold=300):
             issues.append(dict(code='channel_error',error=binding['last_error']))
         if binding and not any(s['status']=='active' and (s['refresh_before'] is None or s['refresh_before']>now) for s in subscriptions(store)):
             issues.append(dict(code='subscription_inactive'))
+        from .maintenance import storage_status
+        storage = storage_status(store)
+        issues.extend({'code': code} for code in storage['warnings'])
         return {'healthy':not issues,'issues':issues}
 
 
 def backup(store, destination):
+    from .store import _private_directory
     path=Path(destination).absolute()
     for item in (path,*path.parents):
         if item.is_symlink():
             raise BridgeError('unsafe_path')
+    _private_directory(path.parent)
     fd=os.open(path,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600)
+    created = os.fstat(fd)
     os.close(fd)
-    with store.lock, sqlite3.connect(path) as target:
-        store.db.backup(target)
-        if target.execute('PRAGMA integrity_check').fetchone()[0]!='ok':
-            raise BridgeError('backup_invalid')
+    try:
+        with store.lock, closing(sqlite3.connect(path)) as target:
+            store.db.backup(target)
+            if target.execute('PRAGMA integrity_check').fetchone()[0]!='ok':
+                raise BridgeError('backup_invalid')
+    except BaseException:
+        # A failed partial snapshot must never count towards future rotation.
+        # Preserve any independently replaced file at the same destination.
+        try:
+            current = path.lstat()
+            if (current.st_dev, current.st_ino) == (created.st_dev, created.st_ino):
+                path.unlink()
+        except OSError:
+            pass
+        raise
     return {'backup_created':True,'integrity':'ok'}
 
 
@@ -90,6 +108,8 @@ class HealthMonitor:
 
 def restore(source,directory):
     import stat
+    from .store import _private_directory
+    directory = _private_directory(directory)
     source=Path(source).absolute()
     for item in (source,*source.parents):
         if item.is_symlink(): raise BridgeError('unsafe_path')
@@ -97,13 +117,13 @@ def restore(source,directory):
     if not stat.S_ISREG(info.st_mode) or info.st_uid!=os.getuid() or info.st_mode&0o077:
         raise BridgeError('unsafe_backup')
     target=Path(directory)/'bridge.sqlite3'
-    with sqlite3.connect(source.as_uri()+'?mode=ro',uri=True) as original:
+    with closing(sqlite3.connect(source.as_uri()+'?mode=ro',uri=True)) as original:
         if original.execute('PRAGMA integrity_check').fetchone()[0]!='ok':
             raise BridgeError('backup_invalid')
         tables={r[0] for r in original.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         if not {'messages','replies','binding'} <= tables: raise BridgeError('backup_invalid')
         fd=os.open(target,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600);os.close(fd)
-        with sqlite3.connect(target) as recovered:
+        with closing(sqlite3.connect(target)) as recovered, recovered:
             original.backup(recovered)
             recovered.execute('UPDATE binding SET enabled=0')
     return {'restored':True,'started':False,'note':'Review pending and uncertain queues before enabling a sole receiver.'}

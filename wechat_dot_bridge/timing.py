@@ -4,16 +4,6 @@ from .errors import BridgeError
 STAGES={'received','event_enqueued','event_start','event_result','reply_queued','send_start','send_result','weixin_accepted','read_start','read_result','reply_tool_result'}
 
 
-def init(store):
-    store.db.execute('''CREATE TABLE IF NOT EXISTS message_timeline (
-        id INTEGER PRIMARY KEY,message_id TEXT NOT NULL REFERENCES messages(id),
-        stage TEXT NOT NULL,at REAL NOT NULL,outcome TEXT,elapsed_ms REAL,reply_id TEXT)''')
-    store.db.execute('CREATE INDEX IF NOT EXISTS timeline_message ON message_timeline(message_id,id)')
-    columns={r['name'] for r in store.db.execute('PRAGMA table_info(tool_calls)')}
-    for name in ('started_at','elapsed_ms'):
-        if name not in columns:store.db.execute('ALTER TABLE tool_calls ADD COLUMN '+name+' REAL')
-
-
 def record(store,mid,stage,*,at=None,outcome=None,elapsed_ms=None,reply_id=None):
     if stage not in STAGES:raise BridgeError('invalid_timing_stage')
     with store.lock:

@@ -20,27 +20,6 @@ def media_identity(ref):
 
 
 class AttachmentStore:
-    def _init_media(self):
-        self.db.execute("""CREATE TABLE IF NOT EXISTS attachments (
-            id TEXT PRIMARY KEY, account TEXT NOT NULL, peer TEXT NOT NULL,
-            message_id TEXT REFERENCES messages(id), kind TEXT NOT NULL, name TEXT NOT NULL,
-            descriptor TEXT NOT NULL, data BLOB, status TEXT NOT NULL, error TEXT,
-            attempts INTEGER NOT NULL DEFAULT 0, next_attempt REAL NOT NULL DEFAULT 0)""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS attachment_uploads (
-            id TEXT PRIMARY KEY, account TEXT NOT NULL, peer TEXT NOT NULL,
-            kind TEXT NOT NULL, name TEXT NOT NULL, data BLOB NOT NULL, updated REAL NOT NULL)""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS completed_uploads (
-            id TEXT PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL,
-            offset INTEGER NOT NULL, digest TEXT NOT NULL, attachment_id TEXT NOT NULL)""")
-        self.db.execute("""CREATE TABLE IF NOT EXISTS attachment_links (
-            message_id TEXT NOT NULL REFERENCES messages(id), attachment_id TEXT NOT NULL REFERENCES attachments(id),
-            PRIMARY KEY(message_id,attachment_id))""")
-        if "created_at" not in {r["name"] for r in self.db.execute("PRAGMA table_info(attachments)")}:
-            self.db.execute("ALTER TABLE attachments ADD COLUMN created_at REAL NOT NULL DEFAULT 0")
-            self.db.execute("UPDATE attachments SET created_at=? WHERE created_at=0", (self.clock(),))
-        if "attachment_id" not in {r["name"] for r in self.db.execute("PRAGMA table_info(replies)")}:
-            self.db.execute("ALTER TABLE replies ADD COLUMN attachment_id TEXT")
-
     def _cache_room(self, size):
         total = self.db.execute("SELECT COALESCE(SUM(length(data)),0) FROM attachments").fetchone()[0]
         total += self.db.execute("SELECT COALESCE(SUM(length(data)),0) FROM attachment_uploads").fetchone()[0]

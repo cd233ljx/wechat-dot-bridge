@@ -68,8 +68,10 @@ def load_config(args):
             config = json.loads(path.read_text())
         except (OSError, ValueError):
             raise BridgeError("config_invalid") from None
-        if not isinstance(config, dict) or set(config) - {"state_dir", "callback_hosts", "lock_dir", "callback_proxy", "callback_dns", "media_proxy", "media_dns", "media_policy"}:
+        if not isinstance(config, dict) or set(config) - {"state_dir", "callback_hosts", "lock_dir", "callback_proxy", "callback_dns", "media_proxy", "media_dns", "media_policy", "maintenance_policy"}:
             raise BridgeError("config_invalid")
+    from .maintenance import validate_policy
+    args.maintenance_policy = validate_policy(config.get("maintenance_policy", {}))
     policy = config.get("media_policy", {})
     bounds = {"cache_mib": (20, 65536), "retention_days": (1, 3650), "upload_hours": (1, 8760)}
     if not isinstance(policy,dict) or set(policy)-set(bounds):
@@ -156,7 +158,8 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
         def maintain_cache():
             while not stop.wait(3600):
                 try:
-                    store.cleanup_media()
+                    from .maintenance import maintain
+                    maintain(store)
                 except Exception:
                     pass
 
@@ -232,6 +235,13 @@ def parser():
     commands.add_parser("diagnose", help="Show redacted health and stuck work")
     commands.add_parser("subscriptions", help="List subscription IDs and lifetime, without callback credentials")
     commands.add_parser("queue", help="List unresolved reply IDs and fixed error categories")
+    commands.add_parser("storage", help="Read storage sizes, row counts and fixed capacity warnings")
+    cleanup = commands.add_parser("cleanup-history", help="Preview completed history retirement; stop service first")
+    cleanup.add_argument("--days", type=int)
+    cleanup.add_argument("--apply", action="store_true", help="Retire eligible completed history, preserving unresolved work and deduplication")
+    managed = commands.add_parser("backup-managed", help="Create a verified private snapshot and rotate only managed backups; stop service first")
+    managed.add_argument("directory")
+    managed.add_argument("--keep", type=int, default=7)
     latency = commands.add_parser("latency", help="Show redacted per-message timing stages and tool server durations")
     latency.add_argument("--limit",type=int,default=10)
     latency.add_argument("--message-id")
@@ -285,11 +295,18 @@ def main(argv=None):
                             code = getpass.getpass("Weixin verification code (hidden): ")
                     result = poll_login(state, verify_code=code)
                 print(canonical(result))
-        elif args.command in ("import-binding", "resume", "pause", "subscription-forever", "cancel-subscription", "retry-send", "retry-attachment", "backup", "resolve-send"):
+        elif args.command in ("import-binding", "resume", "pause", "subscription-forever", "cancel-subscription", "retry-send", "retry-attachment", "backup", "resolve-send", "cleanup-history", "backup-managed"):
             # Configuration changes must not race a running tunnel child.
             with acquire_lock(state / "worker.lock"):
                 store = Store(state)
-                if args.command == "resolve-send":
+                store.maintenance_policy = args.maintenance_policy
+                if args.command == "cleanup-history":
+                    from .maintenance import cleanup_history
+                    result = cleanup_history(store, days=args.days, apply=args.apply)
+                elif args.command == "backup-managed":
+                    from .maintenance import managed_backup
+                    result = managed_backup(store, args.directory, keep=args.keep)
+                elif args.command == "resolve-send":
                     result = store.resolve_uncertain(args.reply_id,args.outcome=="delivered")
                 elif args.command == "backup":
                     from .operations import backup
@@ -314,6 +331,7 @@ def main(argv=None):
         else:
             store = Store(state)
             store.media_policy = args.media_policy
+            store.maintenance_policy = args.maintenance_policy
             if args.command == "serve":
                 runtime_store = store
                 store = None
@@ -321,7 +339,8 @@ def main(argv=None):
             else:
                 from .operations import diagnostics, subscriptions, queue
                 from .timing import report
-                result = report(store,args.limit,args.message_id) if args.command=="latency" else diagnostics(store) if args.command == "diagnose" else subscriptions(store) if args.command == "subscriptions" else queue(store) if args.command == "queue" else store.get_status()
+                from .maintenance import storage_status
+                result = storage_status(store) if args.command == "storage" else report(store,args.limit,args.message_id) if args.command=="latency" else diagnostics(store) if args.command == "diagnose" else subscriptions(store) if args.command == "subscriptions" else queue(store) if args.command == "queue" else store.get_status()
                 print(canonical(result))
         return 0
     except BlockingIOError:
