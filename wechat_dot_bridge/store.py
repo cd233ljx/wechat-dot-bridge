@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 from .errors import BridgeError
 from .migrations import migrate
 from .lifecycle import WorkStore
+from .notifications import NotificationStore
 from .private_paths import _private_database_file, _private_directory
 
 
@@ -80,7 +81,7 @@ from .attachment_store import AttachmentStore, MEDIA_ERRORS
 SAFE_ERRORS = SAFE_ERRORS | MEDIA_ERRORS
 
 
-class Store(AttachmentStore, WorkStore):
+class Store(AttachmentStore, WorkStore, NotificationStore):
     def __init__(self, state_dir, clock=time.time):
         self.directory = _private_directory(state_dir)
         self.state_dir = self.directory
@@ -239,7 +240,7 @@ class Store(AttachmentStore, WorkStore):
             self.db.execute("UPDATE binding SET last_error=?,status=? WHERE id=?",
                             (diagnostic, status, binding["id"]))
 
-    def ingest(self, account_id, messages, cursor, *, after_commit=None):
+    def ingest(self, account_id, messages, cursor, *, after_commit=None, context_only=False):
         if (not isinstance(messages, list) or len(messages) > 1000
                 or not isinstance(cursor, str) or _text_bytes(cursor) is None
                 or _text_bytes(cursor) > 65536):
@@ -290,6 +291,13 @@ class Store(AttachmentStore, WorkStore):
                 if self.db.execute("SELECT 1 FROM messages WHERE id=? UNION ALL "
                                    "SELECT 1 FROM retired_messages WHERE id=? LIMIT 1",
                                    (identifier, identifier)).fetchone():
+                    continue
+                if context_only:
+                    if context:
+                        self.db.execute("""INSERT INTO messages(id,account,peer,source_id,text,created_at,context_token)
+                            VALUES(?,?,?,?,'',?,?)""", (identifier, account_id, peer, source, created_at, context))
+                        self._ensure_work(identifier)
+                        self.db.execute("UPDATE message_work SET state='completed' WHERE message_id=?", (identifier,))
                     continue
                 if count + added >= MAX_PENDING:
                     raise BridgeError("inbox_full")
@@ -530,7 +538,7 @@ class Store(AttachmentStore, WorkStore):
                 "WHERE r.status='queued' AND m.account=? AND m.peer=? "
                 "ORDER BY r.created_at,r.rowid LIMIT 1", (binding["id"], binding["owner"])).fetchone()
             if row is None:
-                return None
+                return self._claim_notification(binding)
             if row["attempts"] >= 3:
                 self.db.execute("UPDATE replies SET status='failed',error='retry_limit' WHERE client_id=?", (row["client_id"],))
                 return None
@@ -557,6 +565,8 @@ class Store(AttachmentStore, WorkStore):
         if not isinstance(status, str) or status not in SEND_OUTCOMES:
             raise BridgeError("invalid_send_outcome")
         diagnostic = None if error is None else _safe_error(error)
+        if message_id is None:
+            return self.finish_notification(reply_id, status, diagnostic)
         with self._transaction():
             binding = self._binding()
             self._message(message_id, binding)
@@ -599,6 +609,8 @@ class Store(AttachmentStore, WorkStore):
         with self._transaction():
             binding = self.db.execute("SELECT id,owner FROM binding LIMIT 1").fetchone()
             if binding:
+                self.db.execute("""UPDATE notifications SET status='uncertain',error='restart_during_send'
+                    WHERE account=? AND peer=? AND status='sending'""", (binding["id"], binding["owner"]))
                 self.db.execute(
                     "UPDATE replies SET status='uncertain',error='restart_during_send' WHERE status='sending' "
                     "AND message_id IN (SELECT id FROM messages WHERE account=? AND peer=?)",
@@ -607,6 +619,8 @@ class Store(AttachmentStore, WorkStore):
     def resolve_uncertain(self, reply_id, delivered):
         if type(delivered) is not bool:
             raise BridgeError("invalid_resolution")
+        if isinstance(reply_id, str) and reply_id.startswith("notify_"):
+            return self.resolve_notification(reply_id, delivered)
         with self._transaction():
             binding=self._binding()
             row=self.db.execute("SELECT r.* FROM replies r JOIN messages m ON m.id=r.message_id WHERE r.client_id=? AND m.account=? AND m.peer=?", (reply_id,binding["id"],binding["owner"])).fetchone()

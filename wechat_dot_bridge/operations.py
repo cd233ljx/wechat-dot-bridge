@@ -15,7 +15,12 @@ def subscriptions(store):
 
 def queue(store):
     with store.lock:
-        return [dict(r) for r in store.db.execute("SELECT client_id AS reply_id,message_id,status,error,created_at FROM replies WHERE status NOT IN ('accepted') ORDER BY rowid DESC LIMIT 100")]
+        return [dict(r) for r in store.db.execute("""SELECT client_id AS reply_id,message_id,status,error,created_at
+            FROM replies WHERE status != 'accepted' UNION ALL
+            SELECT n.id,NULL,n.status,n.error,n.created_at FROM notifications n JOIN binding b
+            ON n.account=b.id AND n.peer=b.owner WHERE n.status NOT IN ('accepted','expired')
+            ORDER BY created_at DESC LIMIT 100""")]
+
 
 
 def diagnostics(store, threshold=300):

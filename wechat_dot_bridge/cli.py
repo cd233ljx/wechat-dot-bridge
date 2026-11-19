@@ -107,7 +107,7 @@ def load_config(args):
     return Path(state).absolute(), hosts, Path(locks).absolute(), proxy, dns, media_proxy, media_dns
 
 
-async def _run_runtime(store, server, weixin, events, media, monitor, typing):
+async def _run_runtime(store, server, weixin, events, media, monitor, typing, local_only=False):
     from .net_transport import cancel_all, reset_cancellation
     from .sdk_adapter import run_stdio
     from .maintenance import maintain
@@ -131,7 +131,8 @@ async def _run_runtime(store, server, weixin, events, media, monitor, typing):
     def received(message_ids):
         # Store invokes this only after atomically committing genuinely new
         # messages. Registration is memory-only; the poll worker wakes I/O.
-        typing.received(message_ids)
+        if not local_only:
+            typing.received(message_ids)
         if previous_received is not None:
             previous_received(message_ids)
 
@@ -205,13 +206,20 @@ async def _run_runtime(store, server, weixin, events, media, monitor, typing):
                         break
 
             tasks.start_soon(signals)
-            for name, function in (("poll", weixin.poll_once), ("send", weixin.send_once),
-                                   ("event", events.deliver_once), ("media", media.tick),
-                                   ("monitor", monitor.tick), ("typing", presence)):
+            from .notification_api import serve_notifications
+            tasks.start_soon(serve_notifications, store, lambda: notify("send"))
+            workers = [("poll", weixin.poll_once), ("send", weixin.send_once)]
+            if not local_only:
+                workers.extend([("event", events.deliver_once), ("media", media.tick),
+                                ("monitor", monitor.tick), ("typing", presence)])
+            for name, function in workers:
                 tasks.start_soon(worker, name, function)
             tasks.start_soon(worker, "cache", lambda: maintain(store), 3600)
             try:
-                await run_stdio(server)
+                if local_only:
+                    await anyio.sleep_forever()
+                else:
+                    await run_stdio(server)
             finally:
                 # EOF and signals share the same shutdown path. A claimed send
                 # finishes before the store closes; interruption stays uncertain.
@@ -227,7 +235,7 @@ async def _run_runtime(store, server, weixin, events, media, monitor, typing):
             await anyio.to_thread.run_sync(typing.close)
 
 
-def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="system", media_proxy=None, media_dns="system"):
+def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="system", media_proxy=None, media_dns="system", local_only=False):
     locks = []
     try:
         locks.append(acquire_lock(state_dir / "worker.lock"))
@@ -240,13 +248,13 @@ def serve(store, hosts, lock_dir, state_dir, callback_proxy=None, callback_dns="
         events = Events(store, allowed_hosts=hosts, proxy=callback_proxy, dns=callback_dns)
         typing = TypingIndicator(store)
         server = MCPServer(store, events, typing=typing)
-        weixin = WeixinWorker(store)
+        weixin = WeixinWorker(store, context_only=local_only)
         from .media import configure_network
         configure_network(media_proxy, media_dns)
         media = MediaWorker(store)
         from .operations import HealthMonitor
         monitor = HealthMonitor(store)
-        anyio.run(_run_runtime, store, server, weixin, events, media, monitor, typing)
+        anyio.run(_run_runtime, store, server, weixin, events, media, monitor, typing, local_only)
     finally:
         store.close()
         for lock in reversed(locks):
@@ -259,6 +267,7 @@ def parser():
     result.add_argument("--config")
     commands = result.add_subparsers(dest="command", required=True)
     commands.add_parser("serve", help="Start the private stdio MCP server")
+    commands.add_parser("serve-local", help="Start the local notification HTTP socket without stdio MCP")
     commands.add_parser("status", help="Read redacted local status")
     commands.add_parser("pause", help="Disable WeChat polling and sending")
     commands.add_parser("subscription-forever", help="Keep the current owner subscription until cancellation; stop the service first")
@@ -362,10 +371,11 @@ def main(argv=None):
             store = Store(state)
             store.media_policy = args.media_policy
             store.maintenance_policy = args.maintenance_policy
-            if args.command == "serve":
+            if args.command in ("serve", "serve-local"):
                 runtime_store = store
                 store = None
-                serve(runtime_store, hosts, lock_dir, state, proxy, dns, media_proxy, media_dns)
+                serve(runtime_store, hosts, lock_dir, state, proxy, dns, media_proxy, media_dns,
+                      local_only=args.command == "serve-local")
             else:
                 from .operations import diagnostics, subscriptions, queue
                 from .timing import report

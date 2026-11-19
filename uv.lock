@@ -945,6 +945,8 @@ dependencies = [
     { name = "mcp" },
     { name = "pillow" },
     { name = "standardwebhooks" },
+    { name = "starlette" },
+    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
@@ -970,6 +972,8 @@ requires-dist = [
     { name = "pillow", specifier = ">=12.1.1,<13" },
     { name = "qrcode", marker = "extra == 'setup'", specifier = "==8.2" },
     { name = "standardwebhooks", specifier = ">=1.0.0,<2" },
+    { name = "starlette", specifier = ">=1.7,<2" },
+    { name = "uvicorn", specifier = ">=0.54,<0.55" },
 ]
 provides-extras = ["setup"]
 

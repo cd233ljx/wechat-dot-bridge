@@ -204,8 +204,24 @@ def _events(db, clock):
     db.execute("CREATE TABLE IF NOT EXISTS event_metadata (key TEXT PRIMARY KEY,value TEXT)")
 
 
+def _reserved_v9(db, clock):
+    """Keep the version allocated by earlier installations."""
+
+
+def _notifications(db, clock):
+    db.execute("""CREATE TABLE IF NOT EXISTS notifications (
+        id TEXT PRIMARY KEY, account TEXT NOT NULL, peer TEXT NOT NULL,
+        digest TEXT NOT NULL, expires_at INTEGER, status TEXT NOT NULL,
+        error TEXT, created_at REAL NOT NULL)""")
+    db.execute("""CREATE INDEX IF NOT EXISTS notifications_dispatch ON notifications(account,peer,status,created_at)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS notification_parts (
+        notification_id TEXT NOT NULL REFERENCES notifications(id), part INTEGER NOT NULL,
+        text TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY(notification_id,part))""")
+
+
 MIGRATIONS = (_core, _inbound_quotes, _media, _outbound, _timing, _retired_messages,
-              _processing_lifecycle, _events)
+              _processing_lifecycle, _events, _reserved_v9, _notifications)
 SCHEMA_VERSION = len(MIGRATIONS)
 
 

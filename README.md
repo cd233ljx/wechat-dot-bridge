@@ -1,8 +1,20 @@
 # WeChat Dot Bridge
 
-在微信里和你已有的 OpenAI dot 聊天。
+为本机 webhook 和自动化提供微信通知接口，也支持在微信里和已有的 OpenAI dot 聊天。
 
 你发来文字、图片或文件，桥接把来信交给 dot，再把它的回复送回同一个微信对话。模型能力仍由原 dot 提供，桥接本身只负责消息收发。
+
+## 从本机发通知
+
+已有桥接服务会在私有状态目录创建 `notify.sock`。调用方只需提交事件的唯一键和消息正文：
+
+```bash
+curl --unix-socket "$WDB_STATE/notify.sock" http://localhost/v1/notifications \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: backup-2026-01-01' \
+  -d '{"text":"服务器备份完成"}'
+```
+
+返回的 ID 可用来查询发送状态。只使用通知接口时，完成微信绑定后用 `serve-local` 启动，无需 dot 或 Tunnel。[本机接口与启动说明](docs/NOTIFICATIONS.md)
 
 ## 能做什么
 
@@ -15,7 +27,7 @@
 
 ## 开始使用
 
-接入需要已有 dot、个人开发者插件权限，以及仅自己可用的 [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) 和 [MCP Events](https://developers.openai.com/plugins/build/mcp-events) 能力。先确认账户具备这些条件，再准备 Python 3.11+ 和 uv。
+接入 dot 聊天需要已有 dot、个人开发者插件权限，以及仅自己可用的 [Secure MCP Tunnel](https://developers.openai.com/api/docs/guides/secure-mcp-tunnels) 和 [MCP Events](https://developers.openai.com/plugins/build/mcp-events) 能力。先确认账户具备这些条件，再准备 Python 3.11+ 和 uv。
 
 在源码目录安装锁定的依赖：
 

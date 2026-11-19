@@ -460,7 +460,8 @@ def _normalize_message(message: dict, binding: dict, now: float) -> dict | None:
 
 
 class WeixinWorker:
-    def __init__(self, store, client=None, *, on_received=None):
+    def __init__(self, store, client=None, *, on_received=None, context_only=False):
+        self.context_only = context_only
         self.store = store
         self.client = client if client is not None else IlinkClient()
         self.send_after = 0
@@ -502,6 +503,8 @@ class WeixinWorker:
                 item["received_at"]=received_at
             # Store commits messages, owner context and cursor as one transaction.
             options = {"after_commit": self.on_received} if self.on_received is not None else {}
+            if self.context_only:
+                options["context_only"] = True
             self.poll_added = self.store.ingest(binding["id"], normalized, cursor or binding.get("cursor", ""), **options)
             self.store.record_error(None)
             return True
