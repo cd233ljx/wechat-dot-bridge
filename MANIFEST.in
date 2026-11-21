@@ -1,5 +1,6 @@
 include README.md CONTRIBUTING.md CHANGELOG.md SECURITY.md AGENTS.md NOTICE.txt LICENSE uv.lock .gitignore
 recursive-include docs *.md
+include docs/history/wechat-media-dns-18.png
 recursive-include scripts *.py *.sh
 recursive-include tests *.py
 recursive-include licenses *.txt

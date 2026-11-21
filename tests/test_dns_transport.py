@@ -92,6 +92,52 @@ class SharedDNSTransportTests(unittest.TestCase):
             return media.cdn_request(media.CDN_BASE + '/download?encrypted_query_param=fixture-private-media')
         return download('https://artifact.example.com/fixture-private-file?key=fixture-private-query')
 
+    @staticmethod
+    def dual_stack_records():
+        ipv4 = [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (f'93.184.216.{i}', 443))
+                for i in range(1, 10)]
+        ipv6 = [(socket.AF_INET6, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', (f'2606:4700:4700::{i}', 443, 0, 0))
+                for i in range(1, 10)]
+        return ipv4 + ipv6
+
+    def test_large_system_dns_answer_reaches_media_upload(self):
+        rows = self.dual_stack_records()
+        media.configure_network(None, 'system')
+        with self.network([self.response(200, b'')]) as (raws, _, names, factory, dns):
+            dns.side_effect = None
+            dns.return_value = rows
+            with patch.object(media, 'request', wraps=net.request) as exchange:
+                media.cdn_request(media.CDN_BASE + '/upload', b'fixture-image')
+        candidates = exchange.call_args.args[1]
+        self.assertEqual([item[-1] for item in candidates], [row[-1] for row in rows[:16]])
+        self.assertEqual(raws[0].connected, [rows[0][-1]])
+        self.assertEqual(names, [media.CDN_HOST])
+        factory.assert_called_once()
+
+    def test_system_dns_duplicates_do_not_use_candidate_slots(self):
+        rows = self.dual_stack_records()
+        with patch.object(net.socket, 'getaddrinfo', return_value=[rows[0]] * 16 + rows):
+            candidates = net.resolve_addresses(media.CDN_HOST)
+        self.assertEqual([item[-1] for item in candidates], [row[-1] for row in rows[:16]])
+
+    def test_system_dns_checks_records_after_candidate_limit(self):
+        rows = self.dual_stack_records()[:16]
+        for endpoint, error in [(('127.0.0.1', 443), 'dns_blocked'), ((self.IP, 80), 'dns_failed')]:
+            last = (socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, '', endpoint)
+            with self.subTest(error=error), patch.object(net.socket, 'getaddrinfo', return_value=rows + [last]):
+                with self.assertRaises(net.NetworkFailure) as failure:
+                    net.resolve_addresses(media.CDN_HOST)
+                self.assertEqual(failure.exception.category, error)
+
+    def test_system_dns_input_budget(self):
+        row = self.dual_stack_records()[0]
+        rows = [row] * net.MAX_SYSTEM_DNS_RECORDS
+        with patch.object(net.socket, 'getaddrinfo', return_value=rows):
+            self.assertEqual(len(net.resolve_addresses(media.CDN_HOST)), 1)
+        with patch.object(net.socket, 'getaddrinfo', return_value=rows + [row]):
+            with self.assertRaisesRegex(net.NetworkFailure, '^dns_failed$'):
+                net.resolve_addresses(media.CDN_HOST)
+
     def test_google_provider_and_application_use_distinct_pinned_hosts_without_credentials(self):
         hosts = {'callback': 'callback.example.com', 'media': media.CDN_HOST, 'artifact': 'artifact.example.com'}
         ambient = {key: 'http://192.0.2.100:8080' for key in ('HTTPS_PROXY', 'HTTP_PROXY', 'ALL_PROXY')}

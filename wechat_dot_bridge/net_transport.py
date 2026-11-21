@@ -42,6 +42,8 @@ _cancellation = threading.Event()
 DNS_SLOTS = threading.BoundedSemaphore(4)
 DNS_TIMEOUT = 10.0
 MAX_DNS_RESPONSE = 32768
+MAX_SYSTEM_DNS_RECORDS = 256
+MAX_PINNED_ADDRESSES = 16
 
 
 def cancellation_token():
@@ -94,9 +96,9 @@ def public_ip(value):
     return address
 
 
-def checked_addresses(entries):
+def checked_addresses(entries, *, max_records=MAX_PINNED_ADDRESSES):
     try:
-        if not isinstance(entries, (list, tuple)) or not 0 < len(entries) <= 16:
+        if not isinstance(entries, (list, tuple)) or not 0 < len(entries) <= max_records:
             raise NetworkFailure("dns_failed")
         result = []
         for family, kind, protocol, *tail in entries:
@@ -109,7 +111,8 @@ def checked_addresses(entries):
             # Discard resolver-provided flow/scope identifiers for global IPv6.
             address = (str(ip), 443) if ip.version == 4 else (str(ip), 443, 0, 0)
             item = (family, kind, socket.IPPROTO_TCP, address)
-            if item not in result:
+            # 候选满额后仍继续校验剩余记录。
+            if len(result) < MAX_PINNED_ADDRESSES and item not in result:
                 result.append(item)
         return result
     except NetworkFailure:
@@ -224,7 +227,7 @@ def _resolve_public_addresses(host, timeout, slots, token, *, deadline=None):
         raise NetworkFailure("timeout")
     if not ok:
         raise NetworkFailure("dns_failed")
-    return checked_addresses(entries)
+    return checked_addresses(entries, max_records=MAX_SYSTEM_DNS_RECORDS)
 
 
 _private_request = threading.local()
